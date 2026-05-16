@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Auther: Christopher Gray
-Version: 0.0.5
+Version: 0.0.6
 Updated: 5/16/2026
 
 Updated from: https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/openweb_ui_push_tool.py
@@ -9,13 +9,19 @@ Updated from: https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/openwe
 Push openwebui_tool.py to a running Open WebUI instance via its REST API.
 No browser required — run this after every edit.
 
-Setup (one time):
+Auth (use one — email/password is easiest if you can't find your API key):
     export OWUI_URL="http://your-server:3000"
-    export OWUI_API_KEY="sk-..."      # Admin Panel → Settings → Account → API Keys
+
+    Option A — email + password (works with any Open WebUI version):
+        export OWUI_EMAIL="you@example.com"
+        export OWUI_PASSWORD="yourpassword"
+
+    Option B — API key (Admin Panel > Settings > Account > API Keys):
+        export OWUI_API_KEY="sk-..."
 
 Usage:
-    python3 push_tool.py              # push once
-    python3 push_tool.py --watch      # push automatically on every file save
+    python3 openweb_ui_push_tool.py              # push once
+    python3 openweb_ui_push_tool.py --watch      # push automatically on every file save
 """
 
 import os
@@ -25,9 +31,52 @@ import time
 import argparse
 import requests
 
-TOOL_FILE = os.path.join(os.path.dirname(__file__), "openwebui_tool.py")
-OWUI_URL  = os.getenv("OWUI_URL",    "http://localhost:3000")
-OWUI_KEY  = os.getenv("OWUI_API_KEY", "")
+TOOL_FILE    = os.path.join(os.path.dirname(__file__), "openwebui_tool.py")
+OWUI_URL     = os.getenv("OWUI_URL",      "http://localhost:3000")
+OWUI_KEY     = os.getenv("OWUI_API_KEY",  "")
+OWUI_EMAIL   = os.getenv("OWUI_EMAIL",    "")
+OWUI_PASSWORD= os.getenv("OWUI_PASSWORD", "")
+
+
+def get_token() -> str:
+    """Return a Bearer token — from env API key, or by signing in with email/password."""
+    if OWUI_KEY:
+        return OWUI_KEY
+
+    if OWUI_EMAIL and OWUI_PASSWORD:
+        base = OWUI_URL.rstrip("/")
+        try:
+            resp = requests.post(
+                f"{base}/api/v1/auths/signin",
+                json={"email": OWUI_EMAIL, "password": OWUI_PASSWORD},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            token = resp.json().get("token")
+            if not token:
+                print(f"Error: Sign-in succeeded but no token returned: {resp.text[:200]}")
+                sys.exit(1)
+            return token
+        except requests.exceptions.HTTPError as e:
+            print(f"Error: Login failed (HTTP {e.response.status_code}) — check OWUI_EMAIL and OWUI_PASSWORD")
+            sys.exit(1)
+        except requests.exceptions.ConnectionError:
+            print(f"Error: Cannot connect to Open WebUI at {OWUI_URL}")
+            sys.exit(1)
+
+    print(
+        "Error: No credentials set. Use one of:\n"
+        "\n"
+        "  Option A — email + password:\n"
+        "    export OWUI_EMAIL='you@example.com'\n"
+        "    export OWUI_PASSWORD='yourpassword'\n"
+        "\n"
+        "  Option B — API key:\n"
+        "    export OWUI_API_KEY='sk-...'\n"
+        "\n"
+        "  Also set:  export OWUI_URL='http://your-server:3000'"
+    )
+    sys.exit(1)
 
 
 def extract_meta(content: str) -> dict:
@@ -35,26 +84,18 @@ def extract_meta(content: str) -> dict:
         m = re.search(rf"^{field}:\s*(.+)", content, re.MULTILINE)
         return m.group(1).strip() if m else ""
 
-    title   = _get("title")   or "Web Search & URL Fetch"
-    version = _get("version") or "1.0.0"
+    title   = _get("title")       or "Web Search & URL Fetch"
+    version = _get("version")     or "1.0.0"
     desc    = _get("description") or ""
     tool_id = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
     return {"id": tool_id, "name": title, "version": version, "description": desc}
 
 
 def push(content: str, meta: dict) -> None:
-    if not OWUI_KEY:
-        print(
-            "Error: OWUI_API_KEY is not set.\n"
-            "  Get one from: Admin Panel → Settings → Account → API Keys\n"
-            "  Then run:  export OWUI_API_KEY='sk-...'"
-        )
-        sys.exit(1)
-
-    headers = {"Authorization": f"Bearer {OWUI_KEY}", "Content-Type": "application/json"}
+    token   = get_token()
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     base    = OWUI_URL.rstrip("/")
 
-    # Find an existing tool with the same name or id
     resp = requests.get(f"{base}/api/v1/tools/", headers=headers, timeout=10)
     resp.raise_for_status()
     tools    = resp.json()
@@ -99,14 +140,11 @@ def watch() -> None:
             mtime = os.path.getmtime(TOOL_FILE)
             if mtime != last_mtime:
                 last_mtime = mtime
-                if last_mtime is not None:  # skip the very first read
+                if last_mtime is not None:
                     try:
                         push_file()
                     except Exception as e:
                         print(f"[{time.strftime('%H:%M:%S')}] Error: {e}")
-                else:
-                    # prime the mtime on first loop without pushing
-                    pass
             time.sleep(1)
         except KeyboardInterrupt:
             print("\nStopped.")
