@@ -3,6 +3,7 @@ title: Web Search & URL Fetch
 author: Christopher Gray
 description: Search the web via SearXNG and fetch full URL content. Works with any model (Gemma, Qwen, Ollama, vLLM).
 version: 1.1.0
+updated: 5/16/2026
 license: MIT
 requirements: requests, beautifulsoup4, lxml
 """
