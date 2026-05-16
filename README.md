@@ -1,0 +1,2 @@
+# ai
+AI Related scripts
