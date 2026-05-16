@@ -8,7 +8,7 @@
 # Run directly on the server as root — no other files needed.
 #
 # Download and run in one command:
-#   curl -fsSL https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/deploy.sh -o deploy.sh && bash deploy.sh
+#   curl -fsSL https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/openwebui_search_deploy.sh -o openwebui_search_deploy.sh && bash openwebui_search_deploy.sh
 
 set -e
 
