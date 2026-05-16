@@ -4,7 +4,7 @@ Auther: Christopher Gray
 Version: 0.0.2
 Updated: 5/16/2026
 
-Updated from: 
+Updated from:  https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/openweb_ui_push_tool.py
 
 Push openwebui_tool.py to a running Open WebUI instance via its REST API.
 No browser required — run this after every edit.
