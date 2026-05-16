@@ -5,7 +5,7 @@ description: Search the web via SearXNG and fetch full URL content. Works with a
 version: 1.1.0
 updated: 5/16/2026
 
-Download from: 
+Download from:  https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/openwebui_tool.py
 
 license: MIT
 requirements: requests, beautifulsoup4, lxml
