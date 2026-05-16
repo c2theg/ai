@@ -1,8 +1,9 @@
 #!/bin/bash
-#
 #  Christopher Gray
-#    Version 0.0.2
+#    Version 0.0.5
 #    Updated: 5/16/2026
+#
+#  *** ENTRY POINT ***
 #
 # Self-contained deploy script for SearXNG + Open WebUI tool.
 # Run directly on the server as root — no other files needed.
@@ -15,6 +16,8 @@ set -e
 SEARXNG_CONFIG_DIR="/opt/models/searxng"
 TOOL_URL="https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/openwebui_tool.py"
 TOOL_DEST="/opt/models/openwebui_tool.py"
+PUSH_URL="https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/openweb_ui_push_tool.py"
+PUSH_DEST="/opt/models/push_tool.py"
 
 # ---------------------------------------------------------------------------
 # 1. SearXNG settings.yml
@@ -125,11 +128,32 @@ curl -fsSL "$TOOL_URL" -o "$TOOL_DEST"
 echo "==> Tool saved."
 
 # ---------------------------------------------------------------------------
-# 5. Instructions
+# 5. Download push_tool.py (auto-deploy without the browser)
+# ---------------------------------------------------------------------------
+echo ""
+echo "==> Downloading push_tool.py to ${PUSH_DEST}..."
+curl -fsSL "$PUSH_URL" -o "$PUSH_DEST"
+chmod +x "$PUSH_DEST"
+echo "==> push_tool.py saved and marked executable."
+
+# Check python3 + requests are available for push_tool.py
+if command -v python3 &>/dev/null; then
+    if ! python3 -c "import requests" 2>/dev/null; then
+        echo "==> Installing requests for push_tool.py..."
+        python3 -m pip install --quiet requests
+    else
+        echo "==> python3 + requests OK."
+    fi
+else
+    echo "    WARNING: python3 not found — install it to use push_tool.py"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Instructions
 # ---------------------------------------------------------------------------
 echo ""
 echo "========================================================"
-echo " Setup complete. Follow these steps in Open WebUI:"
+echo " Setup complete. Follow these steps to finish:"
 echo "========================================================"
 echo ""
 echo " [1] Configure Web Search (Admin Panel > Settings > Web Search):"
@@ -147,4 +171,12 @@ echo " [3] Use in any chat:"
 echo "     - Click the tools '+' icon in the chat bar"
 echo "     - Toggle on 'Web Search & URL Fetch'"
 echo "     - Works with Gemma4, Qwen, or any Ollama / vLLM model"
+echo ""
+echo " [4] Set up push_tool.py so you never paste via the browser again:"
+echo "     - Get an API key: Admin Panel > Settings > Account > API Keys"
+echo "     - Add to your shell profile (~/.bashrc or ~/.zshrc):"
+echo "         export OWUI_URL=\"http://$(hostname -I | awk '{print $1}'):3000\""
+echo "         export OWUI_API_KEY=\"sk-...\""
+echo "     - Push once:        python3 ${PUSH_DEST}"
+echo "     - Auto-push on save: python3 ${PUSH_DEST} --watch"
 echo ""
