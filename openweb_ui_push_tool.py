@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Auther: Christopher Gray
-Version: 0.0.7
+Version: 0.0.9
 Updated: 5/16/2026
 
 Updated from: https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/openweb_ui_push_tool.py
@@ -22,6 +22,7 @@ Auth (use one — email/password is easiest if you can't find your API key):
 Usage:
     python3 openweb_ui_push_tool.py              # push once
     python3 openweb_ui_push_tool.py --watch      # push automatically on every file save
+    python3 openweb_ui_push_tool.py --probe      # discover working API endpoints (run this if push fails)
 """
 
 import os
@@ -121,33 +122,105 @@ def push(content: str, meta: dict) -> None:
 
     if existing:
         eid = existing["id"]
-        # Try REST-style PUT first (newer OWUI), then legacy POST /{id}/update
         candidates = [
-            ("PUT",  f"{base}/api/v1/tools/{eid}"),
-            ("POST", f"{base}/api/v1/tools/{eid}/update"),
+            ("PUT",   f"{base}/api/v1/tools/{eid}"),
+            ("PATCH", f"{base}/api/v1/tools/{eid}"),
+            ("POST",  f"{base}/api/v1/tools/{eid}/update"),
+            ("POST",  f"{base}/api/v1/tools/{eid}"),
+            ("PUT",   f"{base}/api/v1/tools/id/{eid}"),
+            ("POST",  f"{base}/api/v1/tools/update"),
+            ("PUT",   f"{base}/api/tools/{eid}"),
+            ("POST",  f"{base}/api/tools/{eid}/update"),
         ]
         for method, url in candidates:
             resp = _call(method, url, headers, payload)
-            if resp.status_code == 405:
+            if resp.status_code in (404, 405):
                 continue
             resp.raise_for_status()
-            print(f"[{time.strftime('%H:%M:%S')}] Updated  '{meta['name']}' (id={eid})  v{meta['version']}  [{method} {url.split('/api')[1]}]")
+            print(f"[{time.strftime('%H:%M:%S')}] Updated  '{meta['name']}' (id={eid})  v{meta['version']}  [{method} {url.split(base)[1]}]")
             return
-        raise RuntimeError(f"Could not update — tried {[m for m,_ in candidates]}, all returned 405")
+        print("All update endpoints returned 404/405. Run with --probe to diagnose.")
+        raise RuntimeError("Could not update tool — no working endpoint found")
     else:
-        # Try POST / first (newer OWUI), then legacy POST /add
         candidates = [
             ("POST", f"{base}/api/v1/tools/"),
             ("POST", f"{base}/api/v1/tools/add"),
+            ("POST", f"{base}/api/v1/tools/create"),
+            ("PUT",  f"{base}/api/v1/tools/"),
+            ("POST", f"{base}/api/tools/"),
+            ("POST", f"{base}/api/tools/add"),
         ]
         for method, url in candidates:
             resp = _call(method, url, headers, payload)
-            if resp.status_code == 405:
+            if resp.status_code in (404, 405):
                 continue
             resp.raise_for_status()
-            print(f"[{time.strftime('%H:%M:%S')}] Created  '{meta['name']}' (id={meta['id']})  v{meta['version']}  [{method} {url.split('/api')[1]}]")
+            print(f"[{time.strftime('%H:%M:%S')}] Created  '{meta['name']}' (id={meta['id']})  v{meta['version']}  [{method} {url.split(base)[1]}]")
             return
-        raise RuntimeError(f"Could not create — tried {[u.split('/api')[1] for _,u in candidates]}, all returned 405")
+        print("All create endpoints returned 404/405. Run with --probe to diagnose.")
+        raise RuntimeError("Could not create tool — no working endpoint found")
+
+
+def probe() -> None:
+    """Try every known endpoint pattern and print the HTTP status for each."""
+    token   = get_token()
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    base    = OWUI_URL.rstrip("/")
+
+    # Fetch real tool id to use in probes
+    resp = requests.get(f"{base}/api/v1/tools/", headers=headers, timeout=10)
+    resp.raise_for_status()
+    tools = resp.json()
+    eid   = tools[0]["id"] if tools else "test_id"
+    dummy = {"id": eid, "name": "probe", "content": "", "meta": {}}
+
+    print(f"Open WebUI: {base}")
+    print(f"Using tool id for probe: {eid}")
+    print(f"{'METHOD':<8} {'ENDPOINT':<55} STATUS")
+    print("-" * 75)
+
+    probe_urls = [
+        # update candidates
+        ("GET",   f"/api/v1/tools/"),
+        ("GET",   f"/api/tools/"),
+        ("PUT",   f"/api/v1/tools/{eid}"),
+        ("PATCH", f"/api/v1/tools/{eid}"),
+        ("POST",  f"/api/v1/tools/{eid}"),
+        ("POST",  f"/api/v1/tools/{eid}/update"),
+        ("PUT",   f"/api/v1/tools/id/{eid}"),
+        ("POST",  f"/api/v1/tools/update"),
+        ("PUT",   f"/api/tools/{eid}"),
+        ("POST",  f"/api/tools/{eid}/update"),
+        # create candidates
+        ("POST",  f"/api/v1/tools/"),
+        ("POST",  f"/api/v1/tools/add"),
+        ("POST",  f"/api/v1/tools/create"),
+        ("PUT",   f"/api/v1/tools/"),
+        ("POST",  f"/api/tools/"),
+        ("POST",  f"/api/tools/add"),
+    ]
+
+    for method, path in probe_urls:
+        url  = base + path
+        try:
+            r = requests.request(method, url, headers=headers, json=dummy, timeout=8)
+            status = r.status_code
+            note   = ""
+            if status < 300:
+                note = " <-- WORKS"
+            elif status == 401:
+                note = " (auth error)"
+            elif status == 404:
+                note = " (not found)"
+            elif status == 405:
+                note = " (wrong method)"
+            elif status == 422:
+                note = " (endpoint exists, payload rejected)"
+            print(f"{method:<8} {path:<55} {status}{note}")
+        except Exception as e:
+            print(f"{method:<8} {path:<55} ERROR: {e}")
+
+    print("\nShare the output above to identify which endpoint to use.")
 
 
 def push_file() -> None:
@@ -179,9 +252,12 @@ def watch() -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Push openwebui_tool.py to Open WebUI")
     parser.add_argument("--watch", action="store_true", help="Re-push on every file save")
+    parser.add_argument("--probe", action="store_true", help="Discover working API endpoints")
     args = parser.parse_args()
 
-    if args.watch:
+    if args.probe:
+        probe()
+    elif args.watch:
         watch()
     else:
         try:
