@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Auther: Christopher Gray
-Version: 0.1.4
+Version: 0.1.5
 Updated: 5/16/2026
 
 Updated from: https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/openweb_ui_push_tool.py
@@ -28,15 +28,18 @@ Usage:
 import os
 import re
 import sys
+import json
 import time
 import argparse
+import subprocess
 import requests
 
-TOOL_FILE    = os.path.join(os.path.dirname(__file__), "openwebui_tool.py")
-OWUI_URL     = os.getenv("OWUI_URL",      "http://localhost:3000")
-OWUI_KEY     = os.getenv("OWUI_API_KEY",  "")
-OWUI_EMAIL   = os.getenv("OWUI_EMAIL",    "")
-OWUI_PASSWORD= os.getenv("OWUI_PASSWORD", "")
+TOOL_FILE      = os.path.join(os.path.dirname(__file__), "openwebui_tool.py")
+OWUI_URL       = os.getenv("OWUI_URL",        "http://localhost:3000")
+OWUI_KEY       = os.getenv("OWUI_API_KEY",    "")
+OWUI_EMAIL     = os.getenv("OWUI_EMAIL",      "")
+OWUI_PASSWORD  = os.getenv("OWUI_PASSWORD",   "")
+OWUI_CONTAINER = os.getenv("OWUI_CONTAINER",  "open-webui")
 
 
 def get_token() -> str:
@@ -120,45 +123,106 @@ def push(content: str, meta: dict) -> None:
         },
     }
 
-    if existing:
-        # No working PUT/PATCH endpoint found in this OWUI version — delete then recreate.
-        eid = existing["id"]
-        deleted = False
-        for method, url in [
-            ("DELETE", f"{base}/api/v1/tools/{eid}"),
-            ("POST",   f"{base}/api/v1/tools/{eid}/delete"),
-            ("DELETE", f"{base}/api/v1/tools/{eid}/delete"),
-            ("DELETE", f"{base}/api/tools/{eid}"),
-        ]:
-            resp = _call(method, url, headers, {})
-            if resp.status_code not in (404, 405):
-                resp.raise_for_status()
-                deleted = True
-                break
+    if not existing:
+        resp = _call("POST", f"{base}/api/v1/tools/create", headers, payload)
+        if resp.ok:
+            print(f"[{time.strftime('%H:%M:%S')}] Created  '{meta['name']}' (id={meta['id']})  v{meta['version']}")
+            return
+        raise RuntimeError(f"Create failed ({resp.status_code}): {resp.text[:200]}")
 
-        if not deleted:
-            # Last resort: try standard update verbs before giving up
-            for method, url in [
-                ("PUT",   f"{base}/api/v1/tools/{eid}"),
-                ("PATCH", f"{base}/api/v1/tools/{eid}"),
-                ("POST",  f"{base}/api/v1/tools/{eid}/update"),
-            ]:
-                resp = _call(method, url, headers, payload)
-                if resp.status_code not in (404, 405):
-                    resp.raise_for_status()
-                    print(f"[{time.strftime('%H:%M:%S')}] Updated  '{meta['name']}' (id={eid})  v{meta['version']}  [{method} {url.split(base)[1]}]")
-                    return
-            print("All update/delete endpoints failed. Run with --probe to diagnose.")
-            raise RuntimeError("Could not update tool — no working endpoint found")
+    eid = existing["id"]
 
-    # Create (or recreate after delete)
-    resp = _call("POST", f"{base}/api/v1/tools/create", headers, payload)
-    if resp.ok:
-        action = "Updated" if existing else "Created"
-        print(f"[{time.strftime('%H:%M:%S')}] {action}  '{meta['name']}' (id={meta['id']})  v{meta['version']}  [DELETE+POST /api/v1/tools/create]")
-        return
-    print(f"POST /api/v1/tools/create failed ({resp.status_code}): {resp.text[:300]}")
-    raise RuntimeError("Could not create tool — see error above")
+    # Try API update verbs
+    for method, url in [
+        ("PUT",    f"{base}/api/v1/tools/{eid}"),
+        ("PATCH",  f"{base}/api/v1/tools/{eid}"),
+        ("POST",   f"{base}/api/v1/tools/{eid}/update"),
+    ]:
+        resp = _call(method, url, headers, payload)
+        if resp.status_code not in (404, 405):
+            resp.raise_for_status()
+            print(f"[{time.strftime('%H:%M:%S')}] Updated  '{meta['name']}' (id={eid})  v{meta['version']}  [{method}]")
+            return
+
+    # Try delete + recreate
+    for method, url in [
+        ("DELETE", f"{base}/api/v1/tools/{eid}"),
+        ("POST",   f"{base}/api/v1/tools/{eid}/delete"),
+    ]:
+        resp = _call(method, url, headers, {})
+        if resp.status_code not in (404, 405):
+            resp.raise_for_status()
+            resp = _call("POST", f"{base}/api/v1/tools/create", headers, payload)
+            resp.raise_for_status()
+            print(f"[{time.strftime('%H:%M:%S')}] Updated  '{meta['name']}' (id={eid})  v{meta['version']}  [DELETE+CREATE]")
+            return
+
+    # Final fallback: update the database directly via docker exec
+    push_via_docker(content, meta)
+
+
+def push_via_docker(content: str, meta: dict) -> None:
+    """Update the tool directly in Open WebUI's SQLite database via docker exec."""
+    script = """
+import sqlite3, json, os, glob, sys
+
+content  = json.loads(sys.argv[1])
+tool_id  = sys.argv[2]
+
+candidates = [
+    "/app/backend/data/webui.db",
+    "/data/webui.db",
+]
+candidates += glob.glob("/app/**/*.db", recursive=True)
+
+for db_path in candidates:
+    if not os.path.exists(db_path):
+        continue
+    try:
+        conn = sqlite3.connect(db_path)
+        has_tool = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='tool'"
+        ).fetchone()
+        if not has_tool:
+            conn.close()
+            continue
+        conn.execute("UPDATE tool SET content=? WHERE id=?", (content, tool_id))
+        rows = conn.execute("SELECT changes()").fetchone()[0]
+        conn.commit()
+        conn.close()
+        if rows > 0:
+            print("ok:" + db_path)
+            sys.exit(0)
+        else:
+            print("no_rows:" + db_path)
+    except Exception as e:
+        print("err:" + db_path + ":" + str(e))
+
+print("not_found")
+sys.exit(1)
+"""
+    try:
+        result = subprocess.run(
+            ["docker", "exec", OWUI_CONTAINER, "python3", "-c", script,
+             json.dumps(content), meta["id"]],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        output = result.stdout.strip()
+        if result.returncode == 0 and output.startswith("ok:"):
+            db_path = output[3:]
+            print(f"[{time.strftime('%H:%M:%S')}] Updated  '{meta['name']}' (id={meta['id']})  v{meta['version']}  [docker→sqlite {db_path}]")
+            return
+        raise RuntimeError(output or result.stderr)
+    except FileNotFoundError:
+        raise RuntimeError("'docker' command not found — is Docker installed and on PATH?")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("docker exec timed out")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"docker exec failed: {e}") from e
 
 
 def probe() -> None:
