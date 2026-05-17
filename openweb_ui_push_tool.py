@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Auther: Christopher Gray
-Version: 0.0.9
+Version: 0.1.0
 Updated: 5/16/2026
 
 Updated from: https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/openweb_ui_push_tool.py
@@ -120,6 +120,19 @@ def push(content: str, meta: dict) -> None:
         },
     }
 
+    # POST /api/v1/tools/create appears to be an upsert in newer OWUI versions —
+    # probe returned 400 only because our test payload had empty content.
+    # Try it first for both create and update paths.
+    upsert_url = f"{base}/api/v1/tools/create"
+    resp = _call("POST", upsert_url, headers, payload)
+    if resp.status_code not in (404, 405):
+        if not resp.ok:
+            print(f"POST /api/v1/tools/create failed ({resp.status_code}): {resp.text[:300]}")
+            raise RuntimeError("Upsert via /create failed — see error above")
+        action = "Updated" if existing else "Created"
+        print(f"[{time.strftime('%H:%M:%S')}] {action}  '{meta['name']}' (id={meta['id']})  v{meta['version']}  [POST /api/v1/tools/create]")
+        return
+
     if existing:
         eid = existing["id"]
         candidates = [
@@ -139,13 +152,12 @@ def push(content: str, meta: dict) -> None:
             resp.raise_for_status()
             print(f"[{time.strftime('%H:%M:%S')}] Updated  '{meta['name']}' (id={eid})  v{meta['version']}  [{method} {url.split(base)[1]}]")
             return
-        print("All update endpoints returned 404/405. Run with --probe to diagnose.")
+        print("All update endpoints failed. Run with --probe to diagnose.")
         raise RuntimeError("Could not update tool — no working endpoint found")
     else:
         candidates = [
             ("POST", f"{base}/api/v1/tools/"),
             ("POST", f"{base}/api/v1/tools/add"),
-            ("POST", f"{base}/api/v1/tools/create"),
             ("PUT",  f"{base}/api/v1/tools/"),
             ("POST", f"{base}/api/tools/"),
             ("POST", f"{base}/api/tools/add"),
@@ -157,7 +169,7 @@ def push(content: str, meta: dict) -> None:
             resp.raise_for_status()
             print(f"[{time.strftime('%H:%M:%S')}] Created  '{meta['name']}' (id={meta['id']})  v{meta['version']}  [{method} {url.split(base)[1]}]")
             return
-        print("All create endpoints returned 404/405. Run with --probe to diagnose.")
+        print("All create endpoints failed. Run with --probe to diagnose.")
         raise RuntimeError("Could not create tool — no working endpoint found")
 
 
