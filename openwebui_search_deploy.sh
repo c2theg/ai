@@ -1,6 +1,6 @@
 #!/bin/bash
 #  Christopher Gray
-#    Version 0.0.5
+#    Version 0.0.6
 #    Updated: 5/16/2026
 #
 #  *** ENTRY POINT ***
@@ -17,7 +17,7 @@ SEARXNG_CONFIG_DIR="/opt/models/searxng"
 TOOL_URL="https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/openwebui_tool.py"
 TOOL_DEST="/opt/models/openwebui_tool.py"
 PUSH_URL="https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/openweb_ui_push_tool.py"
-PUSH_DEST="/opt/models/push_tool.py"
+PUSH_DEST="/opt/models/openweb_ui_push_tool.py"
 
 # ---------------------------------------------------------------------------
 # 1. SearXNG settings.yml
@@ -173,10 +173,17 @@ echo "     - Toggle on 'Web Search & URL Fetch'"
 echo "     - Works with Gemma4, Qwen, or any Ollama / vLLM model"
 echo ""
 echo " [4] Set up push_tool.py so you never paste via the browser again:"
-echo "     - Get an API key: Admin Panel > Settings > Account > API Keys"
-echo "     - Add to your shell profile (~/.bashrc or ~/.zshrc):"
+echo "     Add to your shell profile (~/.bashrc or ~/.zshrc):"
+echo ""
+echo "     Option A — email + password (easiest, works with any version):"
+echo "         export OWUI_URL=\"http://$(hostname -I | awk '{print $1}'):3000\""
+echo "         export OWUI_EMAIL=\"you@example.com\""
+echo "         export OWUI_PASSWORD=\"yourpassword\""
+echo ""
+echo "     Option B — API key (Admin Panel > Settings > Account > API Keys):"
 echo "         export OWUI_URL=\"http://$(hostname -I | awk '{print $1}'):3000\""
 echo "         export OWUI_API_KEY=\"sk-...\""
-echo "     - Push once:        python3 ${PUSH_DEST}"
-echo "     - Auto-push on save: python3 ${PUSH_DEST} --watch"
+echo ""
+echo "     Push once:         python3 ${PUSH_DEST}"
+echo "     Auto-push on save: python3 ${PUSH_DEST} --watch"
 echo ""
