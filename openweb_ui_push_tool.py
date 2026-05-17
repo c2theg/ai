@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Auther: Christopher Gray
-Version: 0.1.5
+Version: 0.1.6
 Updated: 5/16/2026
 
 Updated from: https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/openweb_ui_push_tool.py
@@ -23,6 +23,7 @@ Usage:
     python3 openweb_ui_push_tool.py              # push once
     python3 openweb_ui_push_tool.py --watch      # push automatically on every file save
     python3 openweb_ui_push_tool.py --probe      # discover working API endpoints (run this if push fails)
+    python3 openweb_ui_push_tool.py --clean      # delete ALL versions of this tool then create one fresh copy
 """
 
 import os
@@ -225,6 +226,78 @@ sys.exit(1)
         raise RuntimeError(f"docker exec failed: {e}") from e
 
 
+def clean_and_push(content: str, meta: dict) -> None:
+    """Delete every version of this tool from the DB by name match, then create one fresh copy."""
+    token   = get_token()
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    base    = OWUI_URL.rstrip("/")
+
+    resp = requests.get(f"{base}/api/v1/tools/", headers=headers, timeout=10)
+    resp.raise_for_status()
+    all_tools = resp.json()
+
+    target_name = meta["name"].lower()
+    matches = [
+        t for t in all_tools
+        if target_name in t.get("name", "").lower()
+        or t.get("id", "") == meta["id"]
+    ]
+
+    if matches:
+        ids_to_delete = [t["id"] for t in matches]
+        print(f"Found {len(matches)} existing tool(s) to remove:")
+        for t in matches:
+            print(f"  - '{t['name']}' (id={t['id']})")
+
+        script = """
+import sqlite3, json, os, glob, sys
+ids = json.loads(sys.argv[1])
+candidates = ["/app/backend/data/webui.db", "/data/webui.db"]
+candidates += glob.glob("/app/**/*.db", recursive=True)
+for db_path in candidates:
+    if not os.path.exists(db_path):
+        continue
+    conn = sqlite3.connect(db_path)
+    has = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='tool'").fetchone()
+    if not has:
+        conn.close()
+        continue
+    for tid in ids:
+        conn.execute("DELETE FROM tool WHERE id=?", (tid,))
+    conn.commit()
+    conn.close()
+    print("deleted:" + db_path)
+    sys.exit(0)
+print("db_not_found")
+sys.exit(1)
+"""
+        result = subprocess.run(
+            ["docker", "exec", OWUI_CONTAINER, "python3", "-c", script,
+             json.dumps(ids_to_delete)],
+            capture_output=True, text=True, timeout=30,
+        )
+        out = result.stdout.strip()
+        if result.returncode != 0 or not out.startswith("deleted:"):
+            raise RuntimeError(f"Failed to delete from DB: {out or result.stderr}")
+        print(f"Deleted from {out[len('deleted:'):]}")
+    else:
+        print("No existing versions found — creating fresh.")
+
+    # Create the single clean copy
+    payload = {
+        "id":      meta["id"],
+        "name":    meta["name"],
+        "content": content,
+        "meta": {
+            "description": meta["description"],
+            "manifest":    {"version": meta["version"]},
+        },
+    }
+    resp = _call("POST", f"{base}/api/v1/tools/create", headers, payload)
+    resp.raise_for_status()
+    print(f"[{time.strftime('%H:%M:%S')}] Created  '{meta['name']}' (id={meta['id']})  v{meta['version']}  [clean install]")
+
+
 def probe() -> None:
     """Try every known endpoint pattern and print the HTTP status for each."""
     token   = get_token()
@@ -337,10 +410,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Push openwebui_tool.py to Open WebUI")
     parser.add_argument("--watch", action="store_true", help="Re-push on every file save")
     parser.add_argument("--probe", action="store_true", help="Discover working API endpoints")
+    parser.add_argument("--clean", action="store_true", help="Delete all versions of this tool then create one fresh copy")
     args = parser.parse_args()
 
     if args.probe:
         probe()
+    elif args.clean:
+        with open(TOOL_FILE, encoding="utf-8") as f:
+            content = f.read()
+        meta = extract_meta(content)
+        clean_and_push(content, meta)
     elif args.watch:
         watch()
     else:
