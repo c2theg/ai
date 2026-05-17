@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Auther: Christopher Gray
-Version: 0.1.0
+Version: 0.1.2
 Updated: 5/16/2026
 
 Updated from: https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/openweb_ui_push_tool.py
@@ -120,57 +120,44 @@ def push(content: str, meta: dict) -> None:
         },
     }
 
-    # POST /api/v1/tools/create appears to be an upsert in newer OWUI versions —
-    # probe returned 400 only because our test payload had empty content.
-    # Try it first for both create and update paths.
-    upsert_url = f"{base}/api/v1/tools/create"
-    resp = _call("POST", upsert_url, headers, payload)
-    if resp.status_code not in (404, 405):
-        if not resp.ok:
-            print(f"POST /api/v1/tools/create failed ({resp.status_code}): {resp.text[:300]}")
-            raise RuntimeError("Upsert via /create failed — see error above")
-        action = "Updated" if existing else "Created"
-        print(f"[{time.strftime('%H:%M:%S')}] {action}  '{meta['name']}' (id={meta['id']})  v{meta['version']}  [POST /api/v1/tools/create]")
-        return
-
     if existing:
+        # No working PUT/PATCH endpoint found in this OWUI version — delete then recreate.
         eid = existing["id"]
-        candidates = [
-            ("PUT",   f"{base}/api/v1/tools/{eid}"),
-            ("PATCH", f"{base}/api/v1/tools/{eid}"),
-            ("POST",  f"{base}/api/v1/tools/{eid}/update"),
-            ("POST",  f"{base}/api/v1/tools/{eid}"),
-            ("PUT",   f"{base}/api/v1/tools/id/{eid}"),
-            ("POST",  f"{base}/api/v1/tools/update"),
-            ("PUT",   f"{base}/api/tools/{eid}"),
-            ("POST",  f"{base}/api/tools/{eid}/update"),
-        ]
-        for method, url in candidates:
-            resp = _call(method, url, headers, payload)
-            if resp.status_code in (404, 405):
-                continue
-            resp.raise_for_status()
-            print(f"[{time.strftime('%H:%M:%S')}] Updated  '{meta['name']}' (id={eid})  v{meta['version']}  [{method} {url.split(base)[1]}]")
-            return
-        print("All update endpoints failed. Run with --probe to diagnose.")
-        raise RuntimeError("Could not update tool — no working endpoint found")
-    else:
-        candidates = [
-            ("POST", f"{base}/api/v1/tools/"),
-            ("POST", f"{base}/api/v1/tools/add"),
-            ("PUT",  f"{base}/api/v1/tools/"),
-            ("POST", f"{base}/api/tools/"),
-            ("POST", f"{base}/api/tools/add"),
-        ]
-        for method, url in candidates:
-            resp = _call(method, url, headers, payload)
-            if resp.status_code in (404, 405):
-                continue
-            resp.raise_for_status()
-            print(f"[{time.strftime('%H:%M:%S')}] Created  '{meta['name']}' (id={meta['id']})  v{meta['version']}  [{method} {url.split(base)[1]}]")
-            return
-        print("All create endpoints failed. Run with --probe to diagnose.")
-        raise RuntimeError("Could not create tool — no working endpoint found")
+        deleted = False
+        for method, url in [
+            ("DELETE", f"{base}/api/v1/tools/{eid}/delete"),
+            ("DELETE", f"{base}/api/v1/tools/{eid}"),
+            ("DELETE", f"{base}/api/tools/{eid}"),
+        ]:
+            resp = _call(method, url, headers, {})
+            if resp.status_code not in (404, 405):
+                resp.raise_for_status()
+                deleted = True
+                break
+
+        if not deleted:
+            # Last resort: try standard update verbs before giving up
+            for method, url in [
+                ("PUT",   f"{base}/api/v1/tools/{eid}"),
+                ("PATCH", f"{base}/api/v1/tools/{eid}"),
+                ("POST",  f"{base}/api/v1/tools/{eid}/update"),
+            ]:
+                resp = _call(method, url, headers, payload)
+                if resp.status_code not in (404, 405):
+                    resp.raise_for_status()
+                    print(f"[{time.strftime('%H:%M:%S')}] Updated  '{meta['name']}' (id={eid})  v{meta['version']}  [{method} {url.split(base)[1]}]")
+                    return
+            print("All update/delete endpoints failed. Run with --probe to diagnose.")
+            raise RuntimeError("Could not update tool — no working endpoint found")
+
+    # Create (or recreate after delete)
+    resp = _call("POST", f"{base}/api/v1/tools/create", headers, payload)
+    if resp.ok:
+        action = "Updated" if existing else "Created"
+        print(f"[{time.strftime('%H:%M:%S')}] {action}  '{meta['name']}' (id={meta['id']})  v{meta['version']}  [DELETE+POST /api/v1/tools/create]")
+        return
+    print(f"POST /api/v1/tools/create failed ({resp.status_code}): {resp.text[:300]}")
+    raise RuntimeError("Could not create tool — see error above")
 
 
 def probe() -> None:
