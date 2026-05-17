@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Auther: Christopher Gray
-Version: 0.0.6
+Version: 0.0.7
 Updated: 5/16/2026
 
 Updated from: https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/openweb_ui_push_tool.py
@@ -91,6 +91,11 @@ def extract_meta(content: str) -> dict:
     return {"id": tool_id, "name": title, "version": version, "description": desc}
 
 
+def _call(method: str, url: str, headers: dict, payload: dict) -> requests.Response:
+    resp = requests.request(method, url, headers=headers, json=payload, timeout=10)
+    return resp
+
+
 def push(content: str, meta: dict) -> None:
     token   = get_token()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -115,14 +120,34 @@ def push(content: str, meta: dict) -> None:
     }
 
     if existing:
-        eid  = existing["id"]
-        resp = requests.post(f"{base}/api/v1/tools/{eid}/update", headers=headers, json=payload, timeout=10)
-        resp.raise_for_status()
-        print(f"[{time.strftime('%H:%M:%S')}] Updated  '{meta['name']}' (id={eid})  v{meta['version']}")
+        eid = existing["id"]
+        # Try REST-style PUT first (newer OWUI), then legacy POST /{id}/update
+        candidates = [
+            ("PUT",  f"{base}/api/v1/tools/{eid}"),
+            ("POST", f"{base}/api/v1/tools/{eid}/update"),
+        ]
+        for method, url in candidates:
+            resp = _call(method, url, headers, payload)
+            if resp.status_code == 405:
+                continue
+            resp.raise_for_status()
+            print(f"[{time.strftime('%H:%M:%S')}] Updated  '{meta['name']}' (id={eid})  v{meta['version']}  [{method} {url.split('/api')[1]}]")
+            return
+        raise RuntimeError(f"Could not update — tried {[m for m,_ in candidates]}, all returned 405")
     else:
-        resp = requests.post(f"{base}/api/v1/tools/add", headers=headers, json=payload, timeout=10)
-        resp.raise_for_status()
-        print(f"[{time.strftime('%H:%M:%S')}] Created  '{meta['name']}' (id={meta['id']})  v{meta['version']}")
+        # Try POST / first (newer OWUI), then legacy POST /add
+        candidates = [
+            ("POST", f"{base}/api/v1/tools/"),
+            ("POST", f"{base}/api/v1/tools/add"),
+        ]
+        for method, url in candidates:
+            resp = _call(method, url, headers, payload)
+            if resp.status_code == 405:
+                continue
+            resp.raise_for_status()
+            print(f"[{time.strftime('%H:%M:%S')}] Created  '{meta['name']}' (id={meta['id']})  v{meta['version']}  [{method} {url.split('/api')[1]}]")
+            return
+        raise RuntimeError(f"Could not create — tried {[u.split('/api')[1] for _,u in candidates]}, all returned 405")
 
 
 def push_file() -> None:
