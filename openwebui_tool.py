@@ -2,7 +2,7 @@
 title: Web Search & URL Fetch
 author: Christopher Gray
 description: Search the web via SearXNG and fetch full URL content. Works with any model (Gemma, Qwen, Ollama, vLLM).
-version: 1.1.5
+version: 1.3.0
 updated: 5/16/2026
 
 Download from:  https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/openwebui_tool.py
@@ -135,73 +135,133 @@ class Tools:
 
     def get_weather(self, location: str) -> str:
         """
-        Get current weather and a 3-day forecast for any location — zip code, city name, airport code, or coordinates.
-        :param location: Location to get weather for (e.g. "80203", "Denver CO", "LAX", "48.85,2.35")
-        :return: Current conditions and forecast as plain text
+        Get current weather conditions and a 7-day forecast using the National Weather Service API (weather.gov). US locations only.
+        :param location: Zip code, city name, or "city, state" (e.g. "80203", "Denver", "Chicago, IL")
+        :return: Current conditions and 7-day forecast from NWS
         """
+        NWS_HEADERS = {
+            "User-Agent": "OpenWebUI-WeatherTool/1.0 (openwebui-tool)",
+            "Accept": "application/geo+json",
+        }
+
+        # Step 1: Geocode location to lat/lon
+        lat, lon, place_name = self._geocode_location(location)
+        if lat is None:
+            return f"Error: Could not find '{location}'. Try a zip code, city name, or 'City, ST'."
+
+        # Step 2: NWS grid lookup
         try:
             resp = requests.get(
-                f"https://wttr.in/{requests.utils.quote(location)}",
-                params={"format": "j1"},
-                headers={"User-Agent": "curl/7.68.0"},
+                f"https://api.weather.gov/points/{lat:.4f},{lon:.4f}",
+                headers=NWS_HEADERS,
                 timeout=10,
             )
             resp.raise_for_status()
-            data = resp.json()
-
-            current = data["current_condition"][0]
-            area = data.get("nearest_area", [{}])[0]
-
-            city = area.get("areaName", [{}])[0].get("value", "")
-            region = area.get("region", [{}])[0].get("value", "")
-            country = area.get("country", [{}])[0].get("value", "")
-            location_label = ", ".join(filter(None, [city, region, country])) or location
-
-            temp_f = current.get("temp_F", "?")
-            temp_c = current.get("temp_C", "?")
-            feels_f = current.get("FeelsLikeF", "?")
-            feels_c = current.get("FeelsLikeC", "?")
-            humidity = current.get("humidity", "?")
-            wind_mph = current.get("windspeedMiles", "?")
-            wind_dir = current.get("winddir16Point", "?")
-            visibility = current.get("visibility", "?")
-            desc = current.get("weatherDesc", [{}])[0].get("value", "?")
-            uv = current.get("uvIndex", "?")
-
-            lines = [
-                f"Weather for: {location_label}",
-                f"Conditions:  {desc}",
-                f"Temperature: {temp_f}°F / {temp_c}°C  (feels like {feels_f}°F / {feels_c}°C)",
-                f"Humidity:    {humidity}%",
-                f"Wind:        {wind_mph} mph {wind_dir}",
-                f"Visibility:  {visibility} miles",
-                f"UV Index:    {uv}",
-                "",
-                "3-Day Forecast:",
-            ]
-
-            for day in data.get("weather", []):
-                date = day.get("date", "")
-                hi_f = day.get("maxtempF", "?")
-                lo_f = day.get("mintempF", "?")
-                hi_c = day.get("maxtempC", "?")
-                lo_c = day.get("mintempC", "?")
-                day_desc = day.get("hourly", [{}])[4].get("weatherDesc", [{}])[0].get("value", "")
-                sunrise = day.get("astronomy", [{}])[0].get("sunrise", "")
-                sunset = day.get("astronomy", [{}])[0].get("sunset", "")
-                lines.append(
-                    f"  {date}: {day_desc} | Hi {hi_f}°F/{hi_c}°C  Lo {lo_f}°F/{lo_c}°C"
-                    + (f" | Sunrise {sunrise}  Sunset {sunset}" if sunrise else "")
-                )
-
-            return "\n".join(lines)
-
-        except requests.exceptions.Timeout:
-            return f"Error: Weather request timed out for '{location}'"
+            grid = resp.json()["properties"]
+            forecast_url  = grid["forecast"]
+            stations_url  = grid["observationStations"]
+            rel           = grid.get("relativeLocation", {}).get("properties", {})
+            city          = rel.get("city", "")
+            state         = rel.get("state", "")
+            if city and state:
+                place_name = f"{city}, {state}"
         except requests.exceptions.HTTPError as e:
-            return f"Error: Could not fetch weather for '{location}' (HTTP {e.response.status_code})"
+            if e.response.status_code == 404:
+                return f"Error: '{location}' is outside NWS coverage. The NWS API only covers US locations."
+            return f"Error: NWS grid lookup failed ({e.response.status_code})"
         except Exception as e:
-            return f"Weather error: {type(e).__name__}: {e}"
+            return f"Error: NWS grid lookup failed: {e}"
+
+        # Step 3: Current observations from nearest station
+        current_lines = [f"Weather for: {place_name}  (source: weather.gov)"]
+        try:
+            resp = requests.get(stations_url, headers=NWS_HEADERS, timeout=10)
+            resp.raise_for_status()
+            features = resp.json().get("features", [])
+            if features:
+                station_id = features[0]["properties"]["stationIdentifier"]
+                obs_resp = requests.get(
+                    f"https://api.weather.gov/stations/{station_id}/observations/latest",
+                    headers=NWS_HEADERS,
+                    timeout=10,
+                )
+                obs_resp.raise_for_status()
+                obs = obs_resp.json()["properties"]
+
+                def c_to_f(c):
+                    return round(c * 9 / 5 + 32) if c is not None else None
+
+                def deg_to_dir(d):
+                    if d is None:
+                        return ""
+                    dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"]
+                    return dirs[round(d / 22.5) % 16]
+
+                temp_c     = obs.get("temperature", {}).get("value")
+                feels_c    = (obs.get("windChill", {}) or obs.get("heatIndex", {})).get("value")
+                humidity   = obs.get("relativeHumidity", {}).get("value")
+                wind_ms    = obs.get("windSpeed", {}).get("value")
+                wind_deg   = obs.get("windDirection", {}).get("value")
+                vis_m      = obs.get("visibility", {}).get("value")
+                desc       = obs.get("textDescription", "")
+
+                temp_f   = c_to_f(temp_c)
+                feels_f  = c_to_f(feels_c)
+                wind_mph = round(wind_ms * 2.237) if wind_ms is not None else None
+                vis_mi   = round(vis_m / 1609.34, 1) if vis_m is not None else None
+
+                if desc:
+                    current_lines.append(f"Conditions:  {desc}")
+                if temp_f is not None:
+                    feels_str = f"  (feels like {feels_f}°F)" if feels_f is not None else ""
+                    current_lines.append(f"Temperature: {temp_f}°F / {temp_c:.0f}°C{feels_str}")
+                if humidity is not None:
+                    current_lines.append(f"Humidity:    {humidity:.0f}%")
+                if wind_mph is not None:
+                    current_lines.append(f"Wind:        {wind_mph} mph {deg_to_dir(wind_deg)}")
+                if vis_mi is not None:
+                    current_lines.append(f"Visibility:  {vis_mi} miles")
+        except Exception:
+            current_lines.append("(Current observations unavailable)")
+
+        # Step 4: 7-day forecast
+        forecast_lines = ["", "7-Day Forecast:"]
+        try:
+            resp = requests.get(forecast_url, headers=NWS_HEADERS, timeout=10)
+            resp.raise_for_status()
+            periods = resp.json()["properties"]["periods"]
+            for p in periods:
+                name   = p.get("name", "")
+                temp   = p.get("temperature", "?")
+                unit   = p.get("temperatureUnit", "F")
+                wind   = p.get("windSpeed", "")
+                wdir   = p.get("windDirection", "")
+                short  = p.get("shortForecast", "")
+                precip = (p.get("probabilityOfPrecipitation") or {}).get("value")
+                rain   = f"  Rain {precip}%" if precip is not None else ""
+                forecast_lines.append(f"  {name:<22} {temp}°{unit}  {wind} {wdir:<3}  {short}{rain}")
+        except Exception as e:
+            forecast_lines.append(f"  (Forecast unavailable: {e})")
+
+        return "\n".join(current_lines + forecast_lines)
+
+    def _geocode_location(self, location: str):
+        """Convert a location string to (lat, lon, display_name) via Nominatim. Returns (None, None, None) on failure."""
+        try:
+            resp = requests.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": location, "format": "json", "limit": 1, "countrycodes": "us"},
+                headers={"User-Agent": "OpenWebUI-WeatherTool/1.0"},
+                timeout=8,
+            )
+            resp.raise_for_status()
+            results = resp.json()
+            if results:
+                r = results[0]
+                return float(r["lat"]), float(r["lon"]), r.get("display_name", location)
+        except Exception:
+            pass
+        return None, None, None
 
     def get_stock_price(self, ticker: str) -> str:
         """
@@ -246,76 +306,106 @@ class Tools:
             return ""
 
     def _yahoo_quote(self, symbol: str) -> str:
+        # Yahoo Finance now requires a cookie + crumb for API access.
+        # We establish a session, grab the crumb, then call v7/finance/quote.
         try:
-            resp = requests.get(
-                f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}",
-                params={"modules": "price,summaryDetail"},
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    "Accept": "application/json",
-                },
+            ua = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            )
+            session = requests.Session()
+
+            # Step 1: seed the session cookie
+            session.get("https://fc.yahoo.com", headers={"User-Agent": ua}, timeout=8)
+
+            # Step 2: fetch crumb
+            crumb_resp = session.get(
+                "https://query2.finance.yahoo.com/v1/test/getcrumb",
+                headers={"User-Agent": ua, "Accept": "*/*"},
+                timeout=8,
+            )
+            crumb = crumb_resp.text.strip()
+            if not crumb or "<" in crumb:
+                return "Error: Yahoo Finance: could not obtain auth crumb"
+
+            # Step 3: fetch quote
+            resp = session.get(
+                "https://query1.finance.yahoo.com/v7/finance/quote",
+                params={"symbols": symbol, "crumb": crumb},
+                headers={"User-Agent": ua, "Accept": "application/json"},
                 timeout=10,
             )
             resp.raise_for_status()
-            result = resp.json()["quoteSummary"]["result"][0]
-            p = result["price"]
-            sd = result.get("summaryDetail", {})
 
-            name = p.get("longName") or p.get("shortName", symbol)
-            currency = p.get("currency", "USD")
-            market_state = p.get("marketState", "REGULAR")
-            exchange = p.get("exchangeName", "")
+            results = resp.json().get("quoteResponse", {}).get("result", [])
+            if not results:
+                return f"Error: Yahoo Finance returned no data for {symbol}"
 
-            current = p.get("regularMarketPrice", {}).get("raw")
+            q = results[0]
+
+            name         = q.get("longName") or q.get("shortName", symbol)
+            currency     = q.get("currency", "USD")
+            exchange     = q.get("fullExchangeName", "")
+            market_state = q.get("marketState", "REGULAR")
+            current      = q.get("regularMarketPrice")
             if current is None:
-                return f"Error: No price data returned for {symbol}"
+                return f"Error: Yahoo Finance returned no price for {symbol}"
 
-            change = p.get("regularMarketChange", {}).get("raw", 0)
-            pct = p.get("regularMarketChangePercent", {}).get("raw", 0)
-            sign = "+" if change >= 0 else ""
+            change = q.get("regularMarketChange", 0)
+            pct    = q.get("regularMarketChangePercent", 0)
+            sign   = "+" if change >= 0 else ""
 
             def f(v):
                 return f"${v:,.2f}" if v is not None else "N/A"
 
-            open_raw = p.get("regularMarketOpen", {}).get("raw")
-            prev_raw = p.get("regularMarketPreviousClose", {}).get("raw")
-            hi_raw = p.get("regularMarketDayHigh", {}).get("raw")
-            lo_raw = p.get("regularMarketDayLow", {}).get("raw")
-            vol_fmt = p.get("regularMarketVolume", {}).get("fmt", "N/A")
-            avg_vol = p.get("averageDailyVolume3Month", {}).get("fmt", "N/A")
-            mktcap = p.get("marketCap", {}).get("fmt")
-            wk52_hi = sd.get("fiftyTwoWeekHigh", {}).get("raw")
-            wk52_lo = sd.get("fiftyTwoWeekLow", {}).get("raw")
+            def fmt_vol(v):
+                if v is None:
+                    return "N/A"
+                for thresh, sfx in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+                    if v >= thresh:
+                        return f"{v / thresh:.2f}{sfx}"
+                return str(int(v))
+
+            def fmt_cap(v):
+                if v is None:
+                    return "N/A"
+                for thresh, sfx in ((1e12, "T"), (1e9, "B"), (1e6, "M")):
+                    if v >= thresh:
+                        return f"${v / thresh:.2f}{sfx}"
+                return f"${v:,.0f}"
 
             lines = [
                 f"Stock: {name} ({symbol})  |  {exchange}  |  {market_state}  |  {currency}",
-                f"Price:       {f(current)}  ({sign}{change:.2f} / {sign}{pct * 100:.2f}% today)",
+                f"Price:       {f(current)}  ({sign}{change:.2f} / {sign}{pct:.2f}% today)",
             ]
 
             if market_state == "PRE":
-                pre = p.get("preMarketPrice", {}).get("raw")
-                pre_chg = p.get("preMarketChange", {}).get("raw", 0)
-                pre_pct = p.get("preMarketChangePercent", {}).get("raw", 0)
+                pre     = q.get("preMarketPrice")
+                pre_chg = q.get("preMarketChange", 0)
+                pre_pct = q.get("preMarketChangePercent", 0)
                 if pre:
                     s = "+" if pre_chg >= 0 else ""
-                    lines.append(f"Pre-Market:  {f(pre)}  ({s}{pre_chg:.2f} / {s}{pre_pct * 100:.2f}%)")
+                    lines.append(f"Pre-Market:  {f(pre)}  ({s}{pre_chg:.2f} / {s}{pre_pct:.2f}%)")
             elif market_state in ("POST", "POSTPOST"):
-                post = p.get("postMarketPrice", {}).get("raw")
-                post_chg = p.get("postMarketChange", {}).get("raw", 0)
-                post_pct = p.get("postMarketChangePercent", {}).get("raw", 0)
+                post     = q.get("postMarketPrice")
+                post_chg = q.get("postMarketChange", 0)
+                post_pct = q.get("postMarketChangePercent", 0)
                 if post:
                     s = "+" if post_chg >= 0 else ""
-                    lines.append(f"After-Hours: {f(post)}  ({s}{post_chg:.2f} / {s}{post_pct * 100:.2f}%)")
+                    lines.append(f"After-Hours: {f(post)}  ({s}{post_chg:.2f} / {s}{post_pct:.2f}%)")
 
             lines += [
-                f"Open:        {f(open_raw)}   Prev Close: {f(prev_raw)}",
-                f"Day Range:   {f(lo_raw)} – {f(hi_raw)}",
+                f"Open:        {f(q.get('regularMarketOpen'))}   Prev Close: {f(q.get('regularMarketPreviousClose'))}",
+                f"Day Range:   {f(q.get('regularMarketDayLow'))} – {f(q.get('regularMarketDayHigh'))}",
             ]
+            wk52_hi = q.get("fiftyTwoWeekHigh")
+            wk52_lo = q.get("fiftyTwoWeekLow")
             if wk52_hi and wk52_lo:
                 lines.append(f"52-Wk Range: {f(wk52_lo)} – {f(wk52_hi)}")
-            lines.append(f"Volume:      {vol_fmt}   Avg Volume: {avg_vol}")
-            if mktcap:
-                lines.append(f"Market Cap:  {mktcap}")
+            lines.append(f"Volume:      {fmt_vol(q.get('regularMarketVolume'))}   Avg Volume: {fmt_vol(q.get('averageDailyVolume3Month'))}")
+            if q.get("marketCap"):
+                lines.append(f"Market Cap:  {fmt_cap(q.get('marketCap'))}")
 
             return "\n".join(lines)
 
