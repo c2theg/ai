@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Auther: Christopher Gray
-Version: 0.1.2
+Version: 0.1.3
 Updated: 5/16/2026
 
 Updated from: https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/openweb_ui_push_tool.py
@@ -125,8 +125,9 @@ def push(content: str, meta: dict) -> None:
         eid = existing["id"]
         deleted = False
         for method, url in [
-            ("DELETE", f"{base}/api/v1/tools/{eid}/delete"),
             ("DELETE", f"{base}/api/v1/tools/{eid}"),
+            ("POST",   f"{base}/api/v1/tools/{eid}/delete"),
+            ("DELETE", f"{base}/api/v1/tools/{eid}/delete"),
             ("DELETE", f"{base}/api/tools/{eid}"),
         ]:
             resp = _call(method, url, headers, {})
@@ -178,25 +179,44 @@ def probe() -> None:
     print(f"{'METHOD':<8} {'ENDPOINT':<55} STATUS")
     print("-" * 75)
 
+    # Try to fetch the OpenAPI spec so we can see all real endpoints
+    for spec_path in ("/openapi.json", "/docs/openapi.json", "/api/openapi.json"):
+        try:
+            r = requests.get(base + spec_path, headers=headers, timeout=6)
+            if r.ok:
+                paths = list(r.json().get("paths", {}).keys())
+                tool_paths = [p for p in paths if "tool" in p.lower()]
+                print(f"OpenAPI spec found at {spec_path}")
+                print(f"  Tool-related paths: {tool_paths}")
+                break
+        except Exception:
+            pass
+
     probe_urls = [
-        # update candidates
-        ("GET",   f"/api/v1/tools/"),
-        ("GET",   f"/api/tools/"),
-        ("PUT",   f"/api/v1/tools/{eid}"),
-        ("PATCH", f"/api/v1/tools/{eid}"),
-        ("POST",  f"/api/v1/tools/{eid}"),
-        ("POST",  f"/api/v1/tools/{eid}/update"),
-        ("PUT",   f"/api/v1/tools/id/{eid}"),
-        ("POST",  f"/api/v1/tools/update"),
-        ("PUT",   f"/api/tools/{eid}"),
-        ("POST",  f"/api/tools/{eid}/update"),
-        # create candidates
-        ("POST",  f"/api/v1/tools/"),
-        ("POST",  f"/api/v1/tools/add"),
-        ("POST",  f"/api/v1/tools/create"),
-        ("PUT",   f"/api/v1/tools/"),
-        ("POST",  f"/api/tools/"),
-        ("POST",  f"/api/tools/add"),
+        # list
+        ("GET",    f"/api/v1/tools/"),
+        ("GET",    f"/api/tools/"),
+        # read single
+        ("GET",    f"/api/v1/tools/{eid}"),
+        # update
+        ("PUT",    f"/api/v1/tools/{eid}"),
+        ("PATCH",  f"/api/v1/tools/{eid}"),
+        ("POST",   f"/api/v1/tools/{eid}"),
+        ("POST",   f"/api/v1/tools/{eid}/update"),
+        ("PUT",    f"/api/v1/tools/id/{eid}"),
+        ("POST",   f"/api/v1/tools/update"),
+        # delete
+        ("DELETE", f"/api/v1/tools/{eid}"),
+        ("DELETE", f"/api/v1/tools/{eid}/delete"),
+        ("POST",   f"/api/v1/tools/{eid}/delete"),
+        ("DELETE", f"/api/tools/{eid}"),
+        # create
+        ("POST",   f"/api/v1/tools/"),
+        ("POST",   f"/api/v1/tools/add"),
+        ("POST",   f"/api/v1/tools/create"),
+        ("PUT",    f"/api/v1/tools/"),
+        ("POST",   f"/api/tools/"),
+        ("POST",   f"/api/tools/add"),
     ]
 
     for method, path in probe_urls:
@@ -204,6 +224,7 @@ def probe() -> None:
         try:
             r = requests.request(method, url, headers=headers, json=dummy, timeout=8)
             status = r.status_code
+            allow  = r.headers.get("Allow", "")
             note   = ""
             if status < 300:
                 note = " <-- WORKS"
@@ -212,7 +233,7 @@ def probe() -> None:
             elif status == 404:
                 note = " (not found)"
             elif status == 405:
-                note = " (wrong method)"
+                note = f" (wrong method — allowed: {allow})" if allow else " (wrong method)"
             elif status == 422:
                 note = " (endpoint exists, payload rejected)"
             print(f"{method:<8} {path:<55} {status}{note}")
