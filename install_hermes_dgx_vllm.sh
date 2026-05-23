@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # By: Christopher Gray
-# Version: 0.0.10
+# Version: 0.0.12
 # Updated: 5/23/2026
 
 
@@ -122,11 +122,13 @@ PYEOF
 
 # Find the Python interpreter that has vllm installed.
 # Strategy (in order):
-#   1. vllm CLI binary in PATH  → derive Python from its bin/ dir
-#   2. Each Python candidate    → test "import vllm"
-#   3. Common virtualenv / conda roots → same test
+#   1. vllm CLI binary in PATH      → sibling python in the same bin/ dir
+#   2. pip/pip3 show vllm           → derive Python from reported Location path
+#   3. Named Python candidates      → test "import vllm"
+#   4. Common venv / conda roots    → test "import vllm"
+#   5. find site-packages           → locate vllm dir, derive Python version
 find_python_with_vllm() {
-    # 1. vllm CLI exists — its sibling python is the right one
+    # 1. vllm CLI on PATH — its bin/ neighbour is the right Python
     if command -v vllm &>/dev/null; then
         local bin_dir
         bin_dir=$(dirname "$(command -v vllm)")
@@ -135,18 +137,42 @@ find_python_with_vllm() {
         done
     fi
 
-    # 2. Named Python candidates in PATH
+    # 2. Ask pip where vllm lives, then resolve the owning Python
+    for pip_cmd in pip3 pip pip3.13 pip3.12 pip3.11 pip3.10; do
+        command -v "$pip_cmd" &>/dev/null || continue
+        local loc
+        loc=$("$pip_cmd" show vllm 2>/dev/null | awk '/^Location:/{print $2}')
+        [[ -z "$loc" ]] && continue
+        # Location is e.g. /home/user/.local/lib/python3.12/site-packages
+        # or /opt/vllm/lib/python3.11/site-packages
+        local pyver
+        pyver=$(echo "$loc" | grep -oP 'python3\.\d+' | head -1)
+        if [[ -n "$pyver" ]]; then
+            # Try the system binary for that version
+            for py in "/usr/bin/$pyver" "/usr/local/bin/$pyver" \
+                      "$(echo "$loc" | sed "s|/lib/${pyver}/site-packages||")/bin/$pyver" \
+                      "$pyver"; do
+                command -v "$py" &>/dev/null || continue
+                "$py" -c "import vllm" 2>/dev/null && { echo "$py"; return 0; }
+            done
+        fi
+        # Fallback: use the pip binary's own Python
+        local pip_py
+        pip_py=$(dirname "$(command -v "$pip_cmd")")/python3
+        [[ -x "$pip_py" ]] && "$pip_py" -c "import vllm" 2>/dev/null && { echo "$pip_py"; return 0; }
+    done
+
+    # 3. Named Python candidates in PATH
     for py in python3.13 python3.12 python3.11 python3.10 python3 python; do
         command -v "$py" &>/dev/null || continue
         "$py" -c "import vllm" 2>/dev/null || continue
-        local minor
-        minor=$("$py" -c "import sys; print(sys.version_info.minor)")
-        local major
+        local major minor
         major=$("$py" -c "import sys; print(sys.version_info.major)")
+        minor=$("$py" -c "import sys; print(sys.version_info.minor)")
         (( major == 3 && minor >= MIN_PYTHON_MINOR )) && { echo "$py"; return 0; }
     done
 
-    # 3. Common virtualenv / conda / opt locations
+    # 4. Common virtualenv / conda / opt locations
     local search_roots=(
         "$HOME/.venv"
         "$HOME/venv"
@@ -160,21 +186,38 @@ find_python_with_vllm() {
         "/usr/local"
     )
     for root in "${search_roots[@]}"; do
+        [[ -d "$root" ]] || continue
         for py in "$root/bin/python3" "$root/bin/python"; do
             [[ -x "$py" ]] || continue
             "$py" -c "import vllm" 2>/dev/null || continue
-            local minor major
+            local major minor
             major=$("$py" -c "import sys; print(sys.version_info.major)")
             minor=$("$py" -c "import sys; print(sys.version_info.minor)")
             (( major == 3 && minor >= MIN_PYTHON_MINOR )) && { echo "$py"; return 0; }
         done
-        # conda envs subdirectory
         for py in "$root"/envs/*/bin/python3; do
             [[ -x "$py" ]] || continue
             "$py" -c "import vllm" 2>/dev/null || continue
             echo "$py"; return 0
         done
     done
+
+    # 5. Filesystem search for vllm package dir → derive Python version
+    local vllm_dir
+    vllm_dir=$(find "$HOME/.local" /usr/local /usr/lib /opt \
+                    -maxdepth 8 -name "vllm" -type d \
+                    -path "*/site-packages/*" 2>/dev/null \
+               | head -1)
+    if [[ -n "$vllm_dir" ]]; then
+        local pyver
+        pyver=$(echo "$vllm_dir" | grep -oP 'python3\.\d+' | head -1)
+        if [[ -n "$pyver" ]]; then
+            for py in "/usr/bin/$pyver" "/usr/local/bin/$pyver" "$pyver"; do
+                command -v "$py" &>/dev/null || continue
+                "$py" -c "import vllm" 2>/dev/null && { echo "$py"; return 0; }
+            done
+        fi
+    fi
 
     return 1
 }
@@ -190,10 +233,24 @@ check_prerequisites() {
     require_cmd git  "sudo apt install git"
 
     # Find the Python that actually has vllm
+    # Override: VLLM_PYTHON=/path/to/python bash install.sh
     log_info "Searching for Python environment with vllm…"
-    local py
-    py=$(find_python_with_vllm 2>/dev/null) \
-        || die "Could not find a Python 3.${MIN_PYTHON_MINOR}+ environment with vllm installed.\nActivate your venv first, or ensure 'vllm' is on PATH."
+    local py="${VLLM_PYTHON:-}"
+    if [[ -n "$py" ]]; then
+        [[ -x "$py" ]] || die "VLLM_PYTHON='$py' is not executable."
+        "$py" -c "import vllm" 2>/dev/null \
+            || die "VLLM_PYTHON='$py' cannot import vllm. Check your environment."
+    elif ! py=$(find_python_with_vllm 2>/dev/null) || [[ -z "$py" ]]; then
+        # Diagnostic: show where pip thinks vllm lives (if anywhere)
+        local pip_loc
+        pip_loc=$(pip3 show vllm 2>/dev/null | awk '/^Location:/{print $2}' || true)
+        if [[ -n "$pip_loc" ]]; then
+            log_warn "pip3 reports vllm at: $pip_loc"
+            log_warn "But no Python there could 'import vllm' — possible missing CUDA libs."
+            log_warn "Try: cd $pip_loc && python3 -c 'import vllm'"
+        fi
+        die "Could not find a Python 3.${MIN_PYTHON_MINOR}+ environment with vllm installed.\nActivate your venv first, or set VLLM_PYTHON=/path/to/python and re-run."
+    fi
 
     PYTHON="$py"
     local vver
