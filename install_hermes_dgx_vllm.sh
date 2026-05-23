@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # By: Christopher Gray
-# Version: 0.0.14
+# Version: 0.0.16
 # Updated: 5/23/2026
 
 
@@ -71,10 +71,20 @@ die() { log_error "$*"; exit 1; }
 require_cmd() { command -v "$1" &>/dev/null || die "Required command '$1' not found. $2"; }
 
 total_vram_gb() {
+    # Use memory.total — free will be 0 if a model is already loaded.
+    # GB10 (DGX Spark) reports "Not Supported" for memory queries; fall back
+    # to half of system RAM as a conservative estimate in that case.
     local mib
-    mib=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null \
+    mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null \
           | awk '{s+=$1} END {print int(s)}')
-    echo $(( mib / 1024 ))
+    if (( mib > 0 )); then
+        echo $(( mib / 1024 ))
+    else
+        # GB10 unified memory: use half of total system RAM
+        local ram_kb
+        ram_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+        echo $(( ram_kb / 1024 / 1024 / 2 ))
+    fi
 }
 
 gpu_count() { nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l; }
@@ -276,20 +286,108 @@ detect_gpu() {
     TP=$(tensor_parallel)
 
     log_info "GPUs        : $NGPUS"
-    log_info "Free VRAM   : ${VRAM_GB} GiB (combined)"
+    log_info "Total VRAM  : ${VRAM_GB} GiB"
     log_info "Tensor par. : $TP"
 
-    (( VRAM_GB >= 8 )) || die "Less than 8 GiB free GPU memory."
+    # Print per-GPU details
+    nvidia-smi --query-gpu=index,name,memory.total,memory.used,utilization.gpu,temperature.gpu \
+               --format=csv,noheader 2>/dev/null \
+    | while IFS=',' read -r idx name mtotal mused util temp; do
+        log_info "  GPU${idx}: ${name} | ${mused// /} / ${mtotal// /} | util ${util// /} | ${temp// /}"
+      done || true
+
+    # If vllm is already running the GPU is occupied — that's expected, not an error
+    if "$VLLM_RUNNING"; then
+        log_info "vllm already running — skipping VRAM floor check."
+    elif (( VRAM_GB < 8 )); then
+        die "Less than 8 GiB total GPU memory detected. Check nvidia-smi."
+    fi
+}
+
+# Extract --port value from a process's cmdline by pid
+_vllm_port_from_pid() {
+    local pid="$1"
+    tr '\0' '\n' < /proc/"$pid"/cmdline 2>/dev/null \
+        | grep -A1 -- '--port' | tail -1 \
+        | grep -E '^[0-9]+$' || true
+}
+
+# Print all models + GPU stats for a live vllm server
+_show_vllm_status() {
+    local host="$1" port="$2"
+    local resp
+    resp=$(curl -sf --max-time 5 "http://${host}:${port}/v1/models" \
+                -H "Authorization: Bearer ${VLLM_API_KEY}" 2>/dev/null \
+           || curl -sf --max-time 5 "http://${host}:${port}/v1/models" 2>/dev/null \
+           || echo "")
+    [[ -z "$resp" ]] && return 1
+
+    echo ""
+    log_info "─── vllm at http://${host}:${port}/v1 ───────────────"
+    $PYTHON - "$resp" <<'PYEOF'
+import sys, json, datetime
+try:
+    data = json.loads(sys.argv[1])
+    for m in data.get("data", []):
+        ts = datetime.datetime.fromtimestamp(m.get("created", 0)) if m.get("created") else "unknown"
+        print(f"    model   : {m['id']}")
+        print(f"    owned_by: {m.get('owned_by','?')}   created: {ts}")
+        print()
+except Exception as e:
+    print(f"  (parse error: {e})")
+PYEOF
+
+    log_info "─── GPU state ───────────────────────────────────────"
+    nvidia-smi --query-gpu=index,name,memory.total,memory.used,utilization.gpu,temperature.gpu \
+               --format=csv,noheader 2>/dev/null \
+    | while IFS=',' read -r idx name mtotal mused util temp; do
+        log_info "  GPU${idx}: ${name} | ${mused// /} / ${mtotal// /} | util ${util// /} | ${temp// /}"
+      done || true
+
+    # Running processes on the GPU
+    log_info "─── GPU processes ───────────────────────────────────"
+    nvidia-smi --query-compute-apps=pid,used_memory,name \
+               --format=csv,noheader 2>/dev/null \
+    | while IFS=',' read -r pid mem name; do
+        log_info "  PID ${pid// /}: ${name// /}  (${mem// /})"
+      done || true
+    echo ""
 }
 
 # ─── step 2: detect already-running vllm ─────────────────────────────────────
 detect_running_vllm() {
     log_step "Detecting running vllm server"
 
-    # Build probe list: configured port first, then the rest of the common ports
-    local probe_ports=("$VLLM_PORT")
-    for p in "${VLLM_PROBE_PORTS[@]}"; do
-        [[ "$p" != "$VLLM_PORT" ]] && probe_ports+=("$p")
+    # ── A. Process-based detection ──────────────────────────────────────────
+    # Find any running vllm API server processes and extract their port
+    local proc_ports=()
+    local pids
+    pids=$(pgrep -f "vllm" 2>/dev/null || true)
+    for pid in $pids; do
+        local cmdline_port
+        cmdline_port=$(_vllm_port_from_pid "$pid")
+        [[ -n "$cmdline_port" ]] && proc_ports+=("$cmdline_port")
+    done
+
+    # Also scan listening sockets for Python processes (ss preferred, netstat fallback)
+    local sock_ports=()
+    if command -v ss &>/dev/null; then
+        while IFS= read -r p; do sock_ports+=("$p"); done < <(
+            ss -tlnp 2>/dev/null | awk '/python/{print $4}' | grep -oP ':\K[0-9]+$' || true
+        )
+    elif command -v netstat &>/dev/null; then
+        while IFS= read -r p; do sock_ports+=("$p"); done < <(
+            netstat -tlnp 2>/dev/null | awk '/python/{print $4}' | grep -oP ':\K[0-9]+$' || true
+        )
+    fi
+
+    # ── B. Port probe list ───────────────────────────────────────────────────
+    # Process-detected ports first, then configured port, then common defaults
+    local seen=()
+    local probe_ports=()
+    for p in "${proc_ports[@]}" "${sock_ports[@]}" "$VLLM_PORT" "${VLLM_PROBE_PORTS[@]}"; do
+        [[ " ${seen[*]} " == *" $p "* ]] && continue
+        seen+=("$p"); probe_ports+=("$p")
     done
 
     for port in "${probe_ports[@]}"; do
@@ -303,7 +401,8 @@ detect_running_vllm() {
             SELECTED_DESC="$model_id (already running)"
             SELECTED_QUANT=""
             SELECTED_CTX="32768"
-            log_ok "Found running vllm on port $port — model: $model_id"
+            log_ok "Found running vllm on port $port"
+            _show_vllm_status "$VLLM_HOST" "$port"
             return 0
         fi
     done
@@ -547,7 +646,7 @@ print_summary() {
     echo ""
     echo -e "  Model       : ${BOLD}${SELECTED_DESC}${NC}"
     echo -e "  vllm API    : http://${VLLM_HOST}:${VLLM_PORT}/v1  (${vllm_origin})"
-    echo -e "  GPUs / VRAM : ${NGPUS} GPU(s) — ${VRAM_GB} GiB free"
+    echo -e "  GPUs / VRAM : ${NGPUS} GPU(s) — ${VRAM_GB} GiB total"
     echo ""
     echo -e "  ${BOLD}Commands:${NC}"
     echo -e "    hermes                                   # start the agent"
@@ -572,8 +671,8 @@ main() {
     echo ""
 
     check_prerequisites   # verify vllm installed, Python, nvidia-smi
-    detect_gpu            # NGPUS, VRAM_GB, TP
-    detect_running_vllm   # probe common ports; sets VLLM_RUNNING + SELECTED_MODEL if found
+    detect_running_vllm   # ps + port probe; sets VLLM_RUNNING + SELECTED_MODEL if found
+    detect_gpu            # NGPUS, VRAM_GB, TP (skips VRAM floor if VLLM_RUNNING)
     select_model          # no-op if VLLM_RUNNING; otherwise pick best fit from catalogue
     setup_vllm_service    # no-op if VLLM_RUNNING; write systemd unit
     start_vllm            # no-op if VLLM_RUNNING; start and wait for health
