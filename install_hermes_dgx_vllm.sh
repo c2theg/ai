@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
+# By: Christopher Gray
+# Version: 0.0.10
+# Updated: 5/23/2026
+
+
 # Hermes Agent — DGX Spark Install Script
 # Installs Hermes Agent backed by a local vllm server.
 # Detects any already-running vllm instance and uses its loaded model.
 # If nothing is running, picks the best Hermes model for available VRAM
 # and starts vllm as a systemd service.
-# By Christopher Gray
-# version 0.0.10
-# updated 5/23/2026
-
-
-# curl https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_hermes_dgx_vllm.sh
+#
+# Install:
+#   curl -fsSL https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_hermes_dgx_vllm.sh | bash
 
 set -euo pipefail
 
@@ -118,6 +120,65 @@ sys.exit(1)
 PYEOF
 }
 
+# Find the Python interpreter that has vllm installed.
+# Strategy (in order):
+#   1. vllm CLI binary in PATH  → derive Python from its bin/ dir
+#   2. Each Python candidate    → test "import vllm"
+#   3. Common virtualenv / conda roots → same test
+find_python_with_vllm() {
+    # 1. vllm CLI exists — its sibling python is the right one
+    if command -v vllm &>/dev/null; then
+        local bin_dir
+        bin_dir=$(dirname "$(command -v vllm)")
+        for py in "$bin_dir/python3" "$bin_dir/python"; do
+            [[ -x "$py" ]] && "$py" -c "import vllm" 2>/dev/null && { echo "$py"; return 0; }
+        done
+    fi
+
+    # 2. Named Python candidates in PATH
+    for py in python3.13 python3.12 python3.11 python3.10 python3 python; do
+        command -v "$py" &>/dev/null || continue
+        "$py" -c "import vllm" 2>/dev/null || continue
+        local minor
+        minor=$("$py" -c "import sys; print(sys.version_info.minor)")
+        local major
+        major=$("$py" -c "import sys; print(sys.version_info.major)")
+        (( major == 3 && minor >= MIN_PYTHON_MINOR )) && { echo "$py"; return 0; }
+    done
+
+    # 3. Common virtualenv / conda / opt locations
+    local search_roots=(
+        "$HOME/.venv"
+        "$HOME/venv"
+        "$HOME/.virtualenvs"/*
+        "$HOME/miniconda3"
+        "$HOME/anaconda3"
+        "$HOME/mambaforge"
+        "/opt/conda"
+        "/opt/vllm"
+        "/opt/python"
+        "/usr/local"
+    )
+    for root in "${search_roots[@]}"; do
+        for py in "$root/bin/python3" "$root/bin/python"; do
+            [[ -x "$py" ]] || continue
+            "$py" -c "import vllm" 2>/dev/null || continue
+            local minor major
+            major=$("$py" -c "import sys; print(sys.version_info.major)")
+            minor=$("$py" -c "import sys; print(sys.version_info.minor)")
+            (( major == 3 && minor >= MIN_PYTHON_MINOR )) && { echo "$py"; return 0; }
+        done
+        # conda envs subdirectory
+        for py in "$root"/envs/*/bin/python3; do
+            [[ -x "$py" ]] || continue
+            "$py" -c "import vllm" 2>/dev/null || continue
+            echo "$py"; return 0
+        done
+    done
+
+    return 1
+}
+
 # ─── step 0: prerequisites ────────────────────────────────────────────────────
 check_prerequisites() {
     log_step "Checking prerequisites"
@@ -128,30 +189,17 @@ check_prerequisites() {
     require_cmd curl "sudo apt install curl"
     require_cmd git  "sudo apt install git"
 
-    # Resolve Python 3.11+
-    local py=""
-    for candidate in python3.12 python3.11 python3; do
-        if command -v "$candidate" &>/dev/null; then
-            local major minor
-            major=$("$candidate" -c "import sys; print(sys.version_info.major)")
-            minor=$("$candidate" -c "import sys; print(sys.version_info.minor)")
-            if (( major == 3 && minor >= MIN_PYTHON_MINOR )); then
-                py="$candidate"; break
-            fi
-        fi
-    done
-    [[ -n "$py" ]] || die "Python 3.${MIN_PYTHON_MINOR}+ required. Install via 'sudo apt install python3.11'."
-    PYTHON="$py"
-    log_ok "Python: $($PYTHON --version)"
+    # Find the Python that actually has vllm
+    log_info "Searching for Python environment with vllm…"
+    local py
+    py=$(find_python_with_vllm 2>/dev/null) \
+        || die "Could not find a Python 3.${MIN_PYTHON_MINOR}+ environment with vllm installed.\nActivate your venv first, or ensure 'vllm' is on PATH."
 
-    # Verify vllm is importable (user already has it installed)
-    if $PYTHON -c "import vllm" 2>/dev/null; then
-        local vver
-        vver=$($PYTHON -c "import vllm; print(vllm.__version__)" 2>/dev/null || echo "unknown")
-        log_ok "vllm: $vver"
-    else
-        die "vllm is not importable by $PYTHON. Check your environment / virtualenv."
-    fi
+    PYTHON="$py"
+    local vver
+    vver=$($PYTHON -c "import vllm; print(vllm.__version__)" 2>/dev/null || echo "unknown")
+    log_ok "Python : $($PYTHON --version)  [$PYTHON]"
+    log_ok "vllm   : $vver"
 
     log_ok "Prerequisites satisfied."
 }
