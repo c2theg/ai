@@ -4,6 +4,12 @@
 # Detects any already-running vllm instance and uses its loaded model.
 # If nothing is running, picks the best Hermes model for available VRAM
 # and starts vllm as a systemd service.
+# By Christopher Gray
+# version 0.0.10
+# updated 5/23/2026
+
+
+# curl https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_hermes_dgx_vllm.sh
 
 set -euo pipefail
 
