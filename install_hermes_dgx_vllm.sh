@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # By: Christopher Gray
-# Version: 0.0.12
+# Version: 0.0.14
 # Updated: 5/23/2026
 
 
@@ -120,101 +120,105 @@ sys.exit(1)
 PYEOF
 }
 
-# Find the Python interpreter that has vllm installed.
-# Strategy (in order):
-#   1. vllm CLI binary in PATH      → sibling python in the same bin/ dir
-#   2. pip/pip3 show vllm           → derive Python from reported Location path
-#   3. Named Python candidates      → test "import vllm"
-#   4. Common venv / conda roots    → test "import vllm"
-#   5. find site-packages           → locate vllm dir, derive Python version
+# Find the Python interpreter whose pip owns the vllm package.
+# Deliberately does NOT require "import vllm" to succeed — vllm's CUDA/torch
+# dependencies can fail at import time even when the package is correctly
+# installed (missing LD_LIBRARY_PATH, GPU not initialised, etc.).
+# We only need to know which Python to hand to the systemd service.
 find_python_with_vllm() {
-    # 1. vllm CLI on PATH — its bin/ neighbour is the right Python
+    # Helper: return $1 if it's a Python 3.MIN_PYTHON_MINOR+ executable
+    _acceptable_py() {
+        [[ -x "$1" ]] || return 1
+        local major minor
+        major=$("$1" -c "import sys; print(sys.version_info.major)" 2>/dev/null) || return 1
+        minor=$("$1" -c "import sys; print(sys.version_info.minor)" 2>/dev/null) || return 1
+        (( major == 3 && minor >= MIN_PYTHON_MINOR ))
+    }
+
+    # 1. vllm CLI on PATH — its bin/ sibling is the right Python
     if command -v vllm &>/dev/null; then
         local bin_dir
         bin_dir=$(dirname "$(command -v vllm)")
         for py in "$bin_dir/python3" "$bin_dir/python"; do
-            [[ -x "$py" ]] && "$py" -c "import vllm" 2>/dev/null && { echo "$py"; return 0; }
+            _acceptable_py "$py" && { echo "$py"; return 0; }
         done
     fi
 
-    # 2. Ask pip where vllm lives, then resolve the owning Python
+    # 2. pip show vllm — works even when "import vllm" fails
     for pip_cmd in pip3 pip pip3.13 pip3.12 pip3.11 pip3.10; do
         command -v "$pip_cmd" &>/dev/null || continue
         local loc
         loc=$("$pip_cmd" show vllm 2>/dev/null | awk '/^Location:/{print $2}')
         [[ -z "$loc" ]] && continue
-        # Location is e.g. /home/user/.local/lib/python3.12/site-packages
-        # or /opt/vllm/lib/python3.11/site-packages
+
+        # Derive python version from path: .../lib/python3.12/site-packages
         local pyver
         pyver=$(echo "$loc" | grep -oP 'python3\.\d+' | head -1)
         if [[ -n "$pyver" ]]; then
-            # Try the system binary for that version
-            for py in "/usr/bin/$pyver" "/usr/local/bin/$pyver" \
-                      "$(echo "$loc" | sed "s|/lib/${pyver}/site-packages||")/bin/$pyver" \
-                      "$pyver"; do
-                command -v "$py" &>/dev/null || continue
-                "$py" -c "import vllm" 2>/dev/null && { echo "$py"; return 0; }
+            local prefix
+            prefix=$(echo "$loc" | sed "s|/lib/${pyver}/site-packages.*||")
+            for py in "$prefix/bin/$pyver" "$prefix/bin/python3" \
+                      "/usr/bin/$pyver" "/usr/local/bin/$pyver" "$pyver"; do
+                _acceptable_py "$py" && { echo "$py"; return 0; }
             done
         fi
-        # Fallback: use the pip binary's own Python
+
+        # pip's own sibling Python
         local pip_py
-        pip_py=$(dirname "$(command -v "$pip_cmd")")/python3
-        [[ -x "$pip_py" ]] && "$pip_py" -c "import vllm" 2>/dev/null && { echo "$pip_py"; return 0; }
+        pip_py="$(dirname "$(command -v "$pip_cmd")")/python3"
+        _acceptable_py "$pip_py" && { echo "$pip_py"; return 0; }
+
+        # Python version embedded in pip --version output
+        local pip_pyver
+        pip_pyver=$("$pip_cmd" --version 2>/dev/null | grep -oP 'python3\.\d+' | head -1)
+        if [[ -n "$pip_pyver" ]]; then
+            for py in "/usr/bin/$pip_pyver" "/usr/local/bin/$pip_pyver" "$pip_pyver"; do
+                _acceptable_py "$py" && { echo "$py"; return 0; }
+            done
+        fi
     done
 
-    # 3. Named Python candidates in PATH
+    # 3. Named Python candidates — package presence check via pip (not import)
     for py in python3.13 python3.12 python3.11 python3.10 python3 python; do
         command -v "$py" &>/dev/null || continue
-        "$py" -c "import vllm" 2>/dev/null || continue
-        local major minor
-        major=$("$py" -c "import sys; print(sys.version_info.major)")
-        minor=$("$py" -c "import sys; print(sys.version_info.minor)")
-        (( major == 3 && minor >= MIN_PYTHON_MINOR )) && { echo "$py"; return 0; }
+        _acceptable_py "$py" || continue
+        local pip_for_py
+        pip_for_py=$(dirname "$(command -v "$py")")/pip3
+        [[ -x "$pip_for_py" ]] || pip_for_py="$py -m pip"
+        $pip_for_py show vllm &>/dev/null && { echo "$py"; return 0; }
     done
 
-    # 4. Common virtualenv / conda / opt locations
+    # 4. Common venv / conda roots
     local search_roots=(
-        "$HOME/.venv"
-        "$HOME/venv"
+        "$HOME/.venv" "$HOME/venv"
         "$HOME/.virtualenvs"/*
-        "$HOME/miniconda3"
-        "$HOME/anaconda3"
-        "$HOME/mambaforge"
-        "/opt/conda"
-        "/opt/vllm"
-        "/opt/python"
-        "/usr/local"
+        "$HOME/miniconda3" "$HOME/anaconda3" "$HOME/mambaforge"
+        "/opt/conda" "/opt/vllm" "/opt/python" "/usr/local"
     )
     for root in "${search_roots[@]}"; do
         [[ -d "$root" ]] || continue
         for py in "$root/bin/python3" "$root/bin/python"; do
-            [[ -x "$py" ]] || continue
-            "$py" -c "import vllm" 2>/dev/null || continue
-            local major minor
-            major=$("$py" -c "import sys; print(sys.version_info.major)")
-            minor=$("$py" -c "import sys; print(sys.version_info.minor)")
-            (( major == 3 && minor >= MIN_PYTHON_MINOR )) && { echo "$py"; return 0; }
+            _acceptable_py "$py" || continue
+            "$py" -m pip show vllm &>/dev/null && { echo "$py"; return 0; }
         done
         for py in "$root"/envs/*/bin/python3; do
-            [[ -x "$py" ]] || continue
-            "$py" -c "import vllm" 2>/dev/null || continue
-            echo "$py"; return 0
+            _acceptable_py "$py" || continue
+            "$py" -m pip show vllm &>/dev/null && { echo "$py"; return 0; }
         done
     done
 
-    # 5. Filesystem search for vllm package dir → derive Python version
-    local vllm_dir
-    vllm_dir=$(find "$HOME/.local" /usr/local /usr/lib /opt \
-                    -maxdepth 8 -name "vllm" -type d \
-                    -path "*/site-packages/*" 2>/dev/null \
-               | head -1)
-    if [[ -n "$vllm_dir" ]]; then
+    # 5. Filesystem: find vllm dist-info or package dir → derive Python binary
+    local vllm_path
+    vllm_path=$(find "$HOME/.local" /usr/local /usr/lib /opt \
+                     -maxdepth 8 \
+                     \( -name "vllm" -type d -o -name "vllm-*.dist-info" -type d \) \
+                     -path "*/site-packages/*" 2>/dev/null | head -1)
+    if [[ -n "$vllm_path" ]]; then
         local pyver
-        pyver=$(echo "$vllm_dir" | grep -oP 'python3\.\d+' | head -1)
+        pyver=$(echo "$vllm_path" | grep -oP 'python3\.\d+' | head -1)
         if [[ -n "$pyver" ]]; then
             for py in "/usr/bin/$pyver" "/usr/local/bin/$pyver" "$pyver"; do
-                command -v "$py" &>/dev/null || continue
-                "$py" -c "import vllm" 2>/dev/null && { echo "$py"; return 0; }
+                _acceptable_py "$py" && { echo "$py"; return 0; }
             done
         fi
     fi
@@ -232,31 +236,33 @@ check_prerequisites() {
     require_cmd curl "sudo apt install curl"
     require_cmd git  "sudo apt install git"
 
-    # Find the Python that actually has vllm
-    # Override: VLLM_PYTHON=/path/to/python bash install.sh
+    # Find the Python whose pip owns the vllm package.
+    # VLLM_PYTHON=/path/to/python bash install.sh  ← manual override
     log_info "Searching for Python environment with vllm…"
     local py="${VLLM_PYTHON:-}"
     if [[ -n "$py" ]]; then
         [[ -x "$py" ]] || die "VLLM_PYTHON='$py' is not executable."
-        "$py" -c "import vllm" 2>/dev/null \
-            || die "VLLM_PYTHON='$py' cannot import vllm. Check your environment."
     elif ! py=$(find_python_with_vllm 2>/dev/null) || [[ -z "$py" ]]; then
-        # Diagnostic: show where pip thinks vllm lives (if anywhere)
         local pip_loc
         pip_loc=$(pip3 show vllm 2>/dev/null | awk '/^Location:/{print $2}' || true)
-        if [[ -n "$pip_loc" ]]; then
-            log_warn "pip3 reports vllm at: $pip_loc"
-            log_warn "But no Python there could 'import vllm' — possible missing CUDA libs."
-            log_warn "Try: cd $pip_loc && python3 -c 'import vllm'"
-        fi
-        die "Could not find a Python 3.${MIN_PYTHON_MINOR}+ environment with vllm installed.\nActivate your venv first, or set VLLM_PYTHON=/path/to/python and re-run."
+        [[ -n "$pip_loc" ]] && log_warn "pip3 reports vllm at: $pip_loc — but no usable Python found for it."
+        die "Could not find Python 3.${MIN_PYTHON_MINOR}+ with vllm installed.\nTry: VLLM_PYTHON=\$(which python3) bash install.sh\nor activate your venv first."
     fi
 
     PYTHON="$py"
-    local vver
-    vver=$($PYTHON -c "import vllm; print(vllm.__version__)" 2>/dev/null || echo "unknown")
     log_ok "Python : $($PYTHON --version)  [$PYTHON]"
-    log_ok "vllm   : $vver"
+
+    # Check if vllm is importable (may fail due to CUDA/torch at install time — non-fatal)
+    local vver
+    if vver=$($PYTHON -c "import vllm; print(vllm.__version__)" 2>/dev/null); then
+        log_ok "vllm   : $vver"
+    else
+        local pip_loc
+        pip_loc=$($PYTHON -m pip show vllm 2>/dev/null | awk '/^Location:/{print $2}' || true)
+        log_warn "vllm package found at ${pip_loc:-unknown} but 'import vllm' failed."
+        log_warn "This is normal if CUDA libs aren't in LD_LIBRARY_PATH during install."
+        log_warn "The systemd service will run in the correct GPU environment."
+    fi
 
     log_ok "Prerequisites satisfied."
 }
