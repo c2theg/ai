@@ -229,3 +229,20 @@ for r in results[:2]:
 "
   echo ""
 done
+
+
+echo " Check which engines responded...
+
+"
+
+curl -s "http://localhost:8080/search?q=bitcoin&format=json" | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+print('Engines used:')
+for e in data.get('answers',[]):
+    print(f'  {e}')
+print(f'Total results: {len(data.get(\"results\",[]))}')
+print(f'Infoboxes: {len(data.get(\"infoboxes\",[]))}')
+for r in data.get('results',[])[:5]:
+    print(f'  [{r.get(\"engine\",\"?\")}] {r.get(\"title\",\"?\")}')
+"
