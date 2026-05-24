@@ -16,7 +16,7 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.0.55
+Version:  0.0.57
 Last Updated:  5/24/2026
 
 Update Yourself:
@@ -370,7 +370,8 @@ if [ "$ENABLE_QWEN35" = "true" ]; then
             --enable-prefix-caching \
             --trust-remote-code \
             --enable-auto-tool-choice \
-            --tool-call-parser hermes
+            --tool-call-parser hermes \
+            --chat-template-kwargs '{"enable_thinking": false}'
             >> "$VLLM_LOGS/vllm-8005.log" 2>&1 &
         echo "✅ Qwen3.6-35B-A3B-FP8 starting on port 8005 (pid $!)"
         echo "   → Logs: tail -f $VLLM_LOGS/vllm-8005.log"
