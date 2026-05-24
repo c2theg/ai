@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-# ai-host-tune.sh
+# By: Christopher Gray
+# Version: 0.0.3
+# Updated: 5/24/2026
+#
+#
 # Tune Ubuntu 26.04+ on AMD Strix Halo / Ryzen AI Max systems for AI + Docker workloads.
 #
 # Usage:
