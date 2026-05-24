@@ -1,15 +1,32 @@
-# By: Christopher Gray - Version: 0.0.15 - Updated: 5/24/2026
+# By: Christopher Gray  |  Version: 0.0.20  |  Updated: 5/24/2026
 # Change the key to some random string! - Use BitWarden or some other source to generate 40+ chars stings
+use_default_settings: true
 
 server:
   secret_key: "LVnu1rn^CZILv40^e7v^YE@AWx@jD*bVBFVSCl9%nQ275"
+  #secret_key: "${SECRET}"
   limiter: false
-  image_proxy: false
+  image_proxy: true
+  port: 8080
+  bind_address: "0.0.0.0"
+
+
+ui:
+  static_use_hash: true
+  default_locale: ""
+  query_in_title: false
+  infinite_scroll: false
+  center_alignment: false
+
 
 search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en"
   formats:
     - html
     - json
+
 
 enabled_plugins:
   - Basic Calculator
@@ -20,6 +37,7 @@ enabled_plugins:
   - Open Metrics
   - Unit converter plugin
   - Tor check plugin
+
 
 engines:
   - name: google
@@ -77,3 +95,11 @@ engines:
   - name: phind
     engine: phind
     shortcut: ph
+
+
+outgoing:
+  request_timeout: 15.0
+  max_request_timeout: 30.0
+  pool_connections: 100
+  pool_maxsize: 20
+  enable_http2: true
