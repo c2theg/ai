@@ -1,6 +1,6 @@
 #!/bin/bash
 #  Christopher Gray
-#    Version 0.0.15
+#    Version 0.0.20
 #    Updated: 5/24/2026
 #
 #  *** ENTRY POINT ***
@@ -161,3 +161,73 @@ echo ""
 echo "     Push once:         python3 ${PUSH_DEST}"
 echo "     Auto-push on save: python3 ${PUSH_DEST} --watch"
 echo ""
+echo "========================================================"
+echo " Done!"
+echo "========================================================"
+echo "Examples: "
+echo "
+
+
+🌤 Weather
+curl -s "http://localhost:8080/search?q=weather+new+york&format=json" | python3 -m json.tool | head -30
+
+
+📰 World News
+curl -s "http://localhost:8080/search?q=world+news+today&format=json" | python3 -m json.tool | head -30
+
+
+💰 Stock Market
+# General market
+curl -s "http://localhost:8080/search?q=stock+market+today&format=json" | python3 -m json.tool | head -30
+
+# Specific stock
+curl -s "http://localhost:8080/search?q=NVIDIA+stock+price&format=json" | python3 -m json.tool | head -30
+
+
+🏈 Sports
+# General scores
+curl -s "http://localhost:8080/search?q=sports+scores+today&format=json" | python3 -m json.tool | head -30
+
+# Specific sport
+curl -s "http://localhost:8080/search?q=NBA+scores+today&format=json" | python3 -m json.tool | head -30
+
+
+📖 Wikipedia
+curl -s "http://localhost:8080/search?q=!wp+artificial+intelligence&format=json" | python3 -m json.tool | head -30
+
+
+💻 Tech News
+curl -s "http://localhost:8080/search?q=AI+news+today&format=json" | python3 -m json.tool | head -30
+
+
+🤖 AI News
+curl -s "http://localhost:8080/search?q=large+language+models+2026&format=json" | python3 -m json.tool | head -30
+
+
+📡 RSS Feed Test (BBC specifically)
+curl -s "http://localhost:8080/search?q=breaking+news&engines=bbc+world+news&format=json" | python3 -m json.tool | head -30
+
+
+"
+
+
+
+echo " Preforming a series of tests... (this will take a minute.). 
+
+"
+for query in "weather New York, New York" "world news today" "NVIDIA stock" "NFL scores" "artificial intelligence wikipedia" "tech news today"; do
+  echo "==============================="
+  echo "Testing: $query"
+  echo "==============================="
+  result=$(curl -s "http://localhost:8080/search?q=$(echo $query | sed 's/ /+/g')&format=json")
+  echo $result | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+results=data.get('results',[])
+print(f'Found {len(results)} results')
+for r in results[:2]:
+    print(f'  - {r.get(\"title\",\"no title\")}')
+    print(f'    {r.get(\"url\",\"no url\")}')
+"
+  echo ""
+done
