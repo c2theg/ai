@@ -1,6 +1,6 @@
 #!/bin/bash
 #  Christopher Gray
-#    Version 0.0.10
+#    Version 0.0.15
 #    Updated: 5/24/2026
 #
 #  *** ENTRY POINT ***
@@ -52,19 +52,22 @@ fi
 echo "==> settings.yml written."
 
 # ---------------------------------------------------------------------------
-# 2. Restart SearXNG
+# 2. Start SearXNG container
 # ---------------------------------------------------------------------------
+
+# Remove existing container if present so we can re-apply the new config
+if docker ps -a --format '{{.Names}}' | grep -q '^searxng$'; then
+    echo "==> Removing existing searxng container..."
+    docker rm -f searxng
+fi
 
 echo "==> Starting SearXNG container..."
 docker run -d \
   --name searxng \
   --restart always \
   -p 8080:8080 \
+  -v "$SEARXNG_CONFIG_DIR/settings.yml:/etc/searxng/settings.yml:ro" \
   searxng/searxng
-
-
-#echo "==> Restarting SearXNG container..."
-#docker restart searxng
 
 echo "==> Waiting for SearXNG to be ready..."
 for i in $(seq 1 15); do
