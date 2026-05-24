@@ -16,7 +16,7 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.0.53
+Version:  0.0.55
 Last Updated:  5/24/2026
 
 Update Yourself:
@@ -369,6 +369,8 @@ if [ "$ENABLE_QWEN35" = "true" ]; then
             --max-model-len 32768 \
             --enable-prefix-caching \
             --trust-remote-code \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes
             >> "$VLLM_LOGS/vllm-8005.log" 2>&1 &
         echo "✅ Qwen3.6-35B-A3B-FP8 starting on port 8005 (pid $!)"
         echo "   → Logs: tail -f $VLLM_LOGS/vllm-8005.log"
@@ -416,6 +418,8 @@ if [ "$ENABLE_NEMOTRON" = "true" ]; then
             --max-num-seqs 178 \
             --enable-prefix-caching \
             --trust-remote-code \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes
             >> "$VLLM_LOGS/vllm-8006.log" 2>&1 &
         echo "✅ Nemotron-3-Nano-30B-NVFP4 starting on port 8006 (pid $!)"
         echo "   → Logs: tail -f $VLLM_LOGS/vllm-8006.log"
@@ -444,6 +448,8 @@ if [ "$ENABLE_GEMMA4" = "true" ]; then
             --max-num-batched-tokens 4096 \
             --enable-prefix-caching \
             --trust-remote-code \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes
             >> "$VLLM_LOGS/vllm-8007.log" 2>&1 &
         echo "✅ gemma-4-26B-A4B starting on port 8007 (pid $!)"
         echo "   → Logs: tail -f $VLLM_LOGS/vllm-8007.log"
