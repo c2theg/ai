@@ -1,6 +1,6 @@
 #!/bin/bash
 #  Christopher Gray
-#    Version 0.0.20
+#    Version 0.0.23
 #    Updated: 5/24/2026
 #
 #  *** ENTRY POINT ***
@@ -169,50 +169,48 @@ echo "
 
 
 🌤 Weather
-curl -s "http://localhost:8080/search?q=weather+new+york&format=json" | python3 -m json.tool | head -30
+curl -s 'http://localhost:8080/search?q=weather+new+york&format=json' | python3 -m json.tool | head -30
 
 
 📰 World News
-curl -s "http://localhost:8080/search?q=world+news+today&format=json" | python3 -m json.tool | head -30
+curl -s 'http://localhost:8080/search?q=world+news+today&format=json' | python3 -m json.tool | head -30
 
 
 💰 Stock Market
 # General market
-curl -s "http://localhost:8080/search?q=stock+market+today&format=json" | python3 -m json.tool | head -30
+curl -s 'http://localhost:8080/search?q=stock+market+today&format=json' | python3 -m json.tool | head -30
 
 # Specific stock
-curl -s "http://localhost:8080/search?q=NVIDIA+stock+price&format=json" | python3 -m json.tool | head -30
+curl -s 'http://localhost:8080/search?q=NVIDIA+stock+price&format=json' | python3 -m json.tool | head -30
 
 
 🏈 Sports
 # General scores
-curl -s "http://localhost:8080/search?q=sports+scores+today&format=json" | python3 -m json.tool | head -30
+curl -s 'http://localhost:8080/search?q=sports+scores+today&format=json' | python3 -m json.tool | head -30
 
 # Specific sport
-curl -s "http://localhost:8080/search?q=NBA+scores+today&format=json" | python3 -m json.tool | head -30
+curl -s 'http://localhost:8080/search?q=NBA+scores+today&format=json' | python3 -m json.tool | head -30
 
 
 📖 Wikipedia
-curl -s "http://localhost:8080/search?q=!wp+artificial+intelligence&format=json" | python3 -m json.tool | head -30
+curl -s 'http://localhost:8080/search?q=!wp+artificial+intelligence&format=json' | python3 -m json.tool | head -30
 
 
 💻 Tech News
-curl -s "http://localhost:8080/search?q=AI+news+today&format=json" | python3 -m json.tool | head -30
+curl -s 'http://localhost:8080/search?q=AI+news+today&format=json' | python3 -m json.tool | head -30
 
 
 🤖 AI News
-curl -s "http://localhost:8080/search?q=large+language+models+2026&format=json" | python3 -m json.tool | head -30
+curl -s 'http://localhost:8080/search?q=large+language+models+2026&format=json' | python3 -m json.tool | head -30
 
 
 📡 RSS Feed Test (BBC specifically)
-curl -s "http://localhost:8080/search?q=breaking+news&engines=bbc+world+news&format=json" | python3 -m json.tool | head -30
+curl -s 'http://localhost:8080/search?q=breaking+news&engines=bbc+world+news&format=json' | python3 -m json.tool | head -30
 
 
 "
 
-
-
-echo " Preforming a series of tests... (this will take a minute.). 
+echo " Performing a series of tests... (this will take a minute.).
 
 "
 for query in "weather New York, New York" "world news today" "NVIDIA stock" "NFL scores" "artificial intelligence wikipedia" "tech news today"; do
