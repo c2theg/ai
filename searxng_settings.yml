@@ -1,5 +1,7 @@
-# By: Christopher Gray  |  Version: 0.0.20  |  Updated: 5/24/2026
+# By: Christopher Gray  |  Version: 0.0.22  |  Updated: 5/24/2026
 # Change the key to some random string! - Use BitWarden or some other source to generate 40+ chars stings
+# download:  wget https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/searxng_settings.yml && cp searxng_settings.yml /opt/models/searxng/settings.yml
+
 use_default_settings: true
 
 server:
@@ -72,10 +74,14 @@ engines:
     engine: yahoo_finance
     shortcut: yf
 
+  - name: tradingview
+    engine: tradingview
+    shortcut: tv
+    
   - name: open meteo
     engine: open_meteo
     shortcut: weather
-
+    
   - name: arxiv
     engine: arxiv
     shortcut: arxiv
@@ -96,6 +102,125 @@ engines:
     engine: phind
     shortcut: ph
 
+  - name: espn
+    engine: xpath
+    shortcut: espn
+    url: https://www.espn.com/search/_/q/{query}
+
+#-----------------------------------------------------------
+  - name: my rss feed
+    engine: xml_feed
+    shortcut: rss
+    url: https://feeds.bbci.co.uk/news/rss.xml
+
+#-----------------------------------------------------------
+
+  # 🌍 World News
+  - name: bbc world news
+    engine: xml_feed
+    shortcut: bbc
+    url: https://feeds.bbci.co.uk/news/world/rss.xml
+
+  - name: cnn world
+    engine: xml_feed
+    shortcut: cnn
+    url: http://rss.cnn.com/rss/edition_world.rss
+
+  - name: reuters world
+    engine: xml_feed
+    shortcut: reu
+    url: https://news.yahoo.com/rss/world
+
+  - name: al jazeera
+    engine: xml_feed
+    shortcut: aj
+    url: https://www.aljazeera.com/xml/rss/all.xml
+
+  - name: ap news
+    engine: xml_feed
+    shortcut: ap
+    url: https://feeds.npr.org/1001/rss.xml
+
+  # 💻 Tech News
+  - name: techcrunch
+    engine: xml_feed
+    shortcut: tc
+    url: https://techcrunch.com/feed/
+
+  - name: ars technica
+    engine: xml_feed
+    shortcut: ars
+    url: https://feeds.arstechnica.com/arstechnica/index
+
+  - name: the verge
+    engine: xml_feed
+    shortcut: verge
+    url: https://www.theverge.com/rss/index.xml
+
+  - name: wired
+    engine: xml_feed
+    shortcut: wired
+    url: https://www.wired.com/feed/rss
+
+  - name: hacker news
+    engine: xml_feed
+    shortcut: hn
+    url: https://news.ycombinator.com/rss
+
+  # 💰 Financial News
+  - name: bbc business
+    engine: xml_feed
+    shortcut: bbcbiz
+    url: https://feeds.bbci.co.uk/news/business/rss.xml
+
+  - name: cnbc world
+    engine: xml_feed
+    shortcut: cnbc
+    url: https://www.cnbc.com/id/100003114/device/rss/rss.html
+
+  - name: forbes business
+    engine: xml_feed
+    shortcut: forbes
+    url: https://www.forbes.com/business/feed/
+
+  - name: bloomberg technology
+    engine: xml_feed
+    shortcut: bloombiz
+    url: https://feeds.bloomberg.com/technology/news.rss
+
+  - name: yahoo finance
+    engine: xml_feed
+    shortcut: yf
+    url: https://news.yahoo.com/rss/
+
+  # 🤖 AI News
+  - name: mit tech review ai
+    engine: xml_feed
+    shortcut: mitai
+    url: https://www.technologyreview.com/feed/
+
+  - name: venturebeat ai
+    engine: xml_feed
+    shortcut: vbai
+    url: https://venturebeat.com/feed/
+
+  # 🏈 Sports
+  - name: bbc sport
+    engine: xml_feed
+    shortcut: bbcsport
+    url: https://feeds.bbci.co.uk/sport/rss.xml
+
+  - name: espn news
+    engine: xml_feed
+    shortcut: espn
+    url: https://www.espn.com/espn/rss/news
+
+  - name: nbc sports
+    engine: xml_feed
+    shortcut: nbcs
+    url: https://www.nbcsports.com/feed
+
+#-----------------------------------------------------------
 
 outgoing:
   request_timeout: 15.0
