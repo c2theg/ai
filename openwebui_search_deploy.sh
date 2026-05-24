@@ -1,6 +1,6 @@
 #!/bin/bash
 #  Christopher Gray
-#    Version 0.0.8
+#    Version 0.0.10
 #    Updated: 5/24/2026
 #
 #  *** ENTRY POINT ***
@@ -22,73 +22,32 @@ PUSH_DEST="/opt/models/openweb_ui_push_tool.py"
 # ---------------------------------------------------------------------------
 # 1. SearXNG settings.yml
 # ---------------------------------------------------------------------------
-# download it:
-#   wget https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/searxng_settings.yml && cp searxng_settings.yml /opt/models/searxng/settings.yml
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SETTINGS_LOCAL="${SCRIPT_DIR}/searxng_settings.yml"
+SETTINGS_URL="https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/searxng_settings.yml"
 
 echo "==> Generating SearXNG secret key..."
 SECRET=$(openssl rand -hex 32)
 
-echo "==> Writing ${SEARXNG_CONFIG_DIR}/settings.yml..."
 mkdir -p "$SEARXNG_CONFIG_DIR"
 
-cat > "$SEARXNG_CONFIG_DIR/settings.yml" <<EOF
-use_default_settings: true
+if [ -f "$SETTINGS_LOCAL" ]; then
+    echo "==> Copying local searxng_settings.yml..."
+    cp "$SETTINGS_LOCAL" "$SEARXNG_CONFIG_DIR/settings.yml"
+else
+    echo "==> Downloading searxng_settings.yml..."
+    curl -fsSL "$SETTINGS_URL" -o "$SEARXNG_CONFIG_DIR/settings.yml"
+fi
 
-server:
-  secret_key: "${SECRET}"
-  limiter: false
-  image_proxy: true
-  port: 8080
-  bind_address: "0.0.0.0"
-
-ui:
-  static_use_hash: true
-  default_locale: ""
-  query_in_title: false
-  infinite_scroll: false
-  center_alignment: false
-
-search:
-  safe_search: 0
-  autocomplete: ""
-  default_lang: "en"
-  formats:
-    - html
-    - json
-
-engines:
-  - name: google
-    engine: google
-    shortcut: g
-    disabled: false
-
-  - name: bing
-    engine: bing
-    shortcut: b
-    disabled: false
-
-  - name: duckduckgo
-    engine: duckduckgo
-    shortcut: ddg
-    disabled: false
-
-  - name: wikipedia
-    engine: wikipedia
-    shortcut: wp
-    disabled: false
-
-  - name: brave
-    engine: brave
-    shortcut: br
-    disabled: false
-
-outgoing:
-  request_timeout: 15.0
-  max_request_timeout: 30.0
-  pool_connections: 100
-  pool_maxsize: 20
-  enable_http2: true
-EOF
+if [ -n "$SECRET" ]; then
+    echo "==> Injecting generated secret key..."
+    sed -i \
+        -e '/^  secret_key: /d' \
+        -e "s|  #secret_key: \"\${SECRET}\"|  secret_key: \"${SECRET}\"|" \
+        "$SEARXNG_CONFIG_DIR/settings.yml"
+else
+    echo "==> No secret generated — using default key from settings file."
+fi
 
 echo "==> settings.yml written."
 
