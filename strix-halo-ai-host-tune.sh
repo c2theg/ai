@@ -4,6 +4,8 @@ set -euo pipefail
 # Version: 0.0.3
 # Updated: 5/24/2026
 #
+# Install:
+#    wget --no-cache -O 'strix-halo-ai-host-tune.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/strix-halo-ai-host-tune.sh' && chmod u+x strix-halo-ai-host-tune.sh && ./strix-halo-ai-host-tune.sh
 #
 # Tune Ubuntu 26.04+ on AMD Strix Halo / Ryzen AI Max systems for AI + Docker workloads.
 #
