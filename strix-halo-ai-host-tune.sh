@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # By: Christopher Gray
-# Version: 0.0.11
+# Version: 0.0.27
 # Updated: 5/24/2026
 #
 #
 # Tune Ubuntu 26.04+ on AMD Strix Halo / Ryzen AI Max systems for AI + Docker workloads.
+#   Then install AI runtimes (Ollama, vLLM, llama.cpp) and web UIs (OpenWebUI).
 #
 # Usage:
 #   sudo bash ai-host-tune.sh 96
@@ -21,8 +22,27 @@ set -euo pipefail
 #   In BIOS, set UMA/iGPU/VRAM/Frame Buffer to 512M, 1G, Auto, or Low.
 #   Do NOT leave it at 96G if you want Linux to see most of the 128 GB.
 #
-#
-#
+# BIOS STEPS:
+    # BIOS VRAM / UMA setting for Beelink Strix Halo / AMI Aptio:
+
+    # 1. Reboot and enter BIOS/UEFI.
+    # 2. Go to: Advanced → AMD CBS → NBIO Common Options → GFX Configuration.
+    # 3. Select: Dedicated Graphics Memory.
+    # 4. Change from 96G to 4G.
+    # - For Linux AI + Docker server use, 4G dedicated VRAM is a good starting point.
+    # - This leaves about 124 GB as system RAM.
+    # 5. Press F4 to Save & Exit.
+    # 6. Boot Ubuntu and verify:
+
+    # free -h
+    # sudo dmesg | grep -Ei "VRAM|GTT|amdgpu.*memory|HMM registered"
+
+    # Expected result after BIOS change:
+
+    # System RAM: about 120–124 GiB
+    # AMDGPU VRAM: about 4096M
+
+
 # This was designed to work on a server that wants to run the following:
 #        Docker
 #        vLLM / llama.cpp
@@ -36,12 +56,20 @@ set -euo pipefail
 #        model download/cache space
 
 
+
 GTT_GIB="${1:-96}"
 
 if [[ "$EUID" -ne 0 ]]; then
   echo "Run as root: sudo bash $0 ${GTT_GIB}"
   exit 1
 fi
+
+# ── AI runtime install switches ───────────────────────────────────────────────
+INSTALL_OLLAMA=true    # Ollama native systemd service (recommended default)
+INSTALL_VLLM=false     # vLLM via Docker ROCm image (OpenAI-compatible API on :8000)
+INSTALL_LLAMACPP=false # llama.cpp built from source with HIP/ROCm
+# OpenWebUI is always installed — works with Ollama or any OpenAI-compatible backend.
+# ─────────────────────────────────────────────────────────────────────────────
 
 echo "=== Memory / GPU diagnostics ==="
 free -h
@@ -180,6 +208,47 @@ echo "Setting HSA_OVERRIDE_GFX_VERSION for Strix Halo (gfx1151)..."
 sed -i '/^HSA_OVERRIDE_GFX_VERSION=/d' /etc/environment
 echo 'HSA_OVERRIDE_GFX_VERSION=11.0.0' >> /etc/environment
 echo "  HSA_OVERRIDE_GFX_VERSION=11.0.0 written to /etc/environment"
+
+if [[ "$INSTALL_OLLAMA" == "true" ]]; then
+  echo
+  echo "Installing Ollama (ROCm is already installed; Ollama installer auto-detects it)..."
+  curl -fsSL https://ollama.com/install.sh | sh
+
+  echo
+  echo "Configuring Ollama systemd service for Strix Halo..."
+  mkdir -p /etc/systemd/system/ollama.service.d
+  cat > /etc/systemd/system/ollama.service.d/override.conf <<'EOF'
+[Service]
+# Listen on all interfaces so Docker containers and LAN clients can reach it.
+Environment="OLLAMA_HOST=0.0.0.0"
+# gfx1151 fallback — harmless with ROCm 6.4+, required for older tooling.
+Environment="HSA_OVERRIDE_GFX_VERSION=11.0.0"
+EOF
+  systemctl daemon-reload
+  systemctl enable --now ollama
+  echo "  Ollama enabled and started on 0.0.0.0:11434"
+fi
+
+if [[ "$INSTALL_VLLM" == "true" ]]; then
+  echo
+  echo "Pulling vLLM ROCm Docker image..."
+  docker pull vllm/vllm-rocm:latest
+  echo "  vLLM image ready. See /opt/ai/compose.vllm.yaml for usage."
+fi
+
+if [[ "$INSTALL_LLAMACPP" == "true" ]]; then
+  echo
+  echo "Building llama.cpp with HIP/ROCm support..."
+  apt-get install -y cmake build-essential libcurl4-openssl-dev
+  git clone --depth=1 https://github.com/ggerganov/llama.cpp /opt/ai/llama.cpp-src
+  cmake -S /opt/ai/llama.cpp-src -B /opt/ai/llama.cpp-src/build \
+    -DGGML_HIPBLAS=ON \
+    -DCMAKE_BUILD_TYPE=Release
+  cmake --build /opt/ai/llama.cpp-src/build --parallel "$(nproc)"
+  cmake --install /opt/ai/llama.cpp-src/build --prefix /opt/ai/llama.cpp
+  echo "  llama.cpp installed to /opt/ai/llama.cpp/bin/"
+  echo "  Start server: /opt/ai/llama.cpp/bin/llama-server -m /path/to/model.gguf --host 0.0.0.0 --port 8080 -ngl 99"
+fi
 
 echo
 echo "Configuring sysctl values for AI + database containers..."
@@ -348,6 +417,75 @@ services:
 YAML
 
 echo
+echo "Creating OpenWebUI + Ollama compose at /opt/ai/compose.ollama-webui.yaml ..."
+cat > /opt/ai/compose.ollama-webui.yaml <<'YAML'
+# OpenWebUI connecting to native Ollama running on the host (systemd service).
+# Ollama must be running: systemctl status ollama
+#
+# Start: docker compose -f /opt/ai/compose.ollama-webui.yaml up -d
+# UI at: http://<host-ip>:3000
+
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    ports:
+      - "3000:8080"
+    volumes:
+      - open-webui-data:/app/backend/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # Points to native Ollama on the host via the bridge gateway address.
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+
+volumes:
+  open-webui-data:
+YAML
+
+echo
+echo "Creating vLLM ROCm compose at /opt/ai/compose.vllm.yaml ..."
+cat > /opt/ai/compose.vllm.yaml <<'YAML'
+# vLLM with ROCm — OpenAI-compatible inference API.
+# Set INSTALL_VLLM=true in ai-host-tune.sh to pre-pull the image, or let
+# Docker pull it on first start.
+#
+# Edit the --model arg before running. HuggingFace token required for gated models.
+# Start: docker compose -f /opt/ai/compose.vllm.yaml up -d
+# API at: http://<host-ip>:8000/v1
+
+services:
+  vllm:
+    image: vllm/vllm-rocm:latest
+    container_name: vllm
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    security_opt:
+      - seccomp=unconfined
+    ipc: host
+    shm_size: 32g
+    volumes:
+      - /root/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      - HSA_OVERRIDE_GFX_VERSION=11.0.0
+      # - HUGGING_FACE_HUB_TOKEN=your_token_here
+    command: >
+      --model meta-llama/Llama-3.1-8B-Instruct
+      --host 0.0.0.0
+      --port 8000
+      --dtype float16
+      --max-model-len 8192
+YAML
+
+echo
 echo "Creating verification script at /usr/local/sbin/ai-host-check ..."
 cat > /usr/local/sbin/ai-host-check <<'EOF'
 #!/usr/bin/env bash
@@ -407,6 +545,35 @@ echo
 
 echo "=== HSA override ==="
 grep HSA_OVERRIDE /etc/environment 2>/dev/null || echo "(not set in /etc/environment)"
+echo
+
+echo "=== Ollama ==="
+if systemctl is-active --quiet ollama 2>/dev/null; then
+  echo "ollama service: running"
+  curl -s http://localhost:11434/api/tags 2>/dev/null | \
+    python3 -c "import json,sys; d=json.load(sys.stdin); models=[m['name'] for m in d.get('models',[])]; print('models:', models if models else '(none pulled yet)')" \
+    2>/dev/null || echo "  (could not query Ollama API)"
+else
+  echo "ollama service: not running"
+fi
+echo
+
+echo "=== vLLM ==="
+if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^vllm$'; then
+  echo "vllm container: running"
+  curl -s http://localhost:8000/health 2>/dev/null && echo "  API: healthy" || echo "  API: not responding"
+else
+  echo "vllm container: not running (see /opt/ai/compose.vllm.yaml)"
+fi
+echo
+
+echo "=== llama.cpp ==="
+if [[ -x /opt/ai/llama.cpp/bin/llama-server ]]; then
+  echo -n "llama-server: "
+  /opt/ai/llama.cpp/bin/llama-server --version 2>/dev/null || echo "installed"
+else
+  echo "llama-server: not installed"
+fi
 echo
 EOF
 
