@@ -1,6 +1,6 @@
 #!/bin/bash
 #  Updated: 5/24/2026
-#  Version: 0.0.32
+#  Version: 0.0.34
 #  Purpose:  Downloads a list of LLM Models into Ollama hosted locally in a docker container
 #  Install:
 #       wget -O "install_ai_models_ollama_v128Gb.sh" https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_models_ollama_v128Gb.sh && chmod +x install_ai_models_ollama_v128Gb.sh
@@ -47,8 +47,9 @@ Downloading AI Models...
 # "llama3.2:latest" "minimax-m2.1:cloud" "qwen3-embedding:0.6b" "ministral-3:8b" "qwen3-vl:8b
 
 # 128Gb vRam
-# qwen3.6:27b-q8_0
-MODELS=("qwen3.6:27b-q4_K_M" "qwen3-embedding:4b" "nomic-embed-text-v2-moe:latest")
+# qwen3.6:27b-q8_0 "gpt-oss:20b"
+# NVIDIA Nemotron 3 Nano Omni
+MODELS=("qwen3-embedding:4b" "nomic-embed-text-v2-moe:latest" "qwen3.6:27b-q4_K_M" "nemotron3:33b-q4_K_M")
 
 for MODEL in "${MODELS[@]}"; do
     echo "
@@ -65,23 +66,22 @@ echo "
 
 "
 
-echo "
+# echo "
 
-Downloading Enhanced AIModels...
+# Downloading Enhanced AIModels...
 
-"
-#  "gemma3:4b"
+# "
 
-MODELS=("qwen2.5:7b" "qwen2.5vl:7b" "qwen3:14b-q4_K_M" "mistral-small3.2:24b-instruct-2506-q4_K_M" "llama3.2:3b-instruct-q8_0"  "qwen3-embedding:4b" "granite3.2-vision")
-
-for MODEL in "${MODELS[@]}"; do
-    echo "
-    ------------------------------------------
-    "
-    echo "Downloading $MODEL..."
-    #docker exec -it ollama ollama pull $MODEL
-    ollama pull $MODEL
-done
+# #  "gemma3:4b"
+# MODELS=("qwen2.5:7b" "qwen2.5vl:7b" "qwen3:14b-q4_K_M" "mistral-small3.2:24b-instruct-2506-q4_K_M" "llama3.2:3b-instruct-q8_0" "granite3.2-vision")
+# for MODEL in "${MODELS[@]}"; do
+#     echo "
+#     ------------------------------------------
+#     "
+#     echo "Downloading $MODEL..."
+#     #docker exec -it ollama ollama pull $MODEL
+#     ollama pull $MODEL
+# done
 
 echo "
 
@@ -96,31 +96,3 @@ You can now select them in Open WebUI at http://localhost:3000
 
 
 "
-
-#--- install other ML / NLP Models ----
-
-mkdir -p /opt/python3_shared
-cd /opt/python3_shared
-
-
-#/media/data/sync/ai_personal/code/ai_image_to_text/models/openai--clip-vit-large-patch14/pytorch_model.bin
-#/media/data/sync/ai_personal/code/ai_image_to_text/models/openai--clip-vit-large-patch14/model.safetensors
-#/media/data/sync/ai_personal/code/ai_image_to_text/models/openai--clip-vit-large-patch14/_torch_model.pt
-
-
-#----
-# /opt/ai_shared/models/ggml-large-v3.bin
-# /opt/ai_shared/models/ggml-large-v3-turbo.bin
-# /opt/ai_shared/models/ggml-large-v3-turbo-q8_0.bin
-# /opt/ai_shared/models/ggml-medium.en-q8_0.bin
-# /opt/ai_shared/whisper.cpp/models/ggml-medium.en.bin
-
-
-
-# delete - cuda-repo-ubuntu2404-13-1-local_13.1.0-590.44.01-1_amd64.deb
-
-
-#--- images -----
-# yolo11n.pt
-# buffalo_l
-# openai/clip-vit-large-patch14
