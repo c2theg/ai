@@ -1,0 +1,21 @@
+# By: Christopher Gray - Version: 0.0.10 - Updated: 5/24/2026
+# Change the key to some random string!
+server:
+  secret_key: "LVnu1rn^CZILv40^e7v^YE@AWx@jD*bVBFVSCl9%nQ275"
+  limiter: false
+  image_proxy: false
+
+search:
+  formats:
+    - html
+    - json
+
+enabled_plugins:
+  - Basic Calculator
+  - Hash plugin
+  - Self Informations
+  - Tracker URL remover
+  - Hostnames plugin
+  - Open Metrics
+  - Unit converter plugin
+  - Tor check plugin
