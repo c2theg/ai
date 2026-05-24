@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # By: Christopher Gray
-# Version: 0.0.27
+# Version: 0.0.29
 # Updated: 5/24/2026
+#  curl -fsSL https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/strix-halo-ai-host-tune.sh -o strix-halo-ai-host-tune.sh && bash strix-halo-ai-host-tune.sh
 #
 #
 # Tune Ubuntu 26.04+ on AMD Strix Halo / Ryzen AI Max systems for AI + Docker workloads.
 #   Then install AI runtimes (Ollama, vLLM, llama.cpp) and web UIs (OpenWebUI).
 #
 # Usage:
-#   sudo bash ai-host-tune.sh 96
-#   sudo bash ai-host-tune.sh 104
-#   sudo bash ai-host-tune.sh 112
-#   sudo bash ai-host-tune.sh 120
+#   sudo bash strix-halo-ai-host-tune.sh 96
+#   sudo bash strix-halo-ai-host-tune.sh 104
+#   sudo bash strix-halo-ai-host-tune.sh 112
+#   sudo bash strix-halo-ai-host-tune.sh 120
 # 
 # Recommended starting value for a 128 GB box running Docker + databases:
 #   96
@@ -448,7 +449,7 @@ echo
 echo "Creating vLLM ROCm compose at /opt/ai/compose.vllm.yaml ..."
 cat > /opt/ai/compose.vllm.yaml <<'YAML'
 # vLLM with ROCm — OpenAI-compatible inference API.
-# Set INSTALL_VLLM=true in ai-host-tune.sh to pre-pull the image, or let
+# Set INSTALL_VLLM=true in strix-halo-ai-host-tune.sh to pre-pull the image, or let
 # Docker pull it on first start.
 #
 # Edit the --model arg before running. HuggingFace token required for gated models.
