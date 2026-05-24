@@ -1,7 +1,7 @@
 #!/bin/bash
 #  Christopher Gray
-#    Version 0.0.6
-#    Updated: 5/16/2026
+#    Version 0.0.8
+#    Updated: 5/24/2026
 #
 #  *** ENTRY POINT ***
 #
@@ -92,6 +92,15 @@ echo "==> settings.yml written."
 # ---------------------------------------------------------------------------
 # 2. Restart SearXNG
 # ---------------------------------------------------------------------------
+
+docker run -d \
+  --name searxng \
+  --restart always \
+  -p 8080:8080 \
+  searxng/searxng
+
+
+
 echo "==> Restarting SearXNG container..."
 docker restart searxng
 
