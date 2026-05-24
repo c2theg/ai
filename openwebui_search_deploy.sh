@@ -22,6 +22,9 @@ PUSH_DEST="/opt/models/openweb_ui_push_tool.py"
 # ---------------------------------------------------------------------------
 # 1. SearXNG settings.yml
 # ---------------------------------------------------------------------------
+# download it:
+#   wget https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/searxng_settings.yml && cp searxng_settings.yml /opt/models/searxng/settings.yml
+
 echo "==> Generating SearXNG secret key..."
 SECRET=$(openssl rand -hex 32)
 
