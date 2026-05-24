@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # By: Christopher Gray
-# Version: 0.0.3
+# Version: 0.0.11
 # Updated: 5/24/2026
 #
-# Install:
-#    wget --no-cache -O 'strix-halo-ai-host-tune.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/strix-halo-ai-host-tune.sh' && chmod u+x strix-halo-ai-host-tune.sh && ./strix-halo-ai-host-tune.sh
 #
 # Tune Ubuntu 26.04+ on AMD Strix Halo / Ryzen AI Max systems for AI + Docker workloads.
 #
@@ -22,6 +20,21 @@ set -euo pipefail
 #   This script cannot change BIOS UMA/iGPU/VRAM allocation.
 #   In BIOS, set UMA/iGPU/VRAM/Frame Buffer to 512M, 1G, Auto, or Low.
 #   Do NOT leave it at 96G if you want Linux to see most of the 128 GB.
+#
+#
+#
+# This was designed to work on a server that wants to run the following:
+#        Docker
+#        vLLM / llama.cpp
+#        nginx
+#        MongoDB
+#        ClickHouse
+#        Qdrant
+#        Redis
+#        other containers
+#        Linux page cache
+#        model download/cache space
+
 
 GTT_GIB="${1:-96}"
 
@@ -29,6 +42,13 @@ if [[ "$EUID" -ne 0 ]]; then
   echo "Run as root: sudo bash $0 ${GTT_GIB}"
   exit 1
 fi
+
+echo "=== Memory / GPU diagnostics ==="
+free -h
+dmesg | grep -Ei "VRAM|GTT|amdgpu.*memory|HMM registered"
+cat /sys/module/ttm/parameters/pages_limit
+cat /sys/module/ttm/parameters/page_pool_size
+echo "================================"
 
 case "$GTT_GIB" in
   64|80|96|104|108|112|120) ;;
@@ -105,6 +125,13 @@ else
 fi
 
 echo
+echo "Configuring udev rule for /dev/kfd (ROCm GPU compute access)..."
+cat > /etc/udev/rules.d/70-kfd.rules <<'EOF'
+SUBSYSTEM=="kfd", GROUP="render", MODE="0660"
+EOF
+udevadm control --reload-rules && udevadm trigger || true
+
+echo
 echo "Configuring Docker daemon defaults..."
 mkdir -p /etc/docker
 
@@ -127,6 +154,34 @@ JSON
 systemctl restart docker
 
 echo
+echo "Installing ROCm 6.4 (first release with official Strix Halo / gfx1151 support)..."
+ROCM_VER="6.4.1"
+AMDGPU_PKG_VER="6.4.60401-1"
+UBUNTU_CS="$(lsb_release -cs)"
+DEB_BASE="https://repo.radeon.com/amdgpu-install/${ROCM_VER}/ubuntu"
+DEB_NAME="amdgpu-install_${AMDGPU_PKG_VER}_all.deb"
+if wget -q --spider "${DEB_BASE}/${UBUNTU_CS}/${DEB_NAME}" 2>/dev/null; then
+  DEB_URL="${DEB_BASE}/${UBUNTU_CS}/${DEB_NAME}"
+else
+  echo "  No ROCm installer for ${UBUNTU_CS}; falling back to noble build."
+  DEB_URL="${DEB_BASE}/noble/${DEB_NAME}"
+fi
+wget -q -O /tmp/amdgpu-install.deb "$DEB_URL"
+dpkg -i /tmp/amdgpu-install.deb
+apt-get update -qq
+# --no-dkms: Ubuntu 26.04 ships amdgpu in-kernel; skip DKMS module build.
+amdgpu-install -y --usecase=rocm --no-dkms
+rm -f /tmp/amdgpu-install.deb
+
+echo
+echo "Setting HSA_OVERRIDE_GFX_VERSION for Strix Halo (gfx1151)..."
+# ROCm 6.4+ officially supports gfx1151; this override is a fallback for
+# container images or tools that ship older ROCm versions.
+sed -i '/^HSA_OVERRIDE_GFX_VERSION=/d' /etc/environment
+echo 'HSA_OVERRIDE_GFX_VERSION=11.0.0' >> /etc/environment
+echo "  HSA_OVERRIDE_GFX_VERSION=11.0.0 written to /etc/environment"
+
+echo
 echo "Configuring sysctl values for AI + database containers..."
 cat > /etc/sysctl.d/99-ai-host.conf <<'EOF'
 # AI/database host tuning
@@ -145,6 +200,9 @@ vm.vfs_cache_pressure = 50
 net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
 net.core.netdev_max_backlog = 250000
+
+# Hugepages reduce TLB pressure for large model inference (vLLM, llama.cpp).
+vm.nr_hugepages = 1024
 EOF
 
 sysctl --system >/dev/null
@@ -190,13 +248,14 @@ fi
 cp -a /etc/default/grub "/etc/default/grub.bak.$(date +%Y%m%d-%H%M%S)"
 
 # Remove older/conflicting TTM/amdgpu GTT params from GRUB_CMDLINE_LINUX_DEFAULT, then add desired ones.
-python3 - "$PAGES" <<'PY'
+python3 - "$PAGES" "$GTT_GIB" <<'PY'
 import re
 import shlex
 import sys
 from pathlib import Path
 
 pages = sys.argv[1]
+gtt_mib = int(sys.argv[2]) * 1024
 path = Path("/etc/default/grub")
 text = path.read_text()
 
@@ -223,11 +282,12 @@ def clean_args(s: str):
 
     kept.append(f"ttm.pages_limit={pages}")
     kept.append(f"ttm.page_pool_size={pages}")
+    kept.append(f"amdgpu.gttsize={gtt_mib}")
     return " ".join(kept)
 
 m = line_re.search(text)
 if not m:
-    text += f'\nGRUB_CMDLINE_LINUX_DEFAULT="quiet splash ttm.pages_limit={pages} ttm.page_pool_size={pages}"\n'
+    text += f'\nGRUB_CMDLINE_LINUX_DEFAULT="quiet splash ttm.pages_limit={pages} ttm.page_pool_size={pages} amdgpu.gttsize={gtt_mib}"\n'
 else:
     new_args = clean_args(m.group(3))
     text = line_re.sub(lambda mm: f'{mm.group(1)}"{new_args}"', text, count=1)
@@ -236,6 +296,19 @@ path.write_text(text)
 PY
 
 update-grub
+
+echo
+echo "Setting TTM pages limit at runtime..."
+TTM_PAGES=25165824
+for param in pages_limit page_pool_size; do
+  sysfs="/sys/module/ttm/parameters/${param}"
+  if [[ -w "$sysfs" ]]; then
+    echo "$TTM_PAGES" > "$sysfs"
+    echo "  ${param} = ${TTM_PAGES}"
+  else
+    echo "  ${sysfs} not writable (ttm module may not be loaded yet — value takes effect at next boot via GRUB)"
+  fi
+done
 
 echo
 echo "Creating a ROCm Docker Compose snippet at /opt/ai/compose.rocm-example.yaml ..."
@@ -269,6 +342,9 @@ services:
     command: /bin/bash
     tty: true
     stdin_open: true
+    environment:
+      # May not be needed with ROCm 6.4+ (native gfx1151 support); keeps older images working.
+      - HSA_OVERRIDE_GFX_VERSION=11.0.0
 YAML
 
 echo
@@ -318,7 +394,20 @@ docker compose version 2>/dev/null || true
 echo
 
 echo "=== Sysctl ==="
-sysctl vm.max_map_count fs.file-max vm.swappiness vm.vfs_cache_pressure net.core.somaxconn net.ipv4.tcp_max_syn_backlog 2>/dev/null || true
+sysctl vm.max_map_count fs.file-max vm.swappiness vm.vfs_cache_pressure net.core.somaxconn net.ipv4.tcp_max_syn_backlog vm.nr_hugepages 2>/dev/null || true
+echo
+
+echo "=== ROCm ==="
+if command -v rocminfo >/dev/null 2>&1; then
+  rocminfo | grep -E "Name:|Marketing Name:|gfx|HSA" | head -n 20 || true
+else
+  echo "rocminfo not found (ROCm may not be installed or PATH not updated yet)"
+fi
+echo
+
+echo "=== HSA override ==="
+grep HSA_OVERRIDE /etc/environment 2>/dev/null || echo "(not set in /etc/environment)"
+echo
 EOF
 
 chmod +x /usr/local/sbin/ai-host-check
