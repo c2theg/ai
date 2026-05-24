@@ -93,6 +93,7 @@ echo "==> settings.yml written."
 # 2. Restart SearXNG
 # ---------------------------------------------------------------------------
 
+echo "==> Starting SearXNG container..."
 docker run -d \
   --name searxng \
   --restart always \
@@ -100,9 +101,8 @@ docker run -d \
   searxng/searxng
 
 
-
-echo "==> Restarting SearXNG container..."
-docker restart searxng
+#echo "==> Restarting SearXNG container..."
+#docker restart searxng
 
 echo "==> Waiting for SearXNG to be ready..."
 for i in $(seq 1 15); do
