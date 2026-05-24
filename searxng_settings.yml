@@ -1,5 +1,6 @@
-# By: Christopher Gray - Version: 0.0.10 - Updated: 5/24/2026
-# Change the key to some random string!
+# By: Christopher Gray - Version: 0.0.15 - Updated: 5/24/2026
+# Change the key to some random string! - Use BitWarden or some other source to generate 40+ chars stings
+
 server:
   secret_key: "LVnu1rn^CZILv40^e7v^YE@AWx@jD*bVBFVSCl9%nQ275"
   limiter: false
@@ -19,3 +20,60 @@ enabled_plugins:
   - Open Metrics
   - Unit converter plugin
   - Tor check plugin
+
+engines:
+  - name: google
+    engine: google
+    shortcut: g
+
+  - name: bing
+    engine: bing
+    shortcut: b
+
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+
+  - name: brave
+    engine: brave
+    shortcut: brave
+
+  - name: google news
+    engine: google_news
+    shortcut: gn
+
+  - name: bing news
+    engine: bing_news
+    shortcut: bn
+
+  - name: reddit
+    engine: reddit
+    shortcut: re
+
+  - name: yahoo finance
+    engine: yahoo_finance
+    shortcut: yf
+
+  - name: open meteo
+    engine: open_meteo
+    shortcut: weather
+
+  - name: arxiv
+    engine: arxiv
+    shortcut: arxiv
+
+  - name: github
+    engine: github
+    shortcut: gh
+
+  - name: youtube
+    engine: youtube_noapi
+    shortcut: yt
+
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+
+  - name: phind
+    engine: phind
+    shortcut: ph
