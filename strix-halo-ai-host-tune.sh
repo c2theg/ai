@@ -45,7 +45,7 @@ set -euo pipefail
 
 # This was designed to work on a server that wants to run the following:
 #        Docker
-#        vLLM / llama.cpp
+#        Ollama / vLLM / llama.cpp - OpenWebUI
 #        nginx
 #        MongoDB
 #        ClickHouse
