@@ -4,7 +4,7 @@
 #
 #
 #Update Yourself:
-#  wget --no-cache -O 'tester_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/master/tester_vllm.sh' && chmod u+x tester_vllm.sh
+#  wget --no-cache -O 'tester_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/tester_vllm.sh' && chmod u+x tester_vllm.sh
 #
 #
 # Usage: ./tester_vllm.sh [HOST] [PORT]
