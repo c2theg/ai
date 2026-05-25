@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.0.5  |  Update: 5/25/2026
+# Christopher Gray  |  Version: 0.0.7  |  Update: 5/25/2026
 # Stop all running vLLM instances on this host
 # Usage: ./stop_vllm.sh [-f]   (-f = force, no confirmation prompt)
+#
+#
+# Update Yourself:
+#    wget --no-cache -O 'stop_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/stop_vllm.sh' && chmod u+x stop_vllm.sh
+#
 set -euo pipefail
 
 FORCE=0
