@@ -1,5 +1,24 @@
-#!/bin/sh
-# clear
+#!/usr/bin/env bash
+# Christopher Gray  |  Version: 0.1.0  |  Update: 5/25/2026
+# vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
+#
+# What's New in 0.1.0:
+#   - Interactive checkbox model selection: choose which models to download and which to serve
+#   - VRAM pre-flight check — calculates total VRAM needed before launching anything
+#   - Model catalog with disk size and VRAM estimates for every model
+#   - SUPER LARGE section: Nemotron-3-Super-120B-A12B, Qwen3.5-122B-A10B, GPT-OSS-120B
+#   - Fixed log-redirection bug in all vllm_serve background calls (missing \ continuation)
+#   - Replaced ENABLE_* booleans with runtime interactive selection
+#
+# Update Yourself:
+#   wget --no-cache -O 'install_ai_spark.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark.sh' && chmod u+x install_ai_spark.sh
+#
+# Usage: ./install_ai_spark.sh
+#   You will be prompted interactively to select which models to download and serve.
+
+# ─── strict mode ──────────────────────────────────────────────────────────────
+set -euo pipefail
+
 echo "
 
 
@@ -16,8 +35,8 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.0.57
-Last Updated:  5/24/2026
+Version:  0.1.0
+Last Updated:  5/25/2026
 
 Update Yourself:
     wget --no-cache -O 'install_ai_spark.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark.sh' && chmod u+x install_ai_spark.sh
@@ -44,12 +63,6 @@ NEMO_VENV="$BASE_DIR/nemo-venv"       # separate venv for NeMo ASR (avoids confl
 # =============================================
 # OPTIONAL FEATURES — toggle on/off
 # =============================================
-# NOTE: Gemma 4 26B-A4B is BF16 (~52GB). No vLLM-compatible INT4 exists yet.
-# Enable only when not running other large models simultaneously.
-ENABLE_QWEN35=true          # set to true to download and serve Qwen3.6-35B-A3B-FP8 on port 8005
-ENABLE_NEMOTRON=false       # set to true to download and serve Nemotron-3-Nano-30B-NVFP4 on port 8006
-ENABLE_GEMMA4=false          # set to true to download and serve Gemma 4 26B-A4B on port 8007
-
 ENABLE_SEARXNG=true          # SearXNG web search engine for OpenWebUI (runs on port 4040)
 SEARXNG_PORT=4040            # host port for SearXNG — change if 4040 is in use
 
@@ -59,18 +72,14 @@ BRAVE_SEARCH_API_KEY=""      # Brave Search API key — takes priority over Sear
 # =============================================
 # OPENWEBUI AUTO-REGISTRATION
 # =============================================
-# Set your OpenWebUI admin credentials here to auto-register all model connections on each run.
-# Leave blank to skip (you'll see manual connection instructions instead).
-OWUI_ADMIN_EMAIL="admin@local" # 
-OWUI_ADMIN_PASSWORD="Abc123!@#" # 
+OWUI_ADMIN_EMAIL="admin@local"
+OWUI_ADMIN_PASSWORD="Abc123!@#"
 
 # Load .env from same directory as this script — overrides tokens above if set there
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/.env"
 
-_env_load() {
-    grep -E "^$1=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d '=' -f2- | tr -d '"' | tr -d "'"
-}
+_env_load() { grep -E "^$1=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d '=' -f2- | tr -d '"' | tr -d "'"; }
 _env_save() {
     if grep -qE "^$1=" "$ENV_FILE" 2>/dev/null; then
         sed -i "s|^$1=.*|$1=$2|" "$ENV_FILE"
@@ -79,54 +88,221 @@ _env_save() {
     fi
 }
 
-# HF_TOKEN
 ENV_HF_TOKEN=$(_env_load HF_TOKEN)
 if [ -n "$ENV_HF_TOKEN" ]; then
-    HF_TOKEN="$ENV_HF_TOKEN"
-    echo "✅ HF_TOKEN loaded from .env"
+    HF_TOKEN="$ENV_HF_TOKEN"; echo "✅ HF_TOKEN loaded from .env"
 elif [ -n "$HF_TOKEN" ]; then
-    _env_save HF_TOKEN "$HF_TOKEN"
-    echo "✅ HF_TOKEN saved to $ENV_FILE"
+    _env_save HF_TOKEN "$HF_TOKEN"; echo "✅ HF_TOKEN saved to $ENV_FILE"
 fi
-if [ -z "$HF_TOKEN" ]; then
-    echo "⚠️  HF_TOKEN is not set — gated models will fail. Set it at the top of this script or in $ENV_FILE"
-fi
+[ -z "$HF_TOKEN" ] && echo "⚠️  HF_TOKEN is not set — gated models will fail."
 
-# BRAVE_SEARCH_API_KEY
 ENV_BRAVE_KEY=$(_env_load BRAVE_SEARCH_API_KEY)
-if [ -n "$ENV_BRAVE_KEY" ]; then
-    BRAVE_SEARCH_API_KEY="$ENV_BRAVE_KEY"
-    echo "✅ BRAVE_SEARCH_API_KEY loaded from .env"
-elif [ -n "$BRAVE_SEARCH_API_KEY" ]; then
-    _env_save BRAVE_SEARCH_API_KEY "$BRAVE_SEARCH_API_KEY"
-    echo "✅ BRAVE_SEARCH_API_KEY saved to $ENV_FILE"
-fi
+[ -n "$ENV_BRAVE_KEY" ] && BRAVE_SEARCH_API_KEY="$ENV_BRAVE_KEY" && echo "✅ BRAVE_SEARCH_API_KEY loaded from .env"
+[ -z "$ENV_BRAVE_KEY" ] && [ -n "$BRAVE_SEARCH_API_KEY" ] && _env_save BRAVE_SEARCH_API_KEY "$BRAVE_SEARCH_API_KEY"
 
-# OWUI_ADMIN_EMAIL
 ENV_OWUI_EMAIL=$(_env_load OWUI_ADMIN_EMAIL)
-if [ -n "$ENV_OWUI_EMAIL" ]; then
-    OWUI_ADMIN_EMAIL="$ENV_OWUI_EMAIL"
-    echo "✅ OWUI_ADMIN_EMAIL loaded from .env"
-elif [ -n "$OWUI_ADMIN_EMAIL" ]; then
-    _env_save OWUI_ADMIN_EMAIL "$OWUI_ADMIN_EMAIL"
-    echo "✅ OWUI_ADMIN_EMAIL saved to $ENV_FILE"
+[ -n "$ENV_OWUI_EMAIL" ] && OWUI_ADMIN_EMAIL="$ENV_OWUI_EMAIL" && echo "✅ OWUI_ADMIN_EMAIL loaded from .env"
+[ -z "$ENV_OWUI_EMAIL" ] && [ -n "$OWUI_ADMIN_EMAIL" ] && _env_save OWUI_ADMIN_EMAIL "$OWUI_ADMIN_EMAIL"
+
+ENV_OWUI_PASS=$(_env_load OWUI_ADMIN_PASSWORD)
+[ -n "$ENV_OWUI_PASS" ] && OWUI_ADMIN_PASSWORD="$ENV_OWUI_PASS" && echo "✅ OWUI_ADMIN_PASSWORD loaded from .env"
+[ -z "$ENV_OWUI_PASS" ] && [ -n "$OWUI_ADMIN_PASSWORD" ] && _env_save OWUI_ADMIN_PASSWORD "$OWUI_ADMIN_PASSWORD"
+
+if [ -z "$OWUI_ADMIN_EMAIL" ] || [ -z "$OWUI_ADMIN_PASSWORD" ]; then
+    echo "⚠️  OWUI credentials not set — visit http://localhost:3000 on first run to create your admin account."
 fi
 
-# OWUI_ADMIN_PASSWORD
-ENV_OWUI_PASS=$(_env_load OWUI_ADMIN_PASSWORD)
-if [ -n "$ENV_OWUI_PASS" ]; then
-    OWUI_ADMIN_PASSWORD="$ENV_OWUI_PASS"
-    echo "✅ OWUI_ADMIN_PASSWORD loaded from .env"
-elif [ -n "$OWUI_ADMIN_PASSWORD" ]; then
-    _env_save OWUI_ADMIN_PASSWORD "$OWUI_ADMIN_PASSWORD"
-    echo "✅ OWUI_ADMIN_PASSWORD saved to $ENV_FILE"
-fi
-if [ -z "$OWUI_ADMIN_EMAIL" ] || [ -z "$OWUI_ADMIN_PASSWORD" ]; then
-    echo "⚠️  OWUI_ADMIN_EMAIL / OWUI_ADMIN_PASSWORD not set."
-    echo "   On first run, visit http://localhost:3000 to create your admin account."
-    echo "   Then set these credentials at the top of this script (or in $ENV_FILE) and re-run"
-    echo "   to enable automatic model connection registration."
-fi
+# ─────────────────────────────────────────────────────────────────────────────
+# MODEL CATALOG
+# Fields: HF_REPO | LOCAL_DIR | DISPLAY_NAME | DISK_GB | VRAM_GB | PORT | CATEGORY
+# VRAM_GB=0 → CPU/NeMo only — cannot be served via vLLM
+# PORT=0    → download-only (ASR/NeMo)
+# ─────────────────────────────────────────────────────────────────────────────
+MDL_HF=()
+MDL_DIR=()
+MDL_NAME=()
+MDL_DISK=()
+MDL_VRAM=()
+MDL_PORT=()
+MDL_CAT=()
+
+_add() {
+    local i=${#MDL_HF[@]}
+    MDL_HF[$i]="$1"; MDL_DIR[$i]="$2"; MDL_NAME[$i]="$3"
+    MDL_DISK[$i]="$4"; MDL_VRAM[$i]="$5"; MDL_PORT[$i]="$6"; MDL_CAT[$i]="$7"
+}
+
+# ── Standard models ────────────────────────────────────────────────────────────
+#        HF Repo                                                   Local Dir                               Display Name                          Disk VRAM  Port  Category
+_add "Qwen/Qwen3.6-35B-A3B-FP8"                                  "Qwen3.6-35B-A3B-FP8"                   "Qwen3.6-35B-A3B (FP8)"                  35   38   8005  "General"
+_add "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"               "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"  "Nemotron-3-Nano-30B-A3B (NVFP4)"        15   18   8006  "General"
+_add "Qwen/Qwen3-Coder-30B-A3B-Instruct"                         "Qwen3-Coder-30B-A3B-Instruct"          "Qwen3-Coder-30B-A3B (BF16)"             60   65   8001  "Coding"
+_add "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"                  "DeepSeek-R1-Distill-Qwen-32B"          "DeepSeek-R1-Distill-Qwen-32B (BF16)"    64   68   8002  "Reasoning"
+_add "google/gemma-4-26B-A4B-it"                                 "gemma-4-26B-A4B-it"                    "Gemma 4 26B-A4B (BF16)"                 52   56   8007  "General"
+_add "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"        "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16" "Nemotron-3-Nano-Omni-30B (BF16)"  60   65   8008  "Reasoning"
+_add "BAAI/bge-m3"                                               "bge-m3"                                "BGE-M3 (Embeddings)"                     3    4   8011  "Embeddings"
+_add "Qwen/Qwen3-Embedding-4B"                                   "Qwen3-Embedding-4B"                    "Qwen3-Embedding-4B (Embeddings)"          8   10   8010  "Embeddings"
+_add "BAAI/bge-reranker-v2-m3"                                   "bge-reranker-v2-m3"                    "BGE-Reranker-v2-m3 (Reranking)"           2    3   8020  "Reranking"
+_add "nvidia/parakeet-tdt-0.6b-v3"                               "parakeet-tdt-0.6b-v3"                  "Parakeet-TDT-0.6B v3 (ASR / NeMo)"        1    0      0  "ASR"
+_add "nvidia/nemotron-speech-streaming-en-0.6b"                  "nemotron-speech-streaming-en-0.6b"     "Nemotron-Speech-Streaming-0.6B (ASR)"     1    0      0  "ASR"
+
+# ── SUPER LARGE models (120B+ parameters) ─────────────────────────────────────
+# Info: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard
+# Note: these require nearly the entire GPU — do not run alongside other large models.
+# ⚠️  Verify HF repo IDs before downloading — these may require updated values.
+_add "nvidia/Nemotron-3-Super-120B-A12B"                         "Nemotron-3-Super-120B-A12B"            "Nemotron-3-Super-120B-A12B [SUPER]"     120  115   8030  "Super Large"
+_add "Qwen/Qwen3.5-122B-A10B-Instruct"                           "Qwen3.5-122B-A10B-Instruct"            "Qwen3.5-122B-A10B (MoE) [SUPER]"        122  120   8031  "Super Large"
+_add "nvidia/GPT-OSS-120B"                                       "GPT-OSS-120B"                          "GPT-OSS-120B [SUPER]"                   120  115   8032  "Super Large"
+# ^^^ GPT-OSS-120B: confirm HF repo ID before running — placeholder above
+
+MODEL_TOTAL=${#MDL_HF[@]}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INTERACTIVE CHECKBOX SELECTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+_checkbox_menu() {
+    # Args: $1=title  $2=servable_only (true|false)  $3=result_var_name
+    local title="$1" servable_only="$2" result_var="$3"
+
+    local -a menu_map=()
+    for i in $(seq 0 $((MODEL_TOTAL - 1))); do
+        [ "$servable_only" = "true" ] && [ "${MDL_PORT[$i]}" = "0" ] && continue
+        menu_map+=("$i")
+    done
+    local count=${#menu_map[@]}
+
+    local -a sel=()
+    for j in $(seq 0 $((count - 1))); do sel[$j]=0; done
+
+    while true; do
+        echo ""
+        echo "  $title"
+        printf "  %-4s  %-3s  %-50s  %7s  %10s  %-12s\n" \
+               "Num" " " "Model" "Disk" "VRAM" "Category"
+        printf "  %-4s  %-3s  %-50s  %7s  %10s  %-12s\n" \
+               "---" "---" "-----" "------" "----------" "--------"
+
+        for j in $(seq 0 $((count - 1))); do
+            local i="${menu_map[$j]}"
+            local mark="[ ]"; [ "${sel[$j]}" = "1" ] && mark="[x]"
+            local vram_disp="CPU"
+            [ "${MDL_VRAM[$i]}" -gt 0 ] && vram_disp="${MDL_VRAM[$i]} GB"
+            printf "  %-4d  %s  %-50s  %4d GB  %10s  %-12s\n" \
+                "$((j+1))" "$mark" "${MDL_NAME[$i]}" "${MDL_DISK[$i]}" "$vram_disp" "${MDL_CAT[$i]}"
+        done
+
+        local selected_count=0
+        for j in $(seq 0 $((count - 1))); do [ "${sel[$j]}" = "1" ] && selected_count=$((selected_count+1)); done
+        echo ""
+        printf "  [%d selected]  Toggle: type number(s) separated by spaces\n" "$selected_count"
+        echo "  Commands: a=select all  n=clear all  d=done"
+        printf "  > "
+        read -r input
+
+        case "$input" in
+            d|done|"") break ;;
+            a|all) for j in $(seq 0 $((count - 1))); do sel[$j]=1; done ;;
+            n|none|clear) for j in $(seq 0 $((count - 1))); do sel[$j]=0; done ;;
+            *)
+                for num in $input; do
+                    if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "$count" ]; then
+                        local j=$((num - 1))
+                        [ "${sel[$j]}" = "1" ] && sel[$j]=0 || sel[$j]=1
+                    fi
+                done ;;
+        esac
+    done
+
+    local -a result=()
+    for j in $(seq 0 $((count - 1))); do
+        [ "${sel[$j]}" = "1" ] && result+=("${menu_map[$j]}")
+    done
+    eval "$result_var=(\"\${result[@]+\"\${result[@]}\"}\") "
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VRAM PRE-FLIGHT CHECK
+# ─────────────────────────────────────────────────────────────────────────────
+
+_check_vram() {
+    local total_required=0
+    for idx in "${RUN_SELECTED[@]}"; do
+        total_required=$((total_required + MDL_VRAM[idx]))
+    done
+    [ "$total_required" -eq 0 ] && return 0
+
+    echo ""
+    echo "  ── VRAM Budget ──────────────────────────────────────────"
+
+    if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null 2>&1; then
+        local total_mib
+        total_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs)
+        local total_gb=$(( total_mib / 1024 ))
+        local safe_gb=$(( total_gb * 90 / 100 ))
+
+        printf "  %-20s : %d GB\n" "GPU total" "$total_gb"
+        printf "  %-20s : %d GB  (90%%)\n" "Safe limit" "$safe_gb"
+        printf "  %-20s : %d GB\n" "Models require" "$total_required"
+        echo ""
+
+        local has_super=0
+        for idx in "${RUN_SELECTED[@]}"; do
+            [ "${MDL_CAT[$idx]}" = "Super Large" ] && has_super=1 && break
+        done
+
+        if [ "$has_super" = "1" ] && [ "${#RUN_SELECTED[@]}" -gt 1 ]; then
+            echo "  ⚠️  WARNING: You selected a SUPER LARGE model alongside other models."
+            echo "     Super Large models (120B+) need nearly all GPU VRAM."
+            echo "     Running multiple large models simultaneously will likely fail."
+            echo -n "  Continue anyway? [y/N]: "
+            read -r confirm
+            [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+        elif [ "$total_required" -gt "$safe_gb" ]; then
+            echo "  ⚠️  WARNING: Selected models require ~${total_required} GB but safe limit is ${safe_gb} GB."
+            echo "     Consider deselecting some models."
+            echo -n "  Continue anyway? [y/N]: "
+            read -r confirm
+            [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+        else
+            echo "  ✅ VRAM check OK — ${total_required} GB needed, ${total_gb} GB available"
+        fi
+    else
+        echo "  ⚠️  nvidia-smi not available — skipping VRAM check"
+    fi
+    echo "  ─────────────────────────────────────────────────────────"
+}
+
+is_dl_selected()  { for i in "${DL_SELECTED[@]}";  do [ "$i" = "$1" ] && return 0; done; return 1; }
+is_run_selected() { for i in "${RUN_SELECTED[@]}"; do [ "$i" = "$1" ] && return 0; done; return 1; }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1 — Select models to download
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "════════════════════════════════════════════════════════════════════"
+echo "  STEP 1 of 2 — Select models to DOWNLOAD"
+echo "════════════════════════════════════════════════════════════════════"
+DL_SELECTED=()
+_checkbox_menu "Available models (toggle with numbers, d=done):" "false" DL_SELECTED
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2 — Select models to serve
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "════════════════════════════════════════════════════════════════════"
+echo "  STEP 2 of 2 — Select models to SERVE with vLLM"
+echo "  (ASR/NeMo models are download-only and excluded from this list)"
+echo "════════════════════════════════════════════════════════════════════"
+RUN_SELECTED=()
+_checkbox_menu "Models to serve with vLLM (toggle with numbers, d=done):" "true" RUN_SELECTED
+
+_check_vram
+
+echo ""
+echo "  Download : ${#DL_SELECTED[@]} model(s) selected"
+echo "  Serve    : ${#RUN_SELECTED[@]} model(s) selected"
+echo ""
 
 #--------------------------
 sudo apt update
@@ -135,11 +311,9 @@ sudo apt install -y jq
 sudo apt install -y python3.12-dev python3-dev build-essential ninja-build
 
 #-------- Docker / Containers ------------
-# Check if docker is in the system's PATH
 if command -v docker >/dev/null 2>&1; then
     echo "✅ Docker is installed. Version: $(docker --version)"
 else
-    # BY DEFAULT DGX Spark has Docker installed!
     echo "❌ Docker is not installed."
     echo " You need docker first before running this. This will download a docker installer and run it for you. "
     wget -O "install_docker.sh" https://raw.githubusercontent.com/c2theg/srvBuilds/refs/heads/master/install_docker.sh
@@ -147,14 +321,11 @@ else
     ./install_docker.sh
 fi
 
-
 #--- SETUP vLLM on DGX Spark ---
-
 curl -fsSL https://raw.githubusercontent.com/eelbaz/dgx-spark-vllm-setup/main/install.sh | bash
 
 #------ Download & install models -----
 
-# Auto-detect where the vLLM installer put its venv — try config path first, then known defaults
 VENV_PIP=""
 VENV_DIR=""
 for candidate in "$VLLM_VENV" "$HOME/vllm-install/.vllm" "/home/cgray/vllm-install/.vllm"; do
@@ -166,7 +337,6 @@ for candidate in "$VLLM_VENV" "$HOME/vllm-install/.vllm" "/home/cgray/vllm-insta
     fi
 done
 
-# If vLLM venv not found, create a dedicated downloader venv
 if [ -z "$VENV_PIP" ]; then
     echo "⚠️  vLLM venv not found — creating dedicated downloader venv at $VLLM_VENV"
     python3 -m venv "$VLLM_VENV"
@@ -174,7 +344,6 @@ if [ -z "$VENV_PIP" ]; then
     VENV_DIR="$VLLM_VENV"
 fi
 
-# Ensure vllm is actually installed — the eelbaz script can fail silently (e.g. Triton build error)
 if ! "$VENV_DIR/bin/python" -c "import vllm" 2>/dev/null; then
     echo "⚠️  vllm not found in venv — installing via pip..."
     "$VENV_PIP" install -U vllm
@@ -187,10 +356,8 @@ else
     echo "✅ vllm already installed: $("$VENV_DIR/bin/python" -c 'import vllm; print(vllm.__version__)')"
 fi
 
-# Install huggingface_hub + sentence-transformers into the detected venv
 "$VENV_PIP" install -U "huggingface_hub[cli]" sentence-transformers
 
-# Prefer new 'hf' CLI (replaces deprecated 'huggingface-cli')
 if [ -x "$VENV_DIR/bin/hf" ]; then
     HF_CLI="$VENV_DIR/bin/hf"
     HF_LOGIN="$HF_CLI auth login"
@@ -200,106 +367,50 @@ else
 fi
 echo "✅ Using HF CLI: $HF_CLI"
 
-# NeMo goes in its own venv — its dependencies conflict with vLLM
 python3 -m venv "$NEMO_VENV"
 "$NEMO_VENV/bin/pip" install -U pip
 "$NEMO_VENV/bin/pip" install "nemo_toolkit[asr]"
 
-# Authenticate if token provided
 if [ -n "$HF_TOKEN" ]; then
     $HF_LOGIN --token "$HF_TOKEN"
     HF_AUTH="--token $HF_TOKEN"
 else
-    echo "⚠️  HF_TOKEN is not set — gated models (nvidia/, some Qwen) will fail. Set it at the top of this script."
+    echo "⚠️  HF_TOKEN not set — gated models will fail."
     HF_AUTH=""
 fi
 
 mkdir -p "$MODELS_DIR"
-
-# Base download command — always write full files (no symlinks into HF cache)
 HF_DL="$HF_CLI download $HF_AUTH"
 
-
-# 1. General / RAG generation / Financial research / reasoning
-if [ "$ENABLE_QWEN35" = "true" ]; then
-    echo "--- Downloading Qwen/Qwen3.6-35B-A3B-FP8 (replacing BF16 version) ---"
-    rm -rf "$MODELS_DIR/Qwen3.6-35B-A3B"
-    $HF_DL Qwen/Qwen3.6-35B-A3B-FP8 \
-        --local-dir "$MODELS_DIR/Qwen3.6-35B-A3B-FP8"
+# ─────────────────────────────────────────────────────────────────────────────
+# DOWNLOAD selected models
+# ─────────────────────────────────────────────────────────────────────────────
+if [ "${#DL_SELECTED[@]}" -eq 0 ]; then
+    echo "⏭️  No models selected for download — skipping."
 else
-    echo "⏭️  Qwen3.6-35B-A3B-FP8 download skipped (ENABLE_QWEN35=false)"
+    for idx in "${DL_SELECTED[@]}"; do
+        echo ""
+        echo "--- Downloading ${MDL_NAME[$idx]} ---"
+        echo "    HF repo  : ${MDL_HF[$idx]}"
+        echo "    Local dir: $MODELS_DIR/${MDL_DIR[$idx]}"
+        if [ "${MDL_CAT[$idx]}" = "Super Large" ]; then
+            echo "    ⚠️  SUPER LARGE model (~${MDL_DISK[$idx]} GB) — this will take a while."
+            echo "    ℹ️  Nemotron-3-Super info: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard"
+        fi
+        $HF_DL "${MDL_HF[$idx]}" --local-dir "$MODELS_DIR/${MDL_DIR[$idx]}"
+        echo "✅ ${MDL_NAME[$idx]} downloaded"
+    done
 fi
 
-echo "--- Downloading nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 ---"
-$HF_DL nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 \
-    --local-dir "$MODELS_DIR/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
+echo ""
+echo "✅ All selected models downloaded to $MODELS_DIR"
 
-echo "--- Downloading nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 ---"
-$HF_DL nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 \
-    --local-dir "$MODELS_DIR/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
-
-
-# 2. Coding
-echo "--- Downloading Qwen/Qwen3-Coder-30B-A3B-Instruct ---"
-$HF_DL Qwen/Qwen3-Coder-30B-A3B-Instruct \
-    --local-dir "$MODELS_DIR/Qwen3-Coder-30B-A3B-Instruct"
-
-
-# 3. Financial research / reasoning (second opinion)
-echo "--- Downloading deepseek-ai/DeepSeek-R1-Distill-Qwen-32B ---"
-$HF_DL deepseek-ai/DeepSeek-R1-Distill-Qwen-32B \
-    --local-dir "$MODELS_DIR/DeepSeek-R1-Distill-Qwen-32B"
-
-
-# 4. Audio transcription (ASR — served via NeMo, not vLLM)
-echo "--- Downloading nvidia/parakeet-tdt-0.6b-v3 ---"
-$HF_DL nvidia/parakeet-tdt-0.6b-v3 \
-    --local-dir "$MODELS_DIR/parakeet-tdt-0.6b-v3"
-
-echo "--- Downloading nvidia/nemotron-speech-streaming-en-0.6b ---"
-$HF_DL nvidia/nemotron-speech-streaming-en-0.6b \
-    --local-dir "$MODELS_DIR/nemotron-speech-streaming-en-0.6b"
-
-
-# 5. RAG embeddings (served via vLLM --task embedding, or sentence-transformers)
-echo "--- Downloading BAAI/bge-m3 ---"
-$HF_DL BAAI/bge-m3 \
-    --local-dir "$MODELS_DIR/bge-m3"
-
-echo "--- Downloading Qwen/Qwen3-Embedding-4B ---"
-$HF_DL Qwen/Qwen3-Embedding-4B \
-    --local-dir "$MODELS_DIR/Qwen3-Embedding-4B"
-
-
-# 6. RAG reranking (served via sentence-transformers CrossEncoder or vLLM classify)
-echo "--- Downloading BAAI/bge-reranker-v2-m3 ---"
-$HF_DL BAAI/bge-reranker-v2-m3 \
-    --local-dir "$MODELS_DIR/bge-reranker-v2-m3"
-
-# 7. Gemma 4 26B-A4B (optional — default off, ~52GB BF16, needs exclusive GPU access)
-if [ "$ENABLE_GEMMA4" = "true" ]; then
-    echo "--- Downloading google/gemma-4-26B-A4B-it ---"
-    $HF_DL google/gemma-4-26B-A4B-it \
-        --local-dir "$MODELS_DIR/gemma-4-26B-A4B-it"
-else
-    echo "⏭️  Gemma 4 download skipped (ENABLE_GEMMA4=false)"
-fi
-
-
-echo "✅ All models downloaded to $MODELS_DIR"
-
-
-#----- Serve models with vLLM ------------------------------
-# Both models run in background (&) so the script continues.
-# gpu-memory-utilization 0.70 for single-model use (30B BF16 weights alone need ~60 GiB).
-# Raise to 0.85 (and remove the other) if you want to run only one at a time.
-# OpenWebUI connects to port 8000 automatically. Add port 8001 manually:
-#   OpenWebUI → Admin Settings → Connections → Add → http://localhost:8001/v1
-
+# ─────────────────────────────────────────────────────────────────────────────
+# SERVE selected models with vLLM
+# ─────────────────────────────────────────────────────────────────────────────
 VLLM_LOGS="$BASE_DIR/logs"
 mkdir -p "$VLLM_LOGS"
 
-# Locate the vllm binary — eelbaz uses uv which may not put it in the standard venv bin
 VLLM_BIN=""
 for candidate in \
     "$VENV_DIR/bin/vllm" \
@@ -314,7 +425,6 @@ for candidate in \
     fi
 done
 
-# Shell function so serve calls work whether we use the CLI or the Python module fallback
 vllm_serve() {
     if [ -n "$VLLM_BIN" ]; then
         "$VLLM_BIN" serve "$@"
@@ -324,41 +434,25 @@ vllm_serve() {
     fi
 }
 
-# Kill all vLLM processes, stop Docker, and wipe old logs for a clean start.
 echo "--- Clean start: killing all vLLM processes and removing old logs ---"
 docker stop open-webui searxng 2>/dev/null || true
-docker rm open-webui searxng 2>/dev/null || true   # remove immediately so --restart policy can't revive them
-pkill -9 -f "vllm serve" 2>/dev/null || true
-pkill -9 -f "vllm.entrypoints" 2>/dev/null || true
-pkill -9 -f "VLLM::EngineCore" 2>/dev/null || true
-pkill -9 -f "vllm.engine" 2>/dev/null || true
+docker rm   open-webui searxng 2>/dev/null || true
+pkill -9 -f "vllm serve"        2>/dev/null || true
+pkill -9 -f "vllm.entrypoints"  2>/dev/null || true
+pkill -9 -f "VLLM::EngineCore"  2>/dev/null || true
+pkill -9 -f "vllm.engine"       2>/dev/null || true
 sleep 3
 rm -f "$VLLM_LOGS"/vllm-*.log
 echo "✅ Old vLLM processes killed and logs cleared"
 
-# Enable TF32 for better matrix multiplication performance on Blackwell tensor cores
 export TORCH_FLOAT32_MATMUL_PRECISION=high
 
-#---- Coding -----
-echo "\r\n \r\n --- Coding --- \r\n \r\n"
-# vllm serve "$MODELS_DIR/Qwen3-Coder-30B-A3B-Instruct" \
-#   --host 0.0.0.0 --port 8001 \
-#   --dtype auto \
-#   --gpu-memory-utilization 0.85 \
-#   --max-model-len 32768 \
-#   --enable-prefix-caching \
-#   --trust-remote-code
+if [ "${#RUN_SELECTED[@]}" -eq 0 ]; then
+    echo "⏭️  No models selected to serve — skipping vLLM startup."
+fi
 
-# vllm serve "$MODELS_DIR/DeepSeek-R1-Distill-Qwen-32B" \
-#   --host 0.0.0.0 --port 8002 \
-#   --dtype auto \
-#   --gpu-memory-utilization 0.85 \
-#   --max-model-len 32768 \
-#   --enable-prefix-caching \
-#   --trust-remote-code
-
-#--- Qwen3.6-35B-A3B-FP8  (port 8005 — ~35GB FP8) ---
-if [ "$ENABLE_QWEN35" = "true" ]; then
+# ── idx 0: Qwen3.6-35B-A3B-FP8  (port 8005) ──────────────────────────────────
+if is_run_selected 0; then
     if [ -f "$MODELS_DIR/Qwen3.6-35B-A3B-FP8/config.json" ]; then
         echo "--- Starting vLLM: Qwen3.6-35B-A3B-FP8 on port 8005 ---"
         vllm_serve "$MODELS_DIR/Qwen3.6-35B-A3B-FP8" \
@@ -371,42 +465,18 @@ if [ "$ENABLE_QWEN35" = "true" ]; then
             --trust-remote-code \
             --enable-auto-tool-choice \
             --tool-call-parser hermes \
-            --chat-template-kwargs '{"enable_thinking": false}'
+            --chat-template-kwargs '{"enable_thinking": false}' \
             >> "$VLLM_LOGS/vllm-8005.log" 2>&1 &
         echo "✅ Qwen3.6-35B-A3B-FP8 starting on port 8005 (pid $!)"
-        echo "   → Logs: tail -f $VLLM_LOGS/vllm-8005.log"
+        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8005.log"
         echo "   → Status: curl -s http://localhost:8005/v1/models | jq ."
     else
-        echo "⚠️  Qwen3.6-35B-A3B-FP8 not found in $MODELS_DIR — skipping."
+        echo "⚠️  Qwen3.6-35B-A3B-FP8 not found in $MODELS_DIR — was it downloaded?"
     fi
-else
-    echo "⏭️  Qwen3.6-35B-A3B-FP8 disabled (ENABLE_QWEN35=false)"
 fi
 
-
-echo "\r\n \r\n --- General Purpose --- \r\n \r\n"
-#--- Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16  (port 8001 — add to OpenWebUI manually) ---
-# if [ -f "$MODELS_DIR/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16/config.json" ]; then
-#     echo "--- Starting vLLM: Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 on port 8001 ---"
-#     vllm_serve "$MODELS_DIR/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16" \
-#         --host 0.0.0.0 --port 8001 \
-#         --served-model-name "Nemotron-3-Nano-Omni-30B-A3B" \
-#         --dtype bfloat16 \
-#         --gpu-memory-utilization 0.85 \
-#         --max-model-len 32768 \
-#         --enable-prefix-caching \
-#         --trust-remote-code \
-#         >> "$VLLM_LOGS/vllm-8001.log" 2>&1 &
-#     echo "✅ Nemotron-3-Nano-Omni-30B-A3B starting on port 8001 (pid $!)"
-#     echo "   → Logs: tail -f $VLLM_LOGS/vllm-8001.log"
-#     echo "   → Status: curl -s http://localhost:8001/v1/models | jq ."
-#     echo "   → Add to OpenWebUI: Admin Settings → Connections → http://localhost:8001/v1"
-# else
-#     echo "⚠️  Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 not found in $MODELS_DIR — skipping."
-# fi
-
-#--- NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4  (port 8006 — DGX Spark optimised) ---
-if [ "$ENABLE_NEMOTRON" = "true" ]; then
+# ── idx 1: NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4  (port 8006) ─────────────────
+if is_run_selected 1; then
     if [ -f "$MODELS_DIR/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4/config.json" ]; then
         echo "--- Starting vLLM: NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 on port 8006 ---"
         vllm_serve "$MODELS_DIR/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4" \
@@ -420,24 +490,61 @@ if [ "$ENABLE_NEMOTRON" = "true" ]; then
             --enable-prefix-caching \
             --trust-remote-code \
             --enable-auto-tool-choice \
-            --tool-call-parser hermes
+            --tool-call-parser hermes \
             >> "$VLLM_LOGS/vllm-8006.log" 2>&1 &
         echo "✅ Nemotron-3-Nano-30B-NVFP4 starting on port 8006 (pid $!)"
-        echo "   → Logs: tail -f $VLLM_LOGS/vllm-8006.log"
+        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8006.log"
         echo "   → Status: curl -s http://localhost:8006/v1/models | jq ."
         echo "   → Add to OpenWebUI: Admin Settings → Connections → http://localhost:8006/v1"
     else
-        echo "⚠️  NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 not found in $MODELS_DIR — skipping."
+        echo "⚠️  NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 not found in $MODELS_DIR — was it downloaded?"
     fi
-else
-    echo "⏭️  Nemotron-3-Nano-30B-NVFP4 disabled (ENABLE_NEMOTRON=false)"
 fi
 
+# ── idx 2: Qwen3-Coder-30B-A3B-Instruct  (port 8001) ─────────────────────────
+if is_run_selected 2; then
+    if [ -f "$MODELS_DIR/Qwen3-Coder-30B-A3B-Instruct/config.json" ]; then
+        echo "--- Starting vLLM: Qwen3-Coder-30B-A3B-Instruct on port 8001 ---"
+        vllm_serve "$MODELS_DIR/Qwen3-Coder-30B-A3B-Instruct" \
+            --host 0.0.0.0 --port 8001 \
+            --served-model-name "Qwen3-Coder-30B" \
+            --dtype auto \
+            --gpu-memory-utilization 0.85 \
+            --max-model-len 32768 \
+            --enable-prefix-caching \
+            --trust-remote-code \
+            >> "$VLLM_LOGS/vllm-8001.log" 2>&1 &
+        echo "✅ Qwen3-Coder-30B-A3B starting on port 8001 (pid $!)"
+        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8001.log"
+        echo "   → Status: curl -s http://localhost:8001/v1/models | jq ."
+    else
+        echo "⚠️  Qwen3-Coder-30B-A3B-Instruct not found in $MODELS_DIR — was it downloaded?"
+    fi
+fi
 
-#--- Gemma 4 26B-A4B  (port 8007 — optional, default off) ---
-# BF16 ~52GB. Disable other large models when running this one.
-# No vLLM-compatible INT4 quantization exists yet — update HF model ID when one is released.
-if [ "$ENABLE_GEMMA4" = "true" ]; then
+# ── idx 3: DeepSeek-R1-Distill-Qwen-32B  (port 8002) ─────────────────────────
+if is_run_selected 3; then
+    if [ -f "$MODELS_DIR/DeepSeek-R1-Distill-Qwen-32B/config.json" ]; then
+        echo "--- Starting vLLM: DeepSeek-R1-Distill-Qwen-32B on port 8002 ---"
+        vllm_serve "$MODELS_DIR/DeepSeek-R1-Distill-Qwen-32B" \
+            --host 0.0.0.0 --port 8002 \
+            --served-model-name "DeepSeek-R1-Distill-Qwen-32B" \
+            --dtype auto \
+            --gpu-memory-utilization 0.85 \
+            --max-model-len 32768 \
+            --enable-prefix-caching \
+            --trust-remote-code \
+            >> "$VLLM_LOGS/vllm-8002.log" 2>&1 &
+        echo "✅ DeepSeek-R1-Distill-Qwen-32B starting on port 8002 (pid $!)"
+        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8002.log"
+        echo "   → Status: curl -s http://localhost:8002/v1/models | jq ."
+    else
+        echo "⚠️  DeepSeek-R1-Distill-Qwen-32B not found in $MODELS_DIR — was it downloaded?"
+    fi
+fi
+
+# ── idx 4: gemma-4-26B-A4B-it  (port 8007) ───────────────────────────────────
+if is_run_selected 4; then
     if [ -f "$MODELS_DIR/gemma-4-26B-A4B-it/config.json" ]; then
         echo "--- Starting vLLM: gemma-4-26B-A4B-it on port 8007 ---"
         vllm_serve "$MODELS_DIR/gemma-4-26B-A4B-it" \
@@ -450,64 +557,179 @@ if [ "$ENABLE_GEMMA4" = "true" ]; then
             --enable-prefix-caching \
             --trust-remote-code \
             --enable-auto-tool-choice \
-            --tool-call-parser hermes
+            --tool-call-parser hermes \
             >> "$VLLM_LOGS/vllm-8007.log" 2>&1 &
         echo "✅ gemma-4-26B-A4B starting on port 8007 (pid $!)"
-        echo "   → Logs: tail -f $VLLM_LOGS/vllm-8007.log"
+        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8007.log"
         echo "   → Status: curl -s http://localhost:8007/v1/models | jq ."
     else
-        echo "⚠️  gemma-4-26B-A4B-it not found in $MODELS_DIR — skipping."
+        echo "⚠️  gemma-4-26B-A4B-it not found in $MODELS_DIR — was it downloaded?"
     fi
-else
-    echo "⏭️  Gemma 4 skipped (ENABLE_GEMMA4=false)"
 fi
 
-
-#--- Qwen3-Embedding-4B  (port 8010) ---
-if [ -f "$MODELS_DIR/Qwen3-Embedding-4B/config.json" ]; then
-    echo "--- Starting vLLM: Qwen3-Embedding-4B on port 8010 ---"
-    vllm_serve "$MODELS_DIR/Qwen3-Embedding-4B" \
-        --host 0.0.0.0 --port 8010 \
-        --served-model-name "Qwen3-Embedding-4B" \
-        --task embedding \
-        --dtype auto \
-        --gpu-memory-utilization 0.50 \
-        --trust-remote-code \
-        >> "$VLLM_LOGS/vllm-8010.log" 2>&1 &
-    echo "✅ Qwen3-Embedding-4B starting on port 8010 (pid $!)"
-    echo "   → Logs: tail -f $VLLM_LOGS/vllm-8010.log"
-    echo "   → Status: curl -s http://localhost:8010/v1/models | jq ."
-else
-    echo "⚠️  Qwen3-Embedding-4B not found in $MODELS_DIR — skipping."
+# ── idx 5: Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16  (port 8008) ──────────
+if is_run_selected 5; then
+    if [ -f "$MODELS_DIR/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16/config.json" ]; then
+        echo "--- Starting vLLM: Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 on port 8008 ---"
+        vllm_serve "$MODELS_DIR/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16" \
+            --host 0.0.0.0 --port 8008 \
+            --served-model-name "Nemotron-3-Nano-Omni-30B-A3B" \
+            --dtype bfloat16 \
+            --gpu-memory-utilization 0.85 \
+            --max-model-len 32768 \
+            --enable-prefix-caching \
+            --trust-remote-code \
+            >> "$VLLM_LOGS/vllm-8008.log" 2>&1 &
+        echo "✅ Nemotron-3-Nano-Omni-30B-A3B starting on port 8008 (pid $!)"
+        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8008.log"
+        echo "   → Status: curl -s http://localhost:8008/v1/models | jq ."
+    else
+        echo "⚠️  Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 not found in $MODELS_DIR — was it downloaded?"
+    fi
 fi
 
-#--- bge-reranker-v2-m3  (port 8020) ---
-if [ -f "$MODELS_DIR/bge-reranker-v2-m3/config.json" ]; then
-    echo "--- Starting vLLM: bge-reranker-v2-m3 on port 8020 ---"
-    vllm_serve "$MODELS_DIR/bge-reranker-v2-m3" \
-        --host 0.0.0.0 --port 8020 \
-        --served-model-name "bge-reranker-v2-m3" \
-        --task classify \
-        --dtype auto \
-        --gpu-memory-utilization 0.50 \
-        --trust-remote-code \
-        >> "$VLLM_LOGS/vllm-8020.log" 2>&1 &
-    echo "✅ bge-reranker-v2-m3 starting on port 8020 (pid $!)"
-    echo "   → Logs: tail -f $VLLM_LOGS/vllm-8020.log"
-    echo "   → Status: curl -s http://localhost:8020/v1/models | jq ."
-else
-    echo "⚠️  bge-reranker-v2-m3 not found in $MODELS_DIR — skipping."
+# ── idx 6: BAAI/bge-m3  (port 8011) ──────────────────────────────────────────
+if is_run_selected 6; then
+    if [ -f "$MODELS_DIR/bge-m3/config.json" ]; then
+        echo "--- Starting vLLM: bge-m3 on port 8011 ---"
+        vllm_serve "$MODELS_DIR/bge-m3" \
+            --host 0.0.0.0 --port 8011 \
+            --served-model-name "bge-m3" \
+            --task embedding \
+            --dtype auto \
+            --gpu-memory-utilization 0.30 \
+            --trust-remote-code \
+            >> "$VLLM_LOGS/vllm-8011.log" 2>&1 &
+        echo "✅ bge-m3 starting on port 8011 (pid $!)"
+        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8011.log"
+    else
+        echo "⚠️  bge-m3 not found in $MODELS_DIR — was it downloaded?"
+    fi
 fi
 
+# ── idx 7: Qwen3-Embedding-4B  (port 8010) ────────────────────────────────────
+if is_run_selected 7; then
+    if [ -f "$MODELS_DIR/Qwen3-Embedding-4B/config.json" ]; then
+        echo "--- Starting vLLM: Qwen3-Embedding-4B on port 8010 ---"
+        vllm_serve "$MODELS_DIR/Qwen3-Embedding-4B" \
+            --host 0.0.0.0 --port 8010 \
+            --served-model-name "Qwen3-Embedding-4B" \
+            --task embedding \
+            --dtype auto \
+            --gpu-memory-utilization 0.50 \
+            --trust-remote-code \
+            >> "$VLLM_LOGS/vllm-8010.log" 2>&1 &
+        echo "✅ Qwen3-Embedding-4B starting on port 8010 (pid $!)"
+        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8010.log"
+        echo "   → Status: curl -s http://localhost:8010/v1/models | jq ."
+    else
+        echo "⚠️  Qwen3-Embedding-4B not found in $MODELS_DIR — was it downloaded?"
+    fi
+fi
 
+# ── idx 8: bge-reranker-v2-m3  (port 8020) ────────────────────────────────────
+if is_run_selected 8; then
+    if [ -f "$MODELS_DIR/bge-reranker-v2-m3/config.json" ]; then
+        echo "--- Starting vLLM: bge-reranker-v2-m3 on port 8020 ---"
+        vllm_serve "$MODELS_DIR/bge-reranker-v2-m3" \
+            --host 0.0.0.0 --port 8020 \
+            --served-model-name "bge-reranker-v2-m3" \
+            --task classify \
+            --dtype auto \
+            --gpu-memory-utilization 0.50 \
+            --trust-remote-code \
+            >> "$VLLM_LOGS/vllm-8020.log" 2>&1 &
+        echo "✅ bge-reranker-v2-m3 starting on port 8020 (pid $!)"
+        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8020.log"
+        echo "   → Status: curl -s http://localhost:8020/v1/models | jq ."
+    else
+        echo "⚠️  bge-reranker-v2-m3 not found in $MODELS_DIR — was it downloaded?"
+    fi
+fi
 
-#--- Audio transcription (NeMo, not vLLM) ---
-# python3 -c "
-# import nemo.collections.asr as nemo_asr
-# model = nemo_asr.models.EncDecRNNTBPEModel.restore_from('$MODELS_DIR/parakeet-tdt-0.6b-v3/model.nemo')
-# print(model.transcribe(['your_audio.wav']))
-# "
+# ── idx 9 & 10: ASR / NeMo models — download only, not served via vLLM ────────
+# To use: python3 -c "
+#   import nemo.collections.asr as nemo_asr
+#   model = nemo_asr.models.EncDecRNNTBPEModel.restore_from('$MODELS_DIR/parakeet-tdt-0.6b-v3/model.nemo')
+#   print(model.transcribe(['your_audio.wav']))"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SUPER LARGE MODELS (120B+ parameters)
+# Info: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard
+# ⚠️  These require nearly the entire GPU. Do NOT run alongside other large models.
+# ⚠️  Verify HF repo IDs before downloading — see comments above _add entries.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── idx 11: Nemotron-3-Super-120B-A12B  (port 8030) ───────────────────────────
+if is_run_selected 11; then
+    if [ -f "$MODELS_DIR/Nemotron-3-Super-120B-A12B/config.json" ]; then
+        echo "--- Starting vLLM: Nemotron-3-Super-120B-A12B on port 8030 ---"
+        echo "   ℹ️  Model info: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard"
+        echo "   ⚠️  SUPER LARGE — needs ~115 GB VRAM. Ensure no other large models are running."
+        vllm_serve "$MODELS_DIR/Nemotron-3-Super-120B-A12B" \
+            --host 0.0.0.0 --port 8030 \
+            --served-model-name "Nemotron-3-Super-120B-A12B" \
+            --dtype auto \
+            --gpu-memory-utilization 0.93 \
+            --max-model-len 32768 \
+            --enable-prefix-caching \
+            --trust-remote-code \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes \
+            >> "$VLLM_LOGS/vllm-8030.log" 2>&1 &
+        echo "✅ Nemotron-3-Super-120B-A12B starting on port 8030 (pid $!)"
+        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8030.log"
+        echo "   → Status: curl -s http://localhost:8030/v1/models | jq ."
+    else
+        echo "⚠️  Nemotron-3-Super-120B-A12B not found in $MODELS_DIR — was it downloaded?"
+    fi
+fi
+
+# ── idx 12: Qwen3.5-122B-A10B-Instruct  (port 8031) ──────────────────────────
+if is_run_selected 12; then
+    if [ -f "$MODELS_DIR/Qwen3.5-122B-A10B-Instruct/config.json" ]; then
+        echo "--- Starting vLLM: Qwen3.5-122B-A10B-Instruct on port 8031 ---"
+        echo "   ⚠️  SUPER LARGE — needs ~120 GB VRAM. Ensure no other large models are running."
+        vllm_serve "$MODELS_DIR/Qwen3.5-122B-A10B-Instruct" \
+            --host 0.0.0.0 --port 8031 \
+            --served-model-name "Qwen3.5-122B-A10B" \
+            --dtype auto \
+            --gpu-memory-utilization 0.93 \
+            --max-model-len 32768 \
+            --enable-prefix-caching \
+            --trust-remote-code \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes \
+            >> "$VLLM_LOGS/vllm-8031.log" 2>&1 &
+        echo "✅ Qwen3.5-122B-A10B starting on port 8031 (pid $!)"
+        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8031.log"
+        echo "   → Status: curl -s http://localhost:8031/v1/models | jq ."
+    else
+        echo "⚠️  Qwen3.5-122B-A10B-Instruct not found in $MODELS_DIR — was it downloaded?"
+    fi
+fi
+
+# ── idx 13: GPT-OSS-120B  (port 8032) ─────────────────────────────────────────
+if is_run_selected 13; then
+    if [ -f "$MODELS_DIR/GPT-OSS-120B/config.json" ]; then
+        echo "--- Starting vLLM: GPT-OSS-120B on port 8032 ---"
+        echo "   ⚠️  SUPER LARGE — needs ~115 GB VRAM. Ensure no other large models are running."
+        vllm_serve "$MODELS_DIR/GPT-OSS-120B" \
+            --host 0.0.0.0 --port 8032 \
+            --served-model-name "GPT-OSS-120B" \
+            --dtype auto \
+            --gpu-memory-utilization 0.93 \
+            --max-model-len 32768 \
+            --enable-prefix-caching \
+            --trust-remote-code \
+            >> "$VLLM_LOGS/vllm-8032.log" 2>&1 &
+        echo "✅ GPT-OSS-120B starting on port 8032 (pid $!)"
+        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8032.log"
+        echo "   → Status: curl -s http://localhost:8032/v1/models | jq ."
+    else
+        echo "⚠️  GPT-OSS-120B not found in $MODELS_DIR — was it downloaded?"
+    fi
+fi
 
 #---------------------------------------------------------------------------------------------------------------
 #--- SearXNG (web search backend for OpenWebUI) ---
@@ -515,7 +737,6 @@ if [ "$ENABLE_SEARXNG" = "true" ]; then
     echo "--- Starting SearXNG container ---"
     mkdir -p "$BASE_DIR/searxng"
 
-    # Write settings.yml only on first run — preserves existing secret_key on re-runs
     if [ ! -f "$BASE_DIR/searxng/settings.yml" ]; then
         SEARXNG_SECRET=$(openssl rand -hex 32 2>/dev/null || echo "change-me-$(date +%s)")
         cat > "$BASE_DIR/searxng/settings.yml" << SEARXNG_EOF
@@ -542,51 +763,39 @@ SEARXNG_EOF
     echo "✅ SearXNG starting on http://localhost:$SEARXNG_PORT"
 fi
 
-#--- Start OpenWebUI (Docker, connected to all vLLM instances) ---
-# --network host: direct access to all vLLM ports without Docker NAT
-
-# docker stop open-webui && docker rm open-webui && docker volume rm open-webui
-
+#--- Start OpenWebUI ---
 echo "--- Starting OpenWebUI container ---"
 docker pull ghcr.io/open-webui/open-webui:main
 
+# Pick the first served model's port as the primary OpenWebUI endpoint
+OWUI_PRIMARY_PORT=8005
+if [ "${#RUN_SELECTED[@]}" -gt 0 ]; then
+    first_run_idx="${RUN_SELECTED[0]}"
+    OWUI_PRIMARY_PORT="${MDL_PORT[$first_run_idx]}"
+fi
+
+OWUI_ENV_ARGS=(
+    -e PORT=3000
+    -e "OPENAI_API_BASE_URL=http://localhost:${OWUI_PRIMARY_PORT}/v1"
+    -e OPENAI_API_KEY=sk-no-key-required
+)
+
 if [ -n "$BRAVE_SEARCH_API_KEY" ]; then
     echo "   → Web search: Brave Search API"
-    docker run -d \
-        --name open-webui \
-        --network host \
-        -v open-webui:/app/backend/data \
-        -e PORT=3000 \
-        -e OPENAI_API_BASE_URL=http://localhost:8006/v1 \
-        -e OPENAI_API_KEY=sk-no-key-required \
-        -e ENABLE_RAG_WEB_SEARCH=true \
-        -e WEB_SEARCH_ENGINE=brave \
-        -e BRAVE_SEARCH_API_KEY="$BRAVE_SEARCH_API_KEY" \
-        ghcr.io/open-webui/open-webui:main
+    OWUI_ENV_ARGS+=(-e ENABLE_RAG_WEB_SEARCH=true -e WEB_SEARCH_ENGINE=brave -e "BRAVE_SEARCH_API_KEY=$BRAVE_SEARCH_API_KEY")
 elif [ "$ENABLE_SEARXNG" = "true" ]; then
     echo "   → Web search: SearXNG (port $SEARXNG_PORT)"
-    docker run -d \
-        --name open-webui \
-        --network host \
-        -v open-webui:/app/backend/data \
-        -e PORT=3000 \
-        -e OPENAI_API_BASE_URL=http://localhost:8006/v1 \
-        -e OPENAI_API_KEY=sk-no-key-required \
-        -e ENABLE_RAG_WEB_SEARCH=true \
-        -e WEB_SEARCH_ENGINE=searxng \
-        -e "SEARXNG_QUERY_URL=http://localhost:${SEARXNG_PORT}/search?q=<query>&format=json" \
-        ghcr.io/open-webui/open-webui:main
+    OWUI_ENV_ARGS+=(-e ENABLE_RAG_WEB_SEARCH=true -e WEB_SEARCH_ENGINE=searxng -e "SEARXNG_QUERY_URL=http://localhost:${SEARXNG_PORT}/search?q=<query>&format=json")
 else
     echo "   → Web search: disabled"
-    docker run -d \
-        --name open-webui \
-        --network host \
-        -v open-webui:/app/backend/data \
-        -e PORT=3000 \
-        -e OPENAI_API_BASE_URL=http://localhost:8006/v1 \
-        -e OPENAI_API_KEY=sk-no-key-required \
-        ghcr.io/open-webui/open-webui:main
 fi
+
+docker run -d \
+    --name open-webui \
+    --network host \
+    -v open-webui:/app/backend/data \
+    "${OWUI_ENV_ARGS[@]}" \
+    ghcr.io/open-webui/open-webui:main
 
 echo "Waiting for OpenWebUI to be ready..."
 OWUI_TIMEOUT=300
@@ -594,37 +803,38 @@ OWUI_ELAPSED=0
 until curl -sf http://localhost:3000/health > /dev/null 2>&1; do
     if [ "$OWUI_ELAPSED" -ge "$OWUI_TIMEOUT" ]; then
         echo ""
-        echo "⚠️  OpenWebUI did not become ready after ${OWUI_TIMEOUT}s — check logs with: docker logs open-webui"
+        echo "⚠️  OpenWebUI did not become ready after ${OWUI_TIMEOUT}s — check: docker logs open-webui"
         break
     fi
     printf "  [%ds] waiting...\n" "$OWUI_ELAPSED"
     sleep 5
     OWUI_ELAPSED=$((OWUI_ELAPSED + 5))
 done
+
 if [ "$OWUI_ELAPSED" -lt "$OWUI_TIMEOUT" ]; then
     echo "✅ OpenWebUI ready at http://localhost:3000"
 
-    # Build URL/key lists dynamically from whatever is enabled + present on disk
+    # Build URL list dynamically from whatever is actually running
     OWUI_URLS=""
     OWUI_KEYS=""
     OWUI_MANUAL=""
     _owui_add() {
-        # $1 = url, $2 = label
         if [ -z "$OWUI_URLS" ]; then
-            OWUI_URLS="\"$1\""
-            OWUI_KEYS='"sk-no-key-required"'
+            OWUI_URLS="\"$1\""; OWUI_KEYS='"sk-no-key-required"'
         else
-            OWUI_URLS="$OWUI_URLS,\"$1\""
-            OWUI_KEYS="$OWUI_KEYS,\"sk-no-key-required\""
+            OWUI_URLS="$OWUI_URLS,\"$1\""; OWUI_KEYS="$OWUI_KEYS,\"sk-no-key-required\""
         fi
         OWUI_MANUAL="$OWUI_MANUAL\n     $1   ($2)"
     }
 
-    [ "$ENABLE_QWEN35"   = "true" ] && [ -f "$MODELS_DIR/Qwen3.6-35B-A3B-FP8/config.json"       ] && _owui_add "http://localhost:8005/v1" "Qwen3.6-35B-A3B-FP8"
-    [ "$ENABLE_NEMOTRON" = "true" ] && [ -f "$MODELS_DIR/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4/config.json" ] && _owui_add "http://localhost:8006/v1" "Nemotron-3-Nano-30B-NVFP4"
-    [ "$ENABLE_GEMMA4"   = "true" ] && [ -f "$MODELS_DIR/gemma-4-26B-A4B-it/config.json"          ] && _owui_add "http://localhost:8007/v1" "gemma-4-26B-A4B"
-    [ -f "$MODELS_DIR/Qwen3-Embedding-4B/config.json" ] && _owui_add "http://localhost:8010/v1" "Qwen3-Embedding-4B"
-    [ -f "$MODELS_DIR/bge-reranker-v2-m3/config.json" ] && _owui_add "http://localhost:8020/v1" "bge-reranker-v2-m3"
+    for idx in "${RUN_SELECTED[@]}"; do
+        port="${MDL_PORT[$idx]}"
+        [ "$port" = "0" ] && continue
+        dir="${MDL_DIR[$idx]}"
+        if [ -f "$MODELS_DIR/$dir/config.json" ]; then
+            _owui_add "http://localhost:${port}/v1" "${MDL_NAME[$idx]}"
+        fi
+    done
 
     if [ -n "$OWUI_ADMIN_EMAIL" ] && [ -n "$OWUI_ADMIN_PASSWORD" ] && [ -n "$OWUI_URLS" ]; then
         echo "--- Auto-registering model connections in OpenWebUI ---"
@@ -657,10 +867,10 @@ if [ "$OWUI_ELAPSED" -lt "$OWUI_TIMEOUT" ]; then
             echo "⚠️  OpenWebUI login failed — check OWUI_ADMIN_EMAIL / OWUI_ADMIN_PASSWORD"
         fi
     elif [ -z "$OWUI_URLS" ]; then
-        echo "⚠️  No models are enabled — nothing to register in OpenWebUI."
+        echo "⚠️  No models are running — nothing to register in OpenWebUI."
     else
         echo ""
-        echo "   Set OWUI_ADMIN_EMAIL and OWUI_ADMIN_PASSWORD in this script to auto-register connections."
+        echo "   Set OWUI_ADMIN_EMAIL and OWUI_ADMIN_PASSWORD to auto-register connections."
         echo "   Or add them manually: Admin Settings → Connections → + Add Connection"
         printf "%b\n" "$OWUI_MANUAL"
     fi
@@ -669,28 +879,23 @@ if [ "$OWUI_ELAPSED" -lt "$OWUI_TIMEOUT" ]; then
     echo "  ⏳ Allow 5-10 minutes for vLLM models to finish loading before they appear."
 fi
 
+echo ""
 echo "--- Disk usage: $BASE_DIR ---"
 du -sh "$BASE_DIR" 2>/dev/null
 echo ""
 echo "--- Per-model breakdown ---"
 du -sh "$MODELS_DIR"/*/  2>/dev/null | sort -rh
 
-echo "\r\n \r\n ---------- \r\n \r\n "
+echo ""
 nvidia-smi
 
-echo "\r\n \r\n ---- Monitor vLLM Startups ---- \r\n \r\n "
-
-echo "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 on port 8006
-
-    tail -f /opt/models/logs/vllm-8006.log
-
-
-"
-#tail -f /opt/models/logs/vllm-8006.log
-
-echo "Qwen3.6-35B-A3B-FP8 starting on port 8005
-
-    tail -f /opt/models/logs/vllm-8005.log
-
-"
-#tail -f /opt/models/logs/vllm-8007.log
+echo ""
+echo "---- Monitor vLLM Startups ----"
+echo "  Run any of the following to tail a model's log:"
+for idx in "${RUN_SELECTED[@]}"; do
+    port="${MDL_PORT[$idx]}"
+    [ "$port" = "0" ] && continue
+    echo "    ${MDL_NAME[$idx]} (port ${port}):"
+    echo "      tail -f $VLLM_LOGS/vllm-${port}.log"
+done
+echo ""
