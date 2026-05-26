@@ -38,7 +38,7 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.1.0
+Version:  0.1.1
 Last Updated:  5/25/2026
 
 Update Yourself:
