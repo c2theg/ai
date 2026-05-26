@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.1.3  |  Update: 5/25/2026
+# Christopher Gray  |  Version: 0.1.4  |  Update: 5/26/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
@@ -9,6 +9,12 @@
 #   You will be prompted interactively to select which models to download and serve.
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.1.4  5/26/2026
+#   - Fixed OOM on SUPER LARGE models (120B+): reduced --max-model-len 32768→8192
+#     and raised --gpu-memory-utilization 0.93→0.96 to leave room for KV cache
+#     (128GB GPU with ~117GB of FP8 weights leaves only ~2GB for KV cache at
+#      32768 context — 8192 is the safe max for single-GPU 120B+ models)
 #
 # v0.1.3  5/25/2026
 #   - Added google/gemma-4-31B-it (idx 14, port 8009, ~62 GB BF16)
@@ -60,8 +66,8 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.1.3
-Last Updated:  5/25/2026
+Version:  0.1.4
+Last Updated:  5/26/2026
 
 Update Yourself:
     wget --no-cache -O 'install_ai_spark.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark.sh' && chmod u+x install_ai_spark.sh
@@ -695,8 +701,8 @@ if is_run_selected 11; then
             --host 0.0.0.0 --port 8030 \
             --served-model-name "Nemotron-3-Super-120B-A12B" \
             --dtype auto \
-            --gpu-memory-utilization 0.93 \
-            --max-model-len 32768 \
+            --gpu-memory-utilization 0.96 \
+            --max-model-len 8192 \
             --enable-prefix-caching \
             --trust-remote-code \
             --enable-auto-tool-choice \
@@ -719,8 +725,8 @@ if is_run_selected 12; then
             --host 0.0.0.0 --port 8031 \
             --served-model-name "Qwen3.5-122B-A10B" \
             --dtype auto \
-            --gpu-memory-utilization 0.93 \
-            --max-model-len 32768 \
+            --gpu-memory-utilization 0.96 \
+            --max-model-len 8192 \
             --enable-prefix-caching \
             --trust-remote-code \
             --enable-auto-tool-choice \
@@ -743,8 +749,8 @@ if is_run_selected 13; then
             --host 0.0.0.0 --port 8032 \
             --served-model-name "GPT-OSS-120B" \
             --dtype auto \
-            --gpu-memory-utilization 0.93 \
-            --max-model-len 32768 \
+            --gpu-memory-utilization 0.96 \
+            --max-model-len 8192 \
             --enable-prefix-caching \
             --trust-remote-code \
             >> "$VLLM_LOGS/vllm-8032.log" 2>&1 &
