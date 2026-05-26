@@ -1,14 +1,32 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.1.4  |  Update: 5/26/2026
+# Christopher Gray  |  Version: 0.1.6  |  Update: 5/26/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
 #   wget --no-cache -O 'install_ai_spark.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark.sh' && chmod u+x install_ai_spark.sh
 #
-# Usage: ./install_ai_spark.sh
-#   You will be prompted interactively to select which models to download and serve.
+# Usage:
+#   ./install_ai_spark.sh              — full install: packages, docker, venv, download, serve
+#   ./install_ai_spark.sh --serve-only — skip install/download; jump straight to model serve
+#   ./install_ai_spark.sh -s           — same as --serve-only
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.1.6  5/26/2026
+#   - Added --serve-only / -s flag: skips apt, docker, venv, NeMo, HF, and
+#     download steps — jumps straight to model selection and vLLM serve.
+#     Use this when models are already downloaded and you just want to (re)start.
+#
+# v0.1.5  5/26/2026
+#   - Fixed index mismatch: gemma-4-31B-it was inserted at catalog pos 4 but
+#     all serve blocks still used the pre-insertion indices, so every model from
+#     pos 4 onward mapped to the wrong serve block and never launched
+#   - Replaced hardcoded serve blocks with _vllm_launch helper that:
+#       * echoes the exact command before running it
+#       * waits 2s and checks if the process survived (tails log on fast exit)
+#   - Added pre-serve summary listing each model, catalog index, and port
+#   - Added VLLM_BIN null-check with fallback PATH search before attempting serve
+#   - Added explicit log-dir creation with confirmation echo
 #
 # v0.1.4  5/26/2026
 #   - Fixed OOM on SUPER LARGE models (120B+): reduced --max-model-len 32768→8192
@@ -50,6 +68,10 @@
 # [ cond ] && action patterns and || true guards that conflict with -e.
 set -uo pipefail
 
+SERVE_ONLY=0
+[ "${1:-}" = "--serve-only" ] && SERVE_ONLY=1
+[ "${1:-}" = "-s"           ] && SERVE_ONLY=1
+
 echo "
 
 
@@ -66,7 +88,7 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.1.4
+Version:  0.1.6
 Last Updated:  5/26/2026
 
 Update Yourself:
@@ -308,21 +330,30 @@ is_dl_selected()  { for i in "${DL_SELECTED[@]}";  do [ "$i" = "$1" ] && return 
 is_run_selected() { for i in "${RUN_SELECTED[@]}"; do [ "$i" = "$1" ] && return 0; done; return 1; }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 1 — Select models to download
+# STEP 1 — Select models to download  (skipped in --serve-only mode)
 # ─────────────────────────────────────────────────────────────────────────────
-echo ""
-echo "════════════════════════════════════════════════════════════════════"
-echo "  STEP 1 of 2 — Select models to DOWNLOAD"
-echo "════════════════════════════════════════════════════════════════════"
 DL_SELECTED=()
-_checkbox_menu "Available models (toggle with numbers, d=done):" "false" DL_SELECTED
+if [ "$SERVE_ONLY" -eq 0 ]; then
+    echo ""
+    echo "════════════════════════════════════════════════════════════════════"
+    echo "  STEP 1 of 2 — Select models to DOWNLOAD"
+    echo "════════════════════════════════════════════════════════════════════"
+    _checkbox_menu "Available models (toggle with numbers, d=done):" "false" DL_SELECTED
+else
+    echo ""
+    echo "  ⏭️  --serve-only: skipping download step (Step 1)"
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 2 — Select models to serve
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
 echo "════════════════════════════════════════════════════════════════════"
-echo "  STEP 2 of 2 — Select models to SERVE with vLLM"
+if [ "$SERVE_ONLY" -eq 0 ]; then
+    echo "  STEP 2 of 2 — Select models to SERVE with vLLM"
+else
+    echo "  Select models to SERVE with vLLM"
+fi
 echo "  (ASR/NeMo models are download-only and excluded from this list)"
 echo "════════════════════════════════════════════════════════════════════"
 RUN_SELECTED=()
@@ -331,116 +362,131 @@ _checkbox_menu "Models to serve with vLLM (toggle with numbers, d=done):" "true"
 _check_vram
 
 echo ""
-echo "  Download : ${#DL_SELECTED[@]} model(s) selected"
+[ "$SERVE_ONLY" -eq 0 ] && echo "  Download : ${#DL_SELECTED[@]} model(s) selected"
 echo "  Serve    : ${#RUN_SELECTED[@]} model(s) selected"
 echo ""
 
-#--------------------------
-sudo apt update
-sudo apt install -y --no-install-recommends wget curl gnupg2 git libgl1 libglib2.0-0
-sudo apt install -y jq
-sudo apt install -y python3.12-dev python3-dev build-essential ninja-build
+if [ "$SERVE_ONLY" -eq 1 ]; then
+    # ── Serve-only mode: skip all install/download steps ──────────────────────
+    echo "⏭️  --serve-only: skipping apt, docker, venv, NeMo, HF, and download steps."
+    echo ""
 
-#-------- Docker / Containers ------------
-if command -v docker >/dev/null 2>&1; then
-    echo "✅ Docker is installed. Version: $(docker --version)"
-else
-    echo "❌ Docker is not installed."
-    echo " You need docker first before running this. This will download a docker installer and run it for you. "
-    wget -O "install_docker.sh" https://raw.githubusercontent.com/c2theg/srvBuilds/refs/heads/master/install_docker.sh
-    chmod u+x install_docker.sh
-    ./install_docker.sh
-fi
-
-#--- SETUP vLLM on DGX Spark ---
-curl -fsSL https://raw.githubusercontent.com/eelbaz/dgx-spark-vllm-setup/main/install.sh | bash
-
-#------ Download & install models -----
-
-VENV_PIP=""
-VENV_DIR=""
-for candidate in "$VLLM_VENV" "$HOME/vllm-install/.vllm" "/home/cgray/vllm-install/.vllm"; do
-    if [ -x "$candidate/bin/pip" ]; then
-        VENV_PIP="$candidate/bin/pip"
-        VENV_DIR="$candidate"
-        echo "✅ Using vLLM venv at $candidate"
-        break
-    fi
-done
-
-if [ -z "$VENV_PIP" ]; then
-    echo "⚠️  vLLM venv not found — creating dedicated downloader venv at $VLLM_VENV"
-    python3 -m venv "$VLLM_VENV"
-    VENV_PIP="$VLLM_VENV/bin/pip"
-    VENV_DIR="$VLLM_VENV"
-fi
-
-if ! "$VENV_DIR/bin/python" -c "import vllm" 2>/dev/null; then
-    echo "⚠️  vllm not found in venv — installing via pip..."
-    "$VENV_PIP" install -U vllm
-    if "$VENV_DIR/bin/python" -c "import vllm" 2>/dev/null; then
-        echo "✅ vllm installed successfully"
-    else
-        echo "❌ vllm install failed — check pip output above"
-    fi
-else
-    echo "✅ vllm already installed: $("$VENV_DIR/bin/python" -c 'import vllm; print(vllm.__version__)')"
-fi
-
-"$VENV_PIP" install -U "huggingface_hub[cli]" sentence-transformers
-
-if [ -x "$VENV_DIR/bin/hf" ]; then
-    HF_CLI="$VENV_DIR/bin/hf"
-    HF_LOGIN="$HF_CLI auth login"
-else
-    HF_CLI="$VENV_DIR/bin/huggingface-cli"
-    HF_LOGIN="$HF_CLI login"
-fi
-echo "✅ Using HF CLI: $HF_CLI"
-
-python3 -m venv "$NEMO_VENV"
-"$NEMO_VENV/bin/pip" install -U pip
-"$NEMO_VENV/bin/pip" install "nemo_toolkit[asr]"
-
-if [ -n "$HF_TOKEN" ]; then
-    $HF_LOGIN --token "$HF_TOKEN"
-    HF_AUTH="--token $HF_TOKEN"
-else
-    echo "⚠️  HF_TOKEN not set — gated models will fail."
-    HF_AUTH=""
-fi
-
-mkdir -p "$MODELS_DIR"
-HF_DL="$HF_CLI download $HF_AUTH"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DOWNLOAD selected models
-# ─────────────────────────────────────────────────────────────────────────────
-if [ "${#DL_SELECTED[@]}" -eq 0 ]; then
-    echo "⏭️  No models selected for download — skipping."
-else
-    for idx in "${DL_SELECTED[@]}"; do
-        echo ""
-        echo "--- Downloading ${MDL_NAME[$idx]} ---"
-        echo "    HF repo  : ${MDL_HF[$idx]}"
-        echo "    Local dir: $MODELS_DIR/${MDL_DIR[$idx]}"
-        if [ "${MDL_CAT[$idx]}" = "Super Large" ]; then
-            echo "    ⚠️  SUPER LARGE model (~${MDL_DISK[$idx]} GB) — this will take a while."
-            echo "    ℹ️  Nemotron-3-Super info: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard"
+    # Find an existing venv so the VLLM_BIN search has a venv path to try first.
+    VENV_DIR=""
+    for candidate in "$VLLM_VENV" "$HOME/vllm-install/.vllm" "/home/cgray/vllm-install/.vllm"; do
+        if [ -x "$candidate/bin/python" ]; then
+            VENV_DIR="$candidate"
+            echo "✅ Using existing venv at $VENV_DIR"
+            break
         fi
-        $HF_DL "${MDL_HF[$idx]}" --local-dir "$MODELS_DIR/${MDL_DIR[$idx]}"
-        echo "✅ ${MDL_NAME[$idx]} downloaded"
     done
-fi
+    [ -z "$VENV_DIR" ] && VENV_DIR="$VLLM_VENV"  # fallback; VLLM_BIN PATH search will cover it
 
-echo ""
-echo "✅ All selected models downloaded to $MODELS_DIR"
+else
+    # ── Full install mode ──────────────────────────────────────────────────────
+    sudo apt update
+    sudo apt install -y --no-install-recommends wget curl gnupg2 git libgl1 libglib2.0-0
+    sudo apt install -y jq
+    sudo apt install -y python3.12-dev python3-dev build-essential ninja-build
+
+    #-------- Docker / Containers ------------
+    if command -v docker >/dev/null 2>&1; then
+        echo "✅ Docker is installed. Version: $(docker --version)"
+    else
+        echo "❌ Docker is not installed."
+        echo " You need docker first before running this. This will download a docker installer and run it for you. "
+        wget -O "install_docker.sh" https://raw.githubusercontent.com/c2theg/srvBuilds/refs/heads/master/install_docker.sh
+        chmod u+x install_docker.sh
+        ./install_docker.sh
+    fi
+
+    #--- SETUP vLLM on DGX Spark ---
+    curl -fsSL https://raw.githubusercontent.com/eelbaz/dgx-spark-vllm-setup/main/install.sh | bash
+
+    VENV_PIP=""
+    VENV_DIR=""
+    for candidate in "$VLLM_VENV" "$HOME/vllm-install/.vllm" "/home/cgray/vllm-install/.vllm"; do
+        if [ -x "$candidate/bin/pip" ]; then
+            VENV_PIP="$candidate/bin/pip"
+            VENV_DIR="$candidate"
+            echo "✅ Using vLLM venv at $candidate"
+            break
+        fi
+    done
+
+    if [ -z "$VENV_PIP" ]; then
+        echo "⚠️  vLLM venv not found — creating dedicated downloader venv at $VLLM_VENV"
+        python3 -m venv "$VLLM_VENV"
+        VENV_PIP="$VLLM_VENV/bin/pip"
+        VENV_DIR="$VLLM_VENV"
+    fi
+
+    if ! "$VENV_DIR/bin/python" -c "import vllm" 2>/dev/null; then
+        echo "⚠️  vllm not found in venv — installing via pip..."
+        "$VENV_PIP" install -U vllm
+        if "$VENV_DIR/bin/python" -c "import vllm" 2>/dev/null; then
+            echo "✅ vllm installed successfully"
+        else
+            echo "❌ vllm install failed — check pip output above"
+        fi
+    else
+        echo "✅ vllm already installed: $("$VENV_DIR/bin/python" -c 'import vllm; print(vllm.__version__)')"
+    fi
+
+    "$VENV_PIP" install -U "huggingface_hub[cli]" sentence-transformers
+
+    if [ -x "$VENV_DIR/bin/hf" ]; then
+        HF_CLI="$VENV_DIR/bin/hf"
+        HF_LOGIN="$HF_CLI auth login"
+    else
+        HF_CLI="$VENV_DIR/bin/huggingface-cli"
+        HF_LOGIN="$HF_CLI login"
+    fi
+    echo "✅ Using HF CLI: $HF_CLI"
+
+    python3 -m venv "$NEMO_VENV"
+    "$NEMO_VENV/bin/pip" install -U pip
+    "$NEMO_VENV/bin/pip" install "nemo_toolkit[asr]"
+
+    if [ -n "$HF_TOKEN" ]; then
+        $HF_LOGIN --token "$HF_TOKEN"
+        HF_AUTH="--token $HF_TOKEN"
+    else
+        echo "⚠️  HF_TOKEN not set — gated models will fail."
+        HF_AUTH=""
+    fi
+
+    mkdir -p "$MODELS_DIR"
+    HF_DL="$HF_CLI download $HF_AUTH"
+
+    # ── Download selected models ───────────────────────────────────────────────
+    if [ "${#DL_SELECTED[@]}" -eq 0 ]; then
+        echo "⏭️  No models selected for download — skipping."
+    else
+        for idx in "${DL_SELECTED[@]}"; do
+            echo ""
+            echo "--- Downloading ${MDL_NAME[$idx]} ---"
+            echo "    HF repo  : ${MDL_HF[$idx]}"
+            echo "    Local dir: $MODELS_DIR/${MDL_DIR[$idx]}"
+            if [ "${MDL_CAT[$idx]}" = "Super Large" ]; then
+                echo "    ⚠️  SUPER LARGE model (~${MDL_DISK[$idx]} GB) — this will take a while."
+                echo "    ℹ️  Nemotron-3-Super info: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard"
+            fi
+            $HF_DL "${MDL_HF[$idx]}" --local-dir "$MODELS_DIR/${MDL_DIR[$idx]}"
+            echo "✅ ${MDL_NAME[$idx]} downloaded"
+        done
+    fi
+
+    echo ""
+    echo "✅ All selected models downloaded to $MODELS_DIR"
+fi  # end SERVE_ONLY check
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SERVE selected models with vLLM
 # ─────────────────────────────────────────────────────────────────────────────
 VLLM_LOGS="$BASE_DIR/logs"
 mkdir -p "$VLLM_LOGS"
+echo "✅ Log directory: $VLLM_LOGS"
 
 VLLM_BIN=""
 for candidate in \
@@ -456,12 +502,68 @@ for candidate in \
     fi
 done
 
+if [ -z "$VLLM_BIN" ]; then
+    echo "⚠️  vllm not found in venv candidates — checking PATH..."
+    if command -v vllm &>/dev/null; then
+        VLLM_BIN="$(command -v vllm)"
+        echo "✅ Found vllm on PATH: $VLLM_BIN"
+    else
+        echo "❌ CRITICAL: vllm binary not found anywhere."
+        echo "   Searched venv: $VENV_DIR"
+        echo "   Run: source $VENV_DIR/bin/activate && pip install -U vllm"
+        echo "   Serve section will be skipped."
+    fi
+fi
+
 vllm_serve() {
     if [ -n "$VLLM_BIN" ]; then
         "$VLLM_BIN" serve "$@"
     else
         echo "⚠️  vllm not found — trying python module fallback"
         "$VENV_DIR/bin/python" -m vllm.entrypoints.openai.api_server "$@"
+    fi
+}
+
+# Helper: launch one model, echo command, wait 2s, confirm process is alive
+# Usage: _vllm_launch <catalog_idx> [extra vllm args...]
+_vllm_launch() {
+    local idx="$1"; shift
+    local name="${MDL_NAME[$idx]}"
+    local dir="${MDL_DIR[$idx]}"
+    local port="${MDL_PORT[$idx]}"
+    local model_path="$MODELS_DIR/$dir"
+    local log_file="$VLLM_LOGS/vllm-${port}.log"
+
+    if [ ! -f "$model_path/config.json" ]; then
+        echo "⚠️  [idx $idx] $name — model not found at $model_path"
+        echo "     Was it downloaded? Re-run and select this model in Step 1."
+        return 1
+    fi
+
+    local vllm_label
+    if [ -n "$VLLM_BIN" ]; then
+        vllm_label="$VLLM_BIN serve"
+    else
+        vllm_label="python3 -m vllm.entrypoints.openai.api_server"
+    fi
+
+    echo ""
+    echo "--- Starting [idx $idx] $name on port $port ---"
+    echo "    Model : $model_path"
+    echo "    Log   : $log_file"
+    echo "    CMD   : $vllm_label $model_path --host 0.0.0.0 --port $port $*"
+
+    vllm_serve "$model_path" --host 0.0.0.0 --port "$port" "$@" >> "$log_file" 2>&1 &
+    local launch_pid=$!
+    sleep 2
+    if kill -0 "$launch_pid" 2>/dev/null; then
+        echo "✅ $name started  pid=$launch_pid  port=$port"
+        echo "   → Logs  : tail -f $log_file"
+        echo "   → Status: curl -s http://localhost:${port}/v1/models | jq ."
+    else
+        echo "⚠️  $name (pid $launch_pid) exited immediately — last 30 lines of log:"
+        tail -30 "$log_file" 2>/dev/null | sed 's/^/   | /'
+        echo "   → Full log: cat $log_file"
     fi
 }
 
@@ -480,205 +582,141 @@ export TORCH_FLOAT32_MATMUL_PRECISION=high
 
 if [ "${#RUN_SELECTED[@]}" -eq 0 ]; then
     echo "⏭️  No models selected to serve — skipping vLLM startup."
+else
+    echo ""
+    echo "  ── Models queued to serve ───────────────────────────────────────"
+    for idx in "${RUN_SELECTED[@]}"; do
+        [ "${MDL_PORT[$idx]}" = "0" ] && continue
+        printf "    [catalog idx %2d]  %-50s  port %s\n" \
+            "$idx" "${MDL_NAME[$idx]}" "${MDL_PORT[$idx]}"
+    done
+    echo "  ─────────────────────────────────────────────────────────────────"
 fi
 
-# ── idx 0: Qwen3.6-35B-A3B-FP8  (port 8005) ──────────────────────────────────
+# NOTE: is_run_selected checks the actual catalog index stored in RUN_SELECTED.
+# Catalog indices are assigned by _add() in order of appearance above — they
+# must match here exactly, or the wrong model serve block will fire.
+
+# ── catalog idx 0: Qwen3.6-35B-A3B-FP8  (port 8005) ──────────────────────────
 if is_run_selected 0; then
-    if [ -f "$MODELS_DIR/Qwen3.6-35B-A3B-FP8/config.json" ]; then
-        echo "--- Starting vLLM: Qwen3.6-35B-A3B-FP8 on port 8005 ---"
-        vllm_serve "$MODELS_DIR/Qwen3.6-35B-A3B-FP8" \
-            --host 0.0.0.0 --port 8005 \
-            --served-model-name "Qwen3.6-35B-A3B" \
-            --dtype auto \
-            --gpu-memory-utilization 0.73 \
-            --max-model-len 32768 \
-            --enable-prefix-caching \
-            --trust-remote-code \
-            --enable-auto-tool-choice \
-            --tool-call-parser hermes \
-            --chat-template-kwargs '{"enable_thinking": false}' \
-            >> "$VLLM_LOGS/vllm-8005.log" 2>&1 &
-        echo "✅ Qwen3.6-35B-A3B-FP8 starting on port 8005 (pid $!)"
-        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8005.log"
-        echo "   → Status: curl -s http://localhost:8005/v1/models | jq ."
-    else
-        echo "⚠️  Qwen3.6-35B-A3B-FP8 not found in $MODELS_DIR — was it downloaded?"
-    fi
+    _vllm_launch 0 \
+        --served-model-name "Qwen3.6-35B-A3B" \
+        --dtype auto \
+        --gpu-memory-utilization 0.73 \
+        --max-model-len 32768 \
+        --enable-prefix-caching \
+        --trust-remote-code \
+        --enable-auto-tool-choice \
+        --tool-call-parser hermes \
+        --chat-template-kwargs '{"enable_thinking": false}'
 fi
 
-# ── idx 1: NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4  (port 8006) ─────────────────
+# ── catalog idx 1: NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4  (port 8006) ─────────
 if is_run_selected 1; then
-    if [ -f "$MODELS_DIR/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4/config.json" ]; then
-        echo "--- Starting vLLM: NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 on port 8006 ---"
-        vllm_serve "$MODELS_DIR/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4" \
-            --host 0.0.0.0 --port 8006 \
-            --served-model-name "Nemotron-3-Nano-30B-NVFP4" \
-            --dtype auto \
-            --quantization modelopt_fp4 \
-            --gpu-memory-utilization 0.85 \
-            --max-model-len 32768 \
-            --max-num-seqs 178 \
-            --enable-prefix-caching \
-            --trust-remote-code \
-            --enable-auto-tool-choice \
-            --tool-call-parser hermes \
-            >> "$VLLM_LOGS/vllm-8006.log" 2>&1 &
-        echo "✅ Nemotron-3-Nano-30B-NVFP4 starting on port 8006 (pid $!)"
-        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8006.log"
-        echo "   → Status: curl -s http://localhost:8006/v1/models | jq ."
-        echo "   → Add to OpenWebUI: Admin Settings → Connections → http://localhost:8006/v1"
-    else
-        echo "⚠️  NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 not found in $MODELS_DIR — was it downloaded?"
-    fi
+    _vllm_launch 1 \
+        --served-model-name "Nemotron-3-Nano-30B-NVFP4" \
+        --dtype auto \
+        --quantization modelopt_fp4 \
+        --gpu-memory-utilization 0.85 \
+        --max-model-len 32768 \
+        --max-num-seqs 178 \
+        --enable-prefix-caching \
+        --trust-remote-code \
+        --enable-auto-tool-choice \
+        --tool-call-parser hermes
 fi
 
-# ── idx 2: Qwen3-Coder-30B-A3B-Instruct  (port 8001) ─────────────────────────
+# ── catalog idx 2: Qwen3-Coder-30B-A3B-Instruct  (port 8001) ─────────────────
 if is_run_selected 2; then
-    if [ -f "$MODELS_DIR/Qwen3-Coder-30B-A3B-Instruct/config.json" ]; then
-        echo "--- Starting vLLM: Qwen3-Coder-30B-A3B-Instruct on port 8001 ---"
-        vllm_serve "$MODELS_DIR/Qwen3-Coder-30B-A3B-Instruct" \
-            --host 0.0.0.0 --port 8001 \
-            --served-model-name "Qwen3-Coder-30B" \
-            --dtype auto \
-            --gpu-memory-utilization 0.85 \
-            --max-model-len 32768 \
-            --enable-prefix-caching \
-            --trust-remote-code \
-            >> "$VLLM_LOGS/vllm-8001.log" 2>&1 &
-        echo "✅ Qwen3-Coder-30B-A3B starting on port 8001 (pid $!)"
-        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8001.log"
-        echo "   → Status: curl -s http://localhost:8001/v1/models | jq ."
-    else
-        echo "⚠️  Qwen3-Coder-30B-A3B-Instruct not found in $MODELS_DIR — was it downloaded?"
-    fi
+    _vllm_launch 2 \
+        --served-model-name "Qwen3-Coder-30B" \
+        --dtype auto \
+        --gpu-memory-utilization 0.85 \
+        --max-model-len 32768 \
+        --enable-prefix-caching \
+        --trust-remote-code
 fi
 
-# ── idx 3: DeepSeek-R1-Distill-Qwen-32B  (port 8002) ─────────────────────────
+# ── catalog idx 3: DeepSeek-R1-Distill-Qwen-32B  (port 8002) ─────────────────
 if is_run_selected 3; then
-    if [ -f "$MODELS_DIR/DeepSeek-R1-Distill-Qwen-32B/config.json" ]; then
-        echo "--- Starting vLLM: DeepSeek-R1-Distill-Qwen-32B on port 8002 ---"
-        vllm_serve "$MODELS_DIR/DeepSeek-R1-Distill-Qwen-32B" \
-            --host 0.0.0.0 --port 8002 \
-            --served-model-name "DeepSeek-R1-Distill-Qwen-32B" \
-            --dtype auto \
-            --gpu-memory-utilization 0.85 \
-            --max-model-len 32768 \
-            --enable-prefix-caching \
-            --trust-remote-code \
-            >> "$VLLM_LOGS/vllm-8002.log" 2>&1 &
-        echo "✅ DeepSeek-R1-Distill-Qwen-32B starting on port 8002 (pid $!)"
-        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8002.log"
-        echo "   → Status: curl -s http://localhost:8002/v1/models | jq ."
-    else
-        echo "⚠️  DeepSeek-R1-Distill-Qwen-32B not found in $MODELS_DIR — was it downloaded?"
-    fi
+    _vllm_launch 3 \
+        --served-model-name "DeepSeek-R1-Distill-Qwen-32B" \
+        --dtype auto \
+        --gpu-memory-utilization 0.85 \
+        --max-model-len 32768 \
+        --enable-prefix-caching \
+        --trust-remote-code
 fi
 
-# ── idx 4: gemma-4-26B-A4B-it  (port 8007) ───────────────────────────────────
+# ── catalog idx 4: gemma-4-31B-it  (port 8009) ────────────────────────────────
 if is_run_selected 4; then
-    if [ -f "$MODELS_DIR/gemma-4-26B-A4B-it/config.json" ]; then
-        echo "--- Starting vLLM: gemma-4-26B-A4B-it on port 8007 ---"
-        vllm_serve "$MODELS_DIR/gemma-4-26B-A4B-it" \
-            --host 0.0.0.0 --port 8007 \
-            --served-model-name "gemma-4-26B-A4B" \
-            --dtype auto \
-            --gpu-memory-utilization 0.55 \
-            --max-model-len 16384 \
-            --max-num-batched-tokens 4096 \
-            --enable-prefix-caching \
-            --trust-remote-code \
-            --enable-auto-tool-choice \
-            --tool-call-parser hermes \
-            >> "$VLLM_LOGS/vllm-8007.log" 2>&1 &
-        echo "✅ gemma-4-26B-A4B starting on port 8007 (pid $!)"
-        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8007.log"
-        echo "   → Status: curl -s http://localhost:8007/v1/models | jq ."
-    else
-        echo "⚠️  gemma-4-26B-A4B-it not found in $MODELS_DIR — was it downloaded?"
-    fi
+    _vllm_launch 4 \
+        --served-model-name "gemma-4-31B" \
+        --dtype auto \
+        --gpu-memory-utilization 0.60 \
+        --max-model-len 32768 \
+        --enable-prefix-caching \
+        --trust-remote-code \
+        --enable-auto-tool-choice \
+        --tool-call-parser hermes
 fi
 
-# ── idx 5: Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16  (port 8008) ──────────
+# ── catalog idx 5: gemma-4-26B-A4B-it  (port 8007) ───────────────────────────
 if is_run_selected 5; then
-    if [ -f "$MODELS_DIR/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16/config.json" ]; then
-        echo "--- Starting vLLM: Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 on port 8008 ---"
-        vllm_serve "$MODELS_DIR/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16" \
-            --host 0.0.0.0 --port 8008 \
-            --served-model-name "Nemotron-3-Nano-Omni-30B-A3B" \
-            --dtype bfloat16 \
-            --gpu-memory-utilization 0.85 \
-            --max-model-len 32768 \
-            --enable-prefix-caching \
-            --trust-remote-code \
-            >> "$VLLM_LOGS/vllm-8008.log" 2>&1 &
-        echo "✅ Nemotron-3-Nano-Omni-30B-A3B starting on port 8008 (pid $!)"
-        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8008.log"
-        echo "   → Status: curl -s http://localhost:8008/v1/models | jq ."
-    else
-        echo "⚠️  Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 not found in $MODELS_DIR — was it downloaded?"
-    fi
+    _vllm_launch 5 \
+        --served-model-name "gemma-4-26B-A4B" \
+        --dtype auto \
+        --gpu-memory-utilization 0.55 \
+        --max-model-len 16384 \
+        --max-num-batched-tokens 4096 \
+        --enable-prefix-caching \
+        --trust-remote-code \
+        --enable-auto-tool-choice \
+        --tool-call-parser hermes
 fi
 
-# ── idx 6: BAAI/bge-m3  (port 8011) ──────────────────────────────────────────
+# ── catalog idx 6: Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16  (port 8008) ───
 if is_run_selected 6; then
-    if [ -f "$MODELS_DIR/bge-m3/config.json" ]; then
-        echo "--- Starting vLLM: bge-m3 on port 8011 ---"
-        vllm_serve "$MODELS_DIR/bge-m3" \
-            --host 0.0.0.0 --port 8011 \
-            --served-model-name "bge-m3" \
-            --task embedding \
-            --dtype auto \
-            --gpu-memory-utilization 0.30 \
-            --trust-remote-code \
-            >> "$VLLM_LOGS/vllm-8011.log" 2>&1 &
-        echo "✅ bge-m3 starting on port 8011 (pid $!)"
-        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8011.log"
-    else
-        echo "⚠️  bge-m3 not found in $MODELS_DIR — was it downloaded?"
-    fi
+    _vllm_launch 6 \
+        --served-model-name "Nemotron-3-Nano-Omni-30B-A3B" \
+        --dtype bfloat16 \
+        --gpu-memory-utilization 0.85 \
+        --max-model-len 32768 \
+        --enable-prefix-caching \
+        --trust-remote-code
 fi
 
-# ── idx 7: Qwen3-Embedding-4B  (port 8010) ────────────────────────────────────
+# ── catalog idx 7: BAAI/bge-m3  (port 8011) ───────────────────────────────────
 if is_run_selected 7; then
-    if [ -f "$MODELS_DIR/Qwen3-Embedding-4B/config.json" ]; then
-        echo "--- Starting vLLM: Qwen3-Embedding-4B on port 8010 ---"
-        vllm_serve "$MODELS_DIR/Qwen3-Embedding-4B" \
-            --host 0.0.0.0 --port 8010 \
-            --served-model-name "Qwen3-Embedding-4B" \
-            --task embedding \
-            --dtype auto \
-            --gpu-memory-utilization 0.50 \
-            --trust-remote-code \
-            >> "$VLLM_LOGS/vllm-8010.log" 2>&1 &
-        echo "✅ Qwen3-Embedding-4B starting on port 8010 (pid $!)"
-        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8010.log"
-        echo "   → Status: curl -s http://localhost:8010/v1/models | jq ."
-    else
-        echo "⚠️  Qwen3-Embedding-4B not found in $MODELS_DIR — was it downloaded?"
-    fi
+    _vllm_launch 7 \
+        --served-model-name "bge-m3" \
+        --task embedding \
+        --dtype auto \
+        --gpu-memory-utilization 0.30 \
+        --trust-remote-code
 fi
 
-# ── idx 8: bge-reranker-v2-m3  (port 8020) ────────────────────────────────────
+# ── catalog idx 8: Qwen3-Embedding-4B  (port 8010) ────────────────────────────
 if is_run_selected 8; then
-    if [ -f "$MODELS_DIR/bge-reranker-v2-m3/config.json" ]; then
-        echo "--- Starting vLLM: bge-reranker-v2-m3 on port 8020 ---"
-        vllm_serve "$MODELS_DIR/bge-reranker-v2-m3" \
-            --host 0.0.0.0 --port 8020 \
-            --served-model-name "bge-reranker-v2-m3" \
-            --task classify \
-            --dtype auto \
-            --gpu-memory-utilization 0.50 \
-            --trust-remote-code \
-            >> "$VLLM_LOGS/vllm-8020.log" 2>&1 &
-        echo "✅ bge-reranker-v2-m3 starting on port 8020 (pid $!)"
-        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8020.log"
-        echo "   → Status: curl -s http://localhost:8020/v1/models | jq ."
-    else
-        echo "⚠️  bge-reranker-v2-m3 not found in $MODELS_DIR — was it downloaded?"
-    fi
+    _vllm_launch 8 \
+        --served-model-name "Qwen3-Embedding-4B" \
+        --task embedding \
+        --dtype auto \
+        --gpu-memory-utilization 0.50 \
+        --trust-remote-code
 fi
 
-# ── idx 9 & 10: ASR / NeMo models — download only, not served via vLLM ────────
+# ── catalog idx 9: bge-reranker-v2-m3  (port 8020) ────────────────────────────
+if is_run_selected 9; then
+    _vllm_launch 9 \
+        --served-model-name "bge-reranker-v2-m3" \
+        --task classify \
+        --dtype auto \
+        --gpu-memory-utilization 0.50 \
+        --trust-remote-code
+fi
+
+# ── catalog idx 10 & 11: ASR / NeMo — download only, not served via vLLM ──────
 # To use: python3 -c "
 #   import nemo.collections.asr as nemo_asr
 #   model = nemo_asr.models.EncDecRNNTBPEModel.restore_from('$MODELS_DIR/parakeet-tdt-0.6b-v3/model.nemo')
@@ -688,101 +726,47 @@ fi
 # SUPER LARGE MODELS (120B+ parameters)
 # Info: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard
 # ⚠️  These require nearly the entire GPU. Do NOT run alongside other large models.
-# ⚠️  Verify HF repo IDs before downloading — see comments above _add entries.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── idx 11: Nemotron-3-Super-120B-A12B  (port 8030) ───────────────────────────
-if is_run_selected 11; then
-    if [ -f "$MODELS_DIR/NVIDIA-Nemotron-3-Super-120B-A12B-BF16/config.json" ]; then
-        echo "--- Starting vLLM: NVIDIA-Nemotron-3-Super-120B-A12B-BF16 on port 8030 ---"
-        echo "   ℹ️  Model info: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard"
-        echo "   ⚠️  SUPER LARGE — needs ~115 GB VRAM. Ensure no other large models are running."
-        vllm_serve "$MODELS_DIR/NVIDIA-Nemotron-3-Super-120B-A12B-BF16" \
-            --host 0.0.0.0 --port 8030 \
-            --served-model-name "Nemotron-3-Super-120B-A12B" \
-            --dtype auto \
-            --gpu-memory-utilization 0.96 \
-            --max-model-len 8192 \
-            --enable-prefix-caching \
-            --trust-remote-code \
-            --enable-auto-tool-choice \
-            --tool-call-parser hermes \
-            >> "$VLLM_LOGS/vllm-8030.log" 2>&1 &
-        echo "✅ Nemotron-3-Super-120B-A12B starting on port 8030 (pid $!)"
-        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8030.log"
-        echo "   → Status: curl -s http://localhost:8030/v1/models | jq ."
-    else
-        echo "⚠️  NVIDIA-Nemotron-3-Super-120B-A12B-BF16 not found in $MODELS_DIR — was it downloaded?"
-    fi
-fi
-
-# ── idx 12: Qwen3.5-122B-A10B-Instruct  (port 8031) ──────────────────────────
+# ── catalog idx 12: Nemotron-3-Super-120B-A12B  (port 8030) ───────────────────
 if is_run_selected 12; then
-    if [ -f "$MODELS_DIR/Qwen3.5-122B-A10B/config.json" ]; then
-        echo "--- Starting vLLM: Qwen3.5-122B-A10B on port 8031 ---"
-        echo "   ⚠️  SUPER LARGE — needs ~120 GB VRAM. Ensure no other large models are running."
-        vllm_serve "$MODELS_DIR/Qwen3.5-122B-A10B" \
-            --host 0.0.0.0 --port 8031 \
-            --served-model-name "Qwen3.5-122B-A10B" \
-            --dtype auto \
-            --gpu-memory-utilization 0.96 \
-            --max-model-len 8192 \
-            --enable-prefix-caching \
-            --trust-remote-code \
-            --enable-auto-tool-choice \
-            --tool-call-parser hermes \
-            >> "$VLLM_LOGS/vllm-8031.log" 2>&1 &
-        echo "✅ Qwen3.5-122B-A10B starting on port 8031 (pid $!)"
-        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8031.log"
-        echo "   → Status: curl -s http://localhost:8031/v1/models | jq ."
-    else
-        echo "⚠️  Qwen3.5-122B-A10B not found in $MODELS_DIR — was it downloaded?"
-    fi
+    echo "   ℹ️  Model info: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard"
+    echo "   ⚠️  SUPER LARGE — needs ~115 GB VRAM. Ensure no other large models are running."
+    _vllm_launch 12 \
+        --served-model-name "Nemotron-3-Super-120B-A12B" \
+        --dtype auto \
+        --gpu-memory-utilization 0.96 \
+        --max-model-len 8192 \
+        --enable-prefix-caching \
+        --trust-remote-code \
+        --enable-auto-tool-choice \
+        --tool-call-parser hermes
 fi
 
-# ── idx 13: GPT-OSS-120B  (port 8032) ─────────────────────────────────────────
+# ── catalog idx 13: Qwen3.5-122B-A10B  (port 8031) ────────────────────────────
 if is_run_selected 13; then
-    if [ -f "$MODELS_DIR/gpt-oss-120b/config.json" ]; then
-        echo "--- Starting vLLM: gpt-oss-120b on port 8032 ---"
-        echo "   ⚠️  SUPER LARGE — needs ~115 GB VRAM. Ensure no other large models are running."
-        vllm_serve "$MODELS_DIR/gpt-oss-120b" \
-            --host 0.0.0.0 --port 8032 \
-            --served-model-name "GPT-OSS-120B" \
-            --dtype auto \
-            --gpu-memory-utilization 0.96 \
-            --max-model-len 8192 \
-            --enable-prefix-caching \
-            --trust-remote-code \
-            >> "$VLLM_LOGS/vllm-8032.log" 2>&1 &
-        echo "✅ GPT-OSS-120B starting on port 8032 (pid $!)"
-        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8032.log"
-        echo "   → Status: curl -s http://localhost:8032/v1/models | jq ."
-    else
-        echo "⚠️  gpt-oss-120b not found in $MODELS_DIR — was it downloaded?"
-    fi
+    echo "   ⚠️  SUPER LARGE — needs ~120 GB VRAM. Ensure no other large models are running."
+    _vllm_launch 13 \
+        --served-model-name "Qwen3.5-122B-A10B" \
+        --dtype auto \
+        --gpu-memory-utilization 0.96 \
+        --max-model-len 8192 \
+        --enable-prefix-caching \
+        --trust-remote-code \
+        --enable-auto-tool-choice \
+        --tool-call-parser hermes
 fi
 
-# ── idx 14: gemma-4-31B-it  (port 8009) ───────────────────────────────────────
+# ── catalog idx 14: GPT-OSS-120B  (port 8032) ─────────────────────────────────
 if is_run_selected 14; then
-    if [ -f "$MODELS_DIR/gemma-4-31B-it/config.json" ]; then
-        echo "--- Starting vLLM: gemma-4-31B-it on port 8009 ---"
-        vllm_serve "$MODELS_DIR/gemma-4-31B-it" \
-            --host 0.0.0.0 --port 8009 \
-            --served-model-name "gemma-4-31B" \
-            --dtype auto \
-            --gpu-memory-utilization 0.60 \
-            --max-model-len 32768 \
-            --enable-prefix-caching \
-            --trust-remote-code \
-            --enable-auto-tool-choice \
-            --tool-call-parser hermes \
-            >> "$VLLM_LOGS/vllm-8009.log" 2>&1 &
-        echo "✅ gemma-4-31B-it starting on port 8009 (pid $!)"
-        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8009.log"
-        echo "   → Status: curl -s http://localhost:8009/v1/models | jq ."
-    else
-        echo "⚠️  gemma-4-31B-it not found in $MODELS_DIR — was it downloaded?"
-    fi
+    echo "   ⚠️  SUPER LARGE — needs ~115 GB VRAM. Ensure no other large models are running."
+    _vllm_launch 14 \
+        --served-model-name "GPT-OSS-120B" \
+        --dtype auto \
+        --gpu-memory-utilization 0.96 \
+        --max-model-len 8192 \
+        --enable-prefix-caching \
+        --trust-remote-code
 fi
 
 #---------------------------------------------------------------------------------------------------------------
