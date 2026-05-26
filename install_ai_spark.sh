@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.1.7  |  Update: 5/26/2026
+# Christopher Gray  |  Version: 0.1.8  |  Update: 5/26/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
@@ -11,6 +11,11 @@
 #   ./install_ai_spark.sh -s           — same as --serve-only
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.1.8  5/26/2026
+#   - Added Qwen/Qwen3.5-122B-A10B-FP8 (catalog idx 14, port 8033, ~62 GB VRAM)
+#     FP8 cuts VRAM roughly in half vs BF16, allowing max-model-len 32768 and
+#     much faster inference on the GB10 GPU.
 #
 # v0.1.7  5/26/2026
 #   - Lowered --gpu-memory-utilization for SUPER LARGE models from 0.96 → 0.93
@@ -94,7 +99,7 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.1.7
+Version:  0.1.8
 Last Updated:  5/26/2026
 
 Update Yourself:
@@ -211,7 +216,8 @@ _add "nvidia/nemotron-speech-streaming-en-0.6b"                  "nemotron-speec
 # Note: these require nearly the entire GPU — do not run alongside other large models.
 # ⚠️  Verify HF repo IDs before downloading — these may require updated values.
 _add "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"             "NVIDIA-Nemotron-3-Super-120B-A12B-BF16" "Nemotron-3-Super-120B-A12B (BF16) [SUPER]" 120  115   8030  "Super Large"
-_add "Qwen/Qwen3.5-122B-A10B"                                    "Qwen3.5-122B-A10B"                     "Qwen3.5-122B-A10B (MoE) [SUPER]"            122  120   8031  "Super Large"
+_add "Qwen/Qwen3.5-122B-A10B"                                    "Qwen3.5-122B-A10B"                     "Qwen3.5-122B-A10B (BF16) [SUPER]"           122  120   8031  "Super Large"
+_add "Qwen/Qwen3.5-122B-A10B-FP8"                               "Qwen3.5-122B-A10B-FP8"                 "Qwen3.5-122B-A10B (FP8) [SUPER] ★Rec"        62   65   8033  "Super Large"
 _add "openai/gpt-oss-120b"                                       "gpt-oss-120b"                          "GPT-OSS-120B [SUPER]"                       120  115   8032  "Super Large"
 
 MODEL_TOTAL=${#MDL_HF[@]}
@@ -763,10 +769,25 @@ if is_run_selected 13; then
         --tool-call-parser hermes
 fi
 
-# ── catalog idx 14: GPT-OSS-120B  (port 8032) ─────────────────────────────────
+# ── catalog idx 14: Qwen3.5-122B-A10B-FP8  (port 8033) ★ Recommended ──────────
+# FP8 uses ~62 GB VRAM vs ~120 GB for BF16 — fits easily, allows longer context
 if is_run_selected 14; then
-    echo "   ⚠️  SUPER LARGE — needs ~115 GB VRAM. Ensure no other large models are running."
+    echo "   ★  FP8 version: ~62 GB VRAM, faster inference, longer context than BF16"
     _vllm_launch 14 \
+        --served-model-name "Qwen3.5-122B-A10B-FP8" \
+        --dtype auto \
+        --gpu-memory-utilization 0.93 \
+        --max-model-len 32768 \
+        --enable-prefix-caching \
+        --trust-remote-code \
+        --enable-auto-tool-choice \
+        --tool-call-parser hermes
+fi
+
+# ── catalog idx 15: GPT-OSS-120B  (port 8032) ─────────────────────────────────
+if is_run_selected 15; then
+    echo "   ⚠️  SUPER LARGE — needs ~115 GB VRAM. Ensure no other large models are running."
+    _vllm_launch 15 \
         --served-model-name "GPT-OSS-120B" \
         --dtype auto \
         --gpu-memory-utilization 0.93 \
