@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.1.6  |  Update: 5/26/2026
+# Christopher Gray  |  Version: 0.1.7  |  Update: 5/26/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
@@ -11,6 +11,12 @@
 #   ./install_ai_spark.sh -s           — same as --serve-only
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.1.7  5/26/2026
+#   - Lowered --gpu-memory-utilization for SUPER LARGE models from 0.96 → 0.93
+#     Root cause: GPU driver already occupies ~6 GiB at startup, so
+#     0.96 × 121.69 GiB = 116.82 GiB > 115.48 GiB free → vLLM ValueError.
+#     0.93 × 121.69 GiB = 113.17 GiB < 115.48 GiB free → passes pre-check.
 #
 # v0.1.6  5/26/2026
 #   - Added --serve-only / -s flag: skips apt, docker, venv, NeMo, HF, and
@@ -88,7 +94,7 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.1.6
+Version:  0.1.7
 Last Updated:  5/26/2026
 
 Update Yourself:
@@ -735,7 +741,7 @@ if is_run_selected 12; then
     _vllm_launch 12 \
         --served-model-name "Nemotron-3-Super-120B-A12B" \
         --dtype auto \
-        --gpu-memory-utilization 0.96 \
+        --gpu-memory-utilization 0.93 \
         --max-model-len 8192 \
         --enable-prefix-caching \
         --trust-remote-code \
@@ -749,7 +755,7 @@ if is_run_selected 13; then
     _vllm_launch 13 \
         --served-model-name "Qwen3.5-122B-A10B" \
         --dtype auto \
-        --gpu-memory-utilization 0.96 \
+        --gpu-memory-utilization 0.93 \
         --max-model-len 8192 \
         --enable-prefix-caching \
         --trust-remote-code \
@@ -763,7 +769,7 @@ if is_run_selected 14; then
     _vllm_launch 14 \
         --served-model-name "GPT-OSS-120B" \
         --dtype auto \
-        --gpu-memory-utilization 0.96 \
+        --gpu-memory-utilization 0.93 \
         --max-model-len 8192 \
         --enable-prefix-caching \
         --trust-remote-code
