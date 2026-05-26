@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.1.0  |  Update: 5/25/2026
+# Christopher Gray  |  Version: 0.1.1  |  Update: 5/25/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # What's New in 0.1.0:
@@ -17,7 +17,10 @@
 #   You will be prompted interactively to select which models to download and serve.
 
 # ─── strict mode ──────────────────────────────────────────────────────────────
-set -euo pipefail
+# -u: error on unset variables  -o pipefail: propagate pipeline failures
+# -e (exit on error) is intentionally omitted — this script uses many
+# [ cond ] && action patterns and || true guards that conflict with -e.
+set -uo pipefail
 
 echo "
 
