@@ -1,20 +1,42 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.1.1  |  Update: 5/25/2026
+# Christopher Gray  |  Version: 0.1.3  |  Update: 5/25/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
-#
-# What's New in 0.1.0:
-#   - Interactive checkbox model selection: choose which models to download and which to serve
-#   - VRAM pre-flight check — calculates total VRAM needed before launching anything
-#   - Model catalog with disk size and VRAM estimates for every model
-#   - SUPER LARGE section: Nemotron-3-Super-120B-A12B, Qwen3.5-122B-A10B, GPT-OSS-120B
-#   - Fixed log-redirection bug in all vllm_serve background calls (missing \ continuation)
-#   - Replaced ENABLE_* booleans with runtime interactive selection
 #
 # Update Yourself:
 #   wget --no-cache -O 'install_ai_spark.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark.sh' && chmod u+x install_ai_spark.sh
 #
 # Usage: ./install_ai_spark.sh
 #   You will be prompted interactively to select which models to download and serve.
+#
+# ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.1.3  5/25/2026
+#   - Added google/gemma-4-31B-it (idx 14, port 8009, ~62 GB BF16)
+#
+# v0.1.2  5/25/2026
+#   - Fixed correct HuggingFace repo IDs for all three SUPER LARGE models:
+#       nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+#       Qwen/Qwen3.5-122B-A10B
+#       openai/gpt-oss-120b
+#
+# v0.1.1  5/25/2026
+#   - Fixed script exiting immediately after banner: dropped -e from set -euo pipefail
+#     ([ cond ] && action patterns return exit code 1 when condition is false, which
+#      triggered immediate exit under strict -e mode)
+#
+# v0.1.0  5/25/2026
+#   - Switched shebang from #!/bin/sh to #!/usr/bin/env bash (required for arrays)
+#   - Interactive checkbox model selection: choose which models to download and serve
+#   - VRAM pre-flight check — calculates total VRAM needed before launching anything
+#   - Model catalog with disk size and VRAM estimates for every model
+#   - SUPER LARGE section (120B+ params): Nemotron-3-Super, Qwen3.5-122B, GPT-OSS-120B
+#   - Fixed log-redirection bug in all vllm_serve background calls (missing \ continuation)
+#   - Replaced ENABLE_* booleans with runtime interactive selection
+#   - OpenWebUI registration now loops dynamically over selected models
+#
+# v0.0.57  5/24/2026  (baseline before rewrite)
+#   - Original static ENABLE_QWEN35 / ENABLE_NEMOTRON / ENABLE_GEMMA4 flags
+# ──────────────────────────────────────────────────────────────────────────────
 
 # ─── strict mode ──────────────────────────────────────────────────────────────
 # -u: error on unset variables  -o pipefail: propagate pipeline failures
@@ -38,7 +60,7 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.1.1
+Version:  0.1.3
 Last Updated:  5/25/2026
 
 Update Yourself:
@@ -141,22 +163,22 @@ _add "Qwen/Qwen3.6-35B-A3B-FP8"                                  "Qwen3.6-35B-A3
 _add "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"               "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"  "Nemotron-3-Nano-30B-A3B (NVFP4)"        15   18   8006  "General"
 _add "Qwen/Qwen3-Coder-30B-A3B-Instruct"                         "Qwen3-Coder-30B-A3B-Instruct"          "Qwen3-Coder-30B-A3B (BF16)"             60   65   8001  "Coding"
 _add "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"                  "DeepSeek-R1-Distill-Qwen-32B"          "DeepSeek-R1-Distill-Qwen-32B (BF16)"    64   68   8002  "Reasoning"
+_add "google/gemma-4-31B-it"                                     "gemma-4-31B-it"                        "Gemma 4 31B-it (BF16)"                  62   66   8009  "General"
 _add "google/gemma-4-26B-A4B-it"                                 "gemma-4-26B-A4B-it"                    "Gemma 4 26B-A4B (BF16)"                 52   56   8007  "General"
 _add "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"        "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16" "Nemotron-3-Nano-Omni-30B (BF16)"  60   65   8008  "Reasoning"
 _add "BAAI/bge-m3"                                               "bge-m3"                                "BGE-M3 (Embeddings)"                     3    4   8011  "Embeddings"
-_add "Qwen/Qwen3-Embedding-4B"                                   "Qwen3-Embedding-4B"                    "Qwen3-Embedding-4B (Embeddings)"          8   10   8010  "Embeddings"
-_add "BAAI/bge-reranker-v2-m3"                                   "bge-reranker-v2-m3"                    "BGE-Reranker-v2-m3 (Reranking)"           2    3   8020  "Reranking"
-_add "nvidia/parakeet-tdt-0.6b-v3"                               "parakeet-tdt-0.6b-v3"                  "Parakeet-TDT-0.6B v3 (ASR / NeMo)"        1    0      0  "ASR"
-_add "nvidia/nemotron-speech-streaming-en-0.6b"                  "nemotron-speech-streaming-en-0.6b"     "Nemotron-Speech-Streaming-0.6B (ASR)"     1    0      0  "ASR"
+_add "Qwen/Qwen3-Embedding-4B"                                   "Qwen3-Embedding-4B"                    "Qwen3-Embedding-4B (Embeddings)"         8   10   8010  "Embeddings"
+_add "BAAI/bge-reranker-v2-m3"                                   "bge-reranker-v2-m3"                    "BGE-Reranker-v2-m3 (Reranking)"          2    3   8020  "Reranking"
+_add "nvidia/parakeet-tdt-0.6b-v3"                               "parakeet-tdt-0.6b-v3"                  "Parakeet-TDT-0.6B v3 (ASR / NeMo)"       1    0      0  "ASR"
+_add "nvidia/nemotron-speech-streaming-en-0.6b"                  "nemotron-speech-streaming-en-0.6b"     "Nemotron-Speech-Streaming-0.6B (ASR)"    1    0      0  "ASR"
 
 # ── SUPER LARGE models (120B+ parameters) ─────────────────────────────────────
 # Info: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard
 # Note: these require nearly the entire GPU — do not run alongside other large models.
 # ⚠️  Verify HF repo IDs before downloading — these may require updated values.
-_add "nvidia/Nemotron-3-Super-120B-A12B"                         "Nemotron-3-Super-120B-A12B"            "Nemotron-3-Super-120B-A12B [SUPER]"     120  115   8030  "Super Large"
-_add "Qwen/Qwen3.5-122B-A10B-Instruct"                           "Qwen3.5-122B-A10B-Instruct"            "Qwen3.5-122B-A10B (MoE) [SUPER]"        122  120   8031  "Super Large"
-_add "nvidia/GPT-OSS-120B"                                       "GPT-OSS-120B"                          "GPT-OSS-120B [SUPER]"                   120  115   8032  "Super Large"
-# ^^^ GPT-OSS-120B: confirm HF repo ID before running — placeholder above
+_add "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"             "NVIDIA-Nemotron-3-Super-120B-A12B-BF16" "Nemotron-3-Super-120B-A12B (BF16) [SUPER]" 120  115   8030  "Super Large"
+_add "Qwen/Qwen3.5-122B-A10B"                                    "Qwen3.5-122B-A10B"                     "Qwen3.5-122B-A10B (MoE) [SUPER]"            122  120   8031  "Super Large"
+_add "openai/gpt-oss-120b"                                       "gpt-oss-120b"                          "GPT-OSS-120B [SUPER]"                       120  115   8032  "Super Large"
 
 MODEL_TOTAL=${#MDL_HF[@]}
 
@@ -665,11 +687,11 @@ fi
 
 # ── idx 11: Nemotron-3-Super-120B-A12B  (port 8030) ───────────────────────────
 if is_run_selected 11; then
-    if [ -f "$MODELS_DIR/Nemotron-3-Super-120B-A12B/config.json" ]; then
-        echo "--- Starting vLLM: Nemotron-3-Super-120B-A12B on port 8030 ---"
+    if [ -f "$MODELS_DIR/NVIDIA-Nemotron-3-Super-120B-A12B-BF16/config.json" ]; then
+        echo "--- Starting vLLM: NVIDIA-Nemotron-3-Super-120B-A12B-BF16 on port 8030 ---"
         echo "   ℹ️  Model info: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard"
         echo "   ⚠️  SUPER LARGE — needs ~115 GB VRAM. Ensure no other large models are running."
-        vllm_serve "$MODELS_DIR/Nemotron-3-Super-120B-A12B" \
+        vllm_serve "$MODELS_DIR/NVIDIA-Nemotron-3-Super-120B-A12B-BF16" \
             --host 0.0.0.0 --port 8030 \
             --served-model-name "Nemotron-3-Super-120B-A12B" \
             --dtype auto \
@@ -684,16 +706,16 @@ if is_run_selected 11; then
         echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8030.log"
         echo "   → Status: curl -s http://localhost:8030/v1/models | jq ."
     else
-        echo "⚠️  Nemotron-3-Super-120B-A12B not found in $MODELS_DIR — was it downloaded?"
+        echo "⚠️  NVIDIA-Nemotron-3-Super-120B-A12B-BF16 not found in $MODELS_DIR — was it downloaded?"
     fi
 fi
 
 # ── idx 12: Qwen3.5-122B-A10B-Instruct  (port 8031) ──────────────────────────
 if is_run_selected 12; then
-    if [ -f "$MODELS_DIR/Qwen3.5-122B-A10B-Instruct/config.json" ]; then
-        echo "--- Starting vLLM: Qwen3.5-122B-A10B-Instruct on port 8031 ---"
+    if [ -f "$MODELS_DIR/Qwen3.5-122B-A10B/config.json" ]; then
+        echo "--- Starting vLLM: Qwen3.5-122B-A10B on port 8031 ---"
         echo "   ⚠️  SUPER LARGE — needs ~120 GB VRAM. Ensure no other large models are running."
-        vllm_serve "$MODELS_DIR/Qwen3.5-122B-A10B-Instruct" \
+        vllm_serve "$MODELS_DIR/Qwen3.5-122B-A10B" \
             --host 0.0.0.0 --port 8031 \
             --served-model-name "Qwen3.5-122B-A10B" \
             --dtype auto \
@@ -708,16 +730,16 @@ if is_run_selected 12; then
         echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8031.log"
         echo "   → Status: curl -s http://localhost:8031/v1/models | jq ."
     else
-        echo "⚠️  Qwen3.5-122B-A10B-Instruct not found in $MODELS_DIR — was it downloaded?"
+        echo "⚠️  Qwen3.5-122B-A10B not found in $MODELS_DIR — was it downloaded?"
     fi
 fi
 
 # ── idx 13: GPT-OSS-120B  (port 8032) ─────────────────────────────────────────
 if is_run_selected 13; then
-    if [ -f "$MODELS_DIR/GPT-OSS-120B/config.json" ]; then
-        echo "--- Starting vLLM: GPT-OSS-120B on port 8032 ---"
+    if [ -f "$MODELS_DIR/gpt-oss-120b/config.json" ]; then
+        echo "--- Starting vLLM: gpt-oss-120b on port 8032 ---"
         echo "   ⚠️  SUPER LARGE — needs ~115 GB VRAM. Ensure no other large models are running."
-        vllm_serve "$MODELS_DIR/GPT-OSS-120B" \
+        vllm_serve "$MODELS_DIR/gpt-oss-120b" \
             --host 0.0.0.0 --port 8032 \
             --served-model-name "GPT-OSS-120B" \
             --dtype auto \
@@ -730,7 +752,30 @@ if is_run_selected 13; then
         echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8032.log"
         echo "   → Status: curl -s http://localhost:8032/v1/models | jq ."
     else
-        echo "⚠️  GPT-OSS-120B not found in $MODELS_DIR — was it downloaded?"
+        echo "⚠️  gpt-oss-120b not found in $MODELS_DIR — was it downloaded?"
+    fi
+fi
+
+# ── idx 14: gemma-4-31B-it  (port 8009) ───────────────────────────────────────
+if is_run_selected 14; then
+    if [ -f "$MODELS_DIR/gemma-4-31B-it/config.json" ]; then
+        echo "--- Starting vLLM: gemma-4-31B-it on port 8009 ---"
+        vllm_serve "$MODELS_DIR/gemma-4-31B-it" \
+            --host 0.0.0.0 --port 8009 \
+            --served-model-name "gemma-4-31B" \
+            --dtype auto \
+            --gpu-memory-utilization 0.60 \
+            --max-model-len 32768 \
+            --enable-prefix-caching \
+            --trust-remote-code \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes \
+            >> "$VLLM_LOGS/vllm-8009.log" 2>&1 &
+        echo "✅ gemma-4-31B-it starting on port 8009 (pid $!)"
+        echo "   → Logs  : tail -f $VLLM_LOGS/vllm-8009.log"
+        echo "   → Status: curl -s http://localhost:8009/v1/models | jq ."
+    else
+        echo "⚠️  gemma-4-31B-it not found in $MODELS_DIR — was it downloaded?"
     fi
 fi
 
