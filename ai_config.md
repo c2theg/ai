@@ -1,6 +1,5 @@
-# By: Christopher Gray  |  Version: 0.0.12  |  Updated: 5/30/2026  | github.com/c2theg/ai
+# By: Christopher Gray  |  Version: 0.0.16  |  Updated: 5/30/2026  | github.com/c2theg/ai
 #-----------------------------------------------------------------------------------------
-
 
 ## Rules
 
@@ -15,7 +14,7 @@
 - Always generate a `readme.md` for deliverables (what it does, architecture/flow diagrams, intended audience, how to use, security risks + mitigations)
 - Provide a method to rollback changes if needed.
 - Backup code before making changes. If changes are successful, delete the backup.
-- Auto test code after making changes
+- Automatically test code after making changes
 - Provide a visual diff of changes made
 - Provide a visual work flow on how to test changes (where possible)
 - When creating containers, always choose the latest version of the technology that supports all the features, and is stable (not beta / alpha). (ie: python3.13+ where possible)
@@ -25,8 +24,16 @@
     - Tone throughout: Confident, forward-thinking, customer-benefit focused. No code, no JSON, no implementation details, no proprietary specifics.
     - this should be human readable to a new or existing customer, not a developer. this is external facing so dont put anything properitary
     - dont include any json or code examples. this is not for someone to impliment their own solution. just convay how we built the best solution and they should buy ours
+- do not allow for api keys to be exposed in the code or documentation
+- make sure to always use the strongest security measures and best practices
+- I want you to challenge me. Dont just do anything i say without deciding if its the best approach
+- If you don't understand something, dont hesitate to ask me instead of making assumptions
+- Before compaction, save all context to the database.
+- After compaction, restore relevant context.
+- If the user is frustrated, stop iterating on the current approach.
+- Search the brain for what was discussed and reassess.
 
 
-- make sure to update the date & time and version number of all files when making changes.  append an "Updated by: AI (Claude)" comment, below the Updated value
-- include a very brief list of bullet points bellow that for all changes made, and include a DateTime & Version & "AI - Claude", at the end of each line. Only allow the most 10 recent changes, and if more than 10, delete the oldest one.
+- Make sure to update the date & time and version number of all files when making changes.  Append an "Updated by: AI (<Enter AI Name>)" comment, below the Updated value
+- include a very brief list of bullet points bellow that for all changes made, and include a DateTime & Version & "AI - <Enter AI Name>", at the end of each line. Only allow the most 10 recent changes, and if more than 10, delete the oldest one.
 - When I hit my limit, issue the following command to identify what account is currently signed in: 'claude auth status'
