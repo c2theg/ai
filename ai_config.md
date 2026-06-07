@@ -1,4 +1,4 @@
-# By: Christopher Gray  |  Version: 0.0.16  |  Updated: 6/6/2026  | github.com/c2theg/ai
+# By: Christopher Gray  |  Version: 0.0.19  |  Updated: 6/7/2026  | github.com/c2theg/ai
 #-----------------------------------------------------------------------------------------
 
 ## Rules
@@ -33,6 +33,10 @@
 - If the user is frustrated, stop iterating on the current approach.
 - Search the brain for what was discussed and reassess.
 
+
+- Make sure to update the date & time and version number of all files when making changes.  Append an "Updated by: AI (<Enter AI Name>)" comment, below the Updated value
+- include a very brief list of bullet points bellow that for all changes made, and include a DateTime & Version & "AI - <Enter AI Name>", at the end of each line. Only allow the most 10 recent changes, and if more than 10, delete the oldest one.
+- When I hit my limit, issue the following command to identify what account is currently signed in: 'claude auth status'
 
 - Make sure to update the date & time and version number of all files when making changes.  Append an "Updated by: AI (<Enter AI Name>)" comment, below the Updated value
 - include a very brief list of bullet points bellow that for all changes made, and include a DateTime & Version & "AI - <Enter AI Name>", at the end of each line. Only allow the most 10 recent changes, and if more than 10, delete the oldest one.
