@@ -1,4 +1,4 @@
-# By: Christopher Gray  |  Version: 0.0.19  |  Updated: 6/7/2026  | github.com/c2theg/ai
+# By: Christopher Gray  |  Version: 0.0.21  |  Updated: 6/8/2026  | github.com/c2theg/ai
 #-----------------------------------------------------------------------------------------
 
 ## Rules
@@ -33,11 +33,15 @@
 - If the user is frustrated, stop iterating on the current approach.
 - Search the brain for what was discussed and reassess.
 
-
 - Make sure to update the date & time and version number of all files when making changes.  Append an "Updated by: AI (<Enter AI Name>)" comment, below the Updated value
 - include a very brief list of bullet points bellow that for all changes made, and include a DateTime & Version & "AI - <Enter AI Name>", at the end of each line. Only allow the most 10 recent changes, and if more than 10, delete the oldest one.
 - When I hit my limit, issue the following command to identify what account is currently signed in: 'claude auth status'
 
-- Make sure to update the date & time and version number of all files when making changes.  Append an "Updated by: AI (<Enter AI Name>)" comment, below the Updated value
-- include a very brief list of bullet points bellow that for all changes made, and include a DateTime & Version & "AI - <Enter AI Name>", at the end of each line. Only allow the most 10 recent changes, and if more than 10, delete the oldest one.
-- When I hit my limit, issue the following command to identify what account is currently signed in: 'claude auth status'
+- Keep a running list of changes in a file called 'changes_customers.md' with all changes that have been done to the website and application, by calendar quarter
+- At the end of each quarter, create a customer-facing summary of summerized major changes call: 'changes_customers_[Q1|Q2|Q3|Q4]_[YEAR].md' in the root directory of the application
+    - Make these short (less then 30 word each) bulletpoints
+    - Order them by importance
+    - The audiance are customers, so it should not include code, jargon, architecture, or anything technical. Focus on benefits and improvements.
+    - Dont mention issues, bugs, basic code iterations, etc. Only mention successful changes
+    - Provide no more then 8 entries / bulletpoints
+
