@@ -1,4 +1,4 @@
-# By: Christopher Gray  |  Version: 0.0.21  |  Updated: 6/8/2026  | github.com/c2theg/ai
+# By: Christopher Gray  |  Version: 0.0.25  |  Updated: 6/8/2026  | github.com/c2theg/ai
 #-----------------------------------------------------------------------------------------
 
 ## Rules
