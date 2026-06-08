@@ -49,7 +49,7 @@
     - Order them by importance
     - The audiance are customers, so it should not include code, jargon, architecture, or anything technical. Focus on benefits and improvements.
     - Dont mention issues, bugs, basic code iterations, etc. Only mention successful changes
-- At the end of each month, create a architecture-facing full summary of all changes call: 'changes_architect_[Q1|Q2|Q3|Q4]_[YEAR]_full.md' in the root directory of the application.
+- At the end of each month, create a architecture-facing full summary of all changes call: 'changes_architect_[MONTH]_[YEAR]_full.md' in the root directory of the application.
     - this should be used as a blog like format, which provides longer, more rich details about the change, and not limited to length
     - Order them by importance
     - The audiance are developers and architectes, so it should not include detailed code (only high level).
