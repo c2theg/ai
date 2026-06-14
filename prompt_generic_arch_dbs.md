@@ -9,14 +9,15 @@ The application uses the following databases. I will provide details about each 
     - ServerIP:27019
 - Redis for caching and session storage.
     - ServerIP:46379
-- Clickhouse for all time-series, analytics and logging.
+- Clickhouse for all time-series, analytics and logging. - Only install this if the application needs it.
     - ServerIP:8123
-- Vector storage, it uses Qdrant
+- Vector storage, it uses Qdrant - Only install this if the application needs it.
     - ServerIP:6333
-- LLM / AI - Models, it uses Ollama
+- LLM / AI - Models, it uses Ollama - Use LangChain for model management, as they will change in the future. 
     - ServerIP:11434
     - Default model: qwen3.5:4b-q8_0, fallback to gemma4:e2b
     - Embedding model: qwen3-embedding:4b, fallback to nomic-embed-text-v2-moe:latest
+    - Include only important model settings: Reasoning, Temperature, Max Tokens, etc.
 
 Create a new database for each application, and prefix the database name with the application name. ie: myapp_mongodb, myapp_redis, etc.
 Do not create any databases on these servers that could conflict with existing databases. ie: Users, admin, logs, etc.
