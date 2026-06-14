@@ -4,7 +4,7 @@
 #  * All rights reserved.
 # Version: 0.0.5
 # Updated: 6/14/2026
-# Install: wget https://github.com/c2theg/ai/edit/main/install_container_mongodb.sh && chmod u+x install_container_mongodb.sh
+# Install: wget https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_container_mongodb.sh && chmod u+x install_container_mongodb.sh
 #
 # Installs the latest STABLE (non-rc/beta) MongoDB Community
 # server in a Docker container on Ubuntu 22.04+, with persistent
