@@ -1,9 +1,10 @@
 #!/bin/bash
 #------------------------------------------------------------
-#  * Copyright (c) 2018-2026 Christopher Gray
+#  * Copyright (c) 2026 Christopher Gray
 #  * All rights reserved. 
 # Version: 0.0.1
 # Updated: 6/14/2026
+# Install: wget https://github.com/c2theg/ai/edit/main/install_container_qdrant.sh && chmod u+x install_container_qdrant.sh
 #
 # Installs the latest STABLE (non-beta) Qdrant vector DB in a
 # Docker container on Ubuntu 22.04+, with persistent storage in
