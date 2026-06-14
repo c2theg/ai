@@ -6,15 +6,15 @@ Default to no authentication and no encryption (TLS) for each server, unless oth
 
 The application uses the following databases. I will provide details about each database below.
 - MongoDB database for all data storage.
-    - <ServerIP>:27019
+    - [ServerIP]:27019
 - Redis for caching and session storage.
-    - <ServerIP>:46379
+    - [ServerIP]:46379
 - Clickhouse for all time-series, analytics and logging.
-    - <ServerIP>:8123
+    - [ServerIP]:8123
 - Vector storage, it uses Qdrant
-    - <ServerIP>:6333
+    - [ServerIP]:6333
 - LLM / AI - Models, it uses Ollama
-    - <ServerIP>:11434
+    - [ServerIP]:11434
     - Default model: qwen3.5:4b-q8_0, fallback to gemma4:e2b
     - Embedding model: qwen3-embedding:4b, fallback to nomic-embed-text-v2-moe:latest
 
