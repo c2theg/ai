@@ -2,7 +2,7 @@
 #
 # Repair NVIDIA drivers on DGX Spark / GB10 Linux systems
 # Updated: 6/18/2026
-# Version: 0.0.10
+# Version: 0.0.11
 #
 #
 #  Latest Version Number: https://docs.nvidia.com/dgx/dgx-spark/release-notes.html
@@ -13,7 +13,7 @@
 #  wget -O ./repair_nvidia_drivers.sh https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/repair_nvidia_drivers.sh && chmod +x repair_nvidia_drivers.sh && sudo ./repair_nvidia_drivers.sh --yes --install-missing --driver-package nvidia-driver-580
 #
 #
-#  ./repair_nvidia_drivers.sh  --yes --install-missing --driver-package nvidia-driver-580
+#  sudo ./repair_nvidia_drivers.sh --yes --install-missing --driver-package nvidia-driver-580-open
 #
 #----------------------------------
 set -Eeuo pipefail
@@ -128,6 +128,20 @@ This will repair package state, reinstall detected NVIDIA driver packages,
 rebuild kernel modules/initramfs, and restart NVIDIA services where present.
 A reboot is normally required after completion.
 EOF
+
+  # --yes is the confirmation. Only ask for the typed phrase when we have an
+  # interactive terminal AND --yes was not given. Because destructive mode
+  # already requires --yes (checked above), passing --yes proceeds without
+  # blocking on input -- this is what makes the documented non-interactive
+  # one-liner (wget ... | sudo ... --yes) actually work.
+  if [[ "$ASSUME_YES" -eq 1 ]]; then
+    log "--yes given; proceeding without interactive confirmation."
+    return 0
+  fi
+
+  if [[ ! -t 0 ]]; then
+    die "No interactive terminal available; re-run with --yes to proceed non-interactively."
+  fi
 
   read -r -p "Type REPAIR-NVIDIA-DRIVERS to continue: " answer
   [[ "$answer" == "REPAIR-NVIDIA-DRIVERS" ]] || die "Aborted."
