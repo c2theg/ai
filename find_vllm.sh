@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
+#   By: Christopher Gray
 #
-#  wget -O https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/find_vllm.sh && chmod +x find_vllm.sh && ./find_vllm.sh
+#   Updated: 6/18/2026
+#   Version: 0.0.4
+#   wget --no-cache -O 'find_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/find_vllm.sh' && chmod u+x find_vllm.sh
 #
 # find_vllm.sh — Discover all vLLM instances on an Ubuntu 24.04+ host.
 #
