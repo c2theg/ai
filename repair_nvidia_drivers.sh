@@ -10,7 +10,7 @@
 #
 # This script is designed to repair the NVIDIA driver stack on DGX Spark / GB10 Linux systems.
 # It can be run in dry-run mode to see what would be done, or in actual mode to perform the repair.
-#  wget -O ./repair_nvidia_drivers.sh https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/repair_nvidia_drivers.sh && chmod +x repair_nvidia_drivers.sh && sudo ./repair_nvidia_drivers.sh --yes --install-missing --driver-package nvidia-driver-580
+#  wget -O ./repair_nvidia_drivers.sh https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/repair_nvidia_drivers.sh && chmod +x repair_nvidia_drivers.sh && sudo ./repair_nvidia_drivers.sh --yes --install-missing --driver-package nvidia-driver-580-open
 #
 #
 #  sudo ./repair_nvidia_drivers.sh --yes --install-missing --driver-package nvidia-driver-580-open
