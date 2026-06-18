@@ -1,0 +1,1 @@
+Working on [ Current Project ], I have created an icon / image pack for the project to be used for all icons and PWA. the filename is: project-icon-pack.zip. Can you put the files in the correct locations to be part of the application?
