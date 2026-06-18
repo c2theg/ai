@@ -2,7 +2,7 @@
 #
 # Repair NVIDIA drivers on DGX Spark / GB10 Linux systems
 # Updated: 6/18/2026
-# Version: 0.0.8
+# Version: 0.0.10
 #
 #
 #  Latest Version Number: https://docs.nvidia.com/dgx/dgx-spark/release-notes.html
@@ -10,7 +10,7 @@
 #
 # This script is designed to repair the NVIDIA driver stack on DGX Spark / GB10 Linux systems.
 # It can be run in dry-run mode to see what would be done, or in actual mode to perform the repair.
-#  wget -O ./repair_nvidia_drivers.sh https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/repair_nvidia_drivers.sh && chmod +x repair_nvidia_drivers.sh && sudo ./repair_nvidia_drivers.sh
+#  wget -O ./repair_nvidia_drivers.sh https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/repair_nvidia_drivers.sh && chmod +x repair_nvidia_drivers.sh && sudo ./repair_nvidia_drivers.sh --yes --install-missing --driver-package nvidia-driver-580
 #
 #
 #  ./repair_nvidia_drivers.sh  --yes --install-missing --driver-package nvidia-driver-580
@@ -138,25 +138,6 @@ os_id_like() {
     # shellcheck disable=SC1091
     . /etc/os-release
     printf '%s %s\n' "${ID:-}" "${ID_LIKE:-}"
-  fi
-}
-
-run_initial_system_updates() {
-  log "Running initial system update phase."
-
-  if command -v apt-get >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive
-    run apt update
-    run apt dist-upgrade -y
-  else
-    log "apt not found; skipping requested apt update/dist-upgrade commands."
-  fi
-
-  if command -v fwupdmgr >/dev/null 2>&1; then
-    run fwupdmgr refresh --force
-    run fwupdmgr upgrade -y
-  else
-    log "fwupdmgr not found; skipping requested firmware update commands."
   fi
 }
 
@@ -366,8 +347,52 @@ detect_nvidia_dkms_versions() {
   } | sort -u
 }
 
+detect_nvidia_dkms_entries() {
+  if ! command -v dkms >/dev/null 2>&1; then
+    return 0
+  fi
+
+  dkms status 2>/dev/null |
+    awk -F'[,/:]' '/^nvidia\// {
+      version = $2
+      kernel = $3
+      arch = $4
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", version)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", kernel)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", arch)
+      if (version != "" && kernel != "" && arch != "") {
+        print version "\t" kernel "\t" arch
+      }
+    }'
+}
+
+remove_conflicting_nvidia_dkms_arches() {
+  local kernel="${1:-$(uname -r)}"
+  local running_arch
+  local version
+  local entry_kernel
+  local entry_arch
+
+  running_arch="$(uname -m)"
+
+  if ! command -v dkms >/dev/null 2>&1; then
+    log "dkms not found; skipping conflicting NVIDIA DKMS arch cleanup."
+    return 0
+  fi
+
+  while IFS=$'\t' read -r version entry_kernel entry_arch; do
+    [[ -n "${version:-}" && -n "${entry_kernel:-}" && -n "${entry_arch:-}" ]] || continue
+    [[ "$entry_kernel" == "$kernel" ]] || continue
+    [[ "$entry_arch" != "$running_arch" ]] || continue
+
+    log "Removing conflicting NVIDIA DKMS record nvidia/${version} for ${entry_kernel}/${entry_arch}; running arch is ${running_arch}."
+    run dkms remove -m nvidia -v "$version" -k "${entry_kernel}/${entry_arch}" || true
+  done < <(detect_nvidia_dkms_entries)
+}
+
 force_install_nvidia_dkms() {
   local kernel="${1:-$(uname -r)}"
+  local running_arch
   local versions=()
 
   if ! command -v dkms >/dev/null 2>&1; then
@@ -375,6 +400,7 @@ force_install_nvidia_dkms() {
     return 0
   fi
 
+  running_arch="$(uname -m)"
   mapfile -t versions < <(detect_nvidia_dkms_versions)
   if [[ "${#versions[@]}" -eq 0 ]]; then
     log "No NVIDIA DKMS versions found to force-install."
@@ -382,9 +408,59 @@ force_install_nvidia_dkms() {
   fi
 
   for version in "${versions[@]}"; do
-    log "Force-installing NVIDIA DKMS module nvidia/${version} for kernel ${kernel}."
-    run dkms install -m nvidia -v "$version" -k "$kernel" --force || true
+    log "Force-installing NVIDIA DKMS module nvidia/${version} for kernel ${kernel}/${running_arch}."
+    run dkms install -m nvidia -v "$version" -k "${kernel}/${running_arch}" --force || true
   done
+}
+
+remove_stale_nvidia_dkms_outputs() {
+  local kernel="${1:-$(uname -r)}"
+  local dkms_dir="/lib/modules/${kernel}/updates/dkms"
+
+  if [[ ! -d "$dkms_dir" ]]; then
+    log "No DKMS output directory found for kernel ${kernel}; skipping stale NVIDIA module cleanup."
+    return 0
+  fi
+
+  log "Removing stale NVIDIA DKMS module outputs for kernel ${kernel}."
+  run find "$dkms_dir" -maxdepth 1 -type f \
+    \( -name 'nvidia*.ko' -o -name 'nvidia*.ko.*' \) \
+    -delete
+  run depmod "$kernel" || true
+}
+
+repair_nvidia_dkms_before_kernel_postinst() {
+  local kernel="${1:-$(uname -r)}"
+
+  remove_conflicting_nvidia_dkms_arches "$kernel"
+  remove_stale_nvidia_dkms_outputs "$kernel"
+  force_install_nvidia_dkms "$kernel"
+}
+
+run_initial_system_updates() {
+  log "Running initial system update phase."
+
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    run apt update
+    repair_nvidia_dkms_before_kernel_postinst "$(uname -r)"
+    if ! run apt dist-upgrade -y; then
+      log "apt dist-upgrade failed; retrying after NVIDIA DKMS stale-output cleanup."
+      repair_nvidia_dkms_before_kernel_postinst "$(uname -r)"
+      run dpkg --configure -a
+      run apt -f install -y
+      run apt dist-upgrade -y
+    fi
+  else
+    log "apt not found; skipping requested apt update/dist-upgrade commands."
+  fi
+
+  if command -v fwupdmgr >/dev/null 2>&1; then
+    run fwupdmgr refresh --force
+    run fwupdmgr upgrade -y
+  else
+    log "fwupdmgr not found; skipping requested firmware update commands."
+  fi
 }
 
 repair_debian_packages() {
@@ -395,7 +471,7 @@ repair_debian_packages() {
 
   log "Repairing apt/dpkg package state."
   run apt-get update
-  force_install_nvidia_dkms "$(uname -r)"
+  repair_nvidia_dkms_before_kernel_postinst "$(uname -r)"
   run dpkg --configure -a
   run apt-get install -f -y
   run apt-get install --reinstall -y "linux-headers-$(uname -r)" dkms || true
