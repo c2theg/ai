@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 #
 # Repair NVIDIA drivers on DGX Spark / GB10 Linux systems
+# Updated: 6/16/2026
+# Version: 0.0.4
 #
 # This script is designed to repair the NVIDIA driver stack on DGX Spark / GB10 Linux systems.
 # It can be run in dry-run mode to see what would be done, or in actual mode to perform the repair.
@@ -14,6 +16,7 @@ DRY_RUN=1
 INSTALL_MISSING=0
 BLACKLIST_NOUVEAU=1
 DRIVER_PACKAGE="${DRIVER_PACKAGE:-cuda-drivers}"
+LIST_AVAILABLE=0
 
 usage() {
   cat <<EOF
@@ -29,12 +32,14 @@ Options:
   -y, --yes                  Actually make changes. Without this, dry-run mode is used.
       --install-missing       Install a driver metapackage if no NVIDIA driver packages are detected.
       --driver-package NAME   Package to install with --install-missing. Default: cuda-drivers
+      --list-available        Show NVIDIA driver packages available from configured repos, then exit.
       --no-blacklist-nouveau  Do not create/refresh the nouveau blacklist config.
   -h, --help                 Show this help.
 
 Examples:
   sudo ./${SCRIPT_NAME}
   sudo ./${SCRIPT_NAME} --yes
+  sudo ./${SCRIPT_NAME} --list-available
   sudo ./${SCRIPT_NAME} --yes --install-missing
   sudo ./${SCRIPT_NAME} --yes --install-missing --driver-package nvidia-driver-575
 EOF
@@ -77,6 +82,9 @@ parse_args() {
         ;;
       --driver-package=*)
         DRIVER_PACKAGE="${1#*=}"
+        ;;
+      --list-available)
+        LIST_AVAILABLE=1
         ;;
       --no-blacklist-nouveau)
         BLACKLIST_NOUVEAU=0
@@ -266,7 +274,7 @@ refresh_boot_artifacts() {
 }
 
 detect_debian_nvidia_packages() {
-  dpkg-query -W -f='${binary:Package}\n' \
+  dpkg-query -W -f='${Status}\t${binary:Package}\n' \
     'cuda-drivers*' \
     'libcuda*' \
     'libnvidia*' \
@@ -274,14 +282,42 @@ detect_debian_nvidia_packages() {
     'xserver-xorg-video-nvidia*' \
     2>/dev/null |
     awk '
-      !/^[[:space:]]*$/ &&
-      !/-doc$/ &&
-      !/-dev$/ &&
-      !/-headers-common$/ {
-        print
+      $1 == "install" && $2 == "ok" && $3 == "installed" {
+        package = $4
+        if (
+          package !~ /-doc$/ &&
+          package !~ /-dev$/ &&
+          package !~ /-headers-common$/
+        ) {
+          print package
+        }
       }
     ' |
     sort -u
+}
+
+list_available_debian_drivers() {
+  log "Refreshing apt metadata."
+  run apt-get update
+
+  log "cuda-drivers policy:"
+  run apt-cache policy cuda-drivers || true
+
+  log "Available nvidia-driver packages:"
+  apt-cache search --names-only '^nvidia-driver-[0-9]+(-open)?$' |
+    awk '{print $1}' |
+    sort -V |
+    while read -r package; do
+      [[ -n "$package" ]] || continue
+      apt-cache policy "$package" |
+        awk -v package="$package" '
+          /Candidate:/ {
+            printf "  %-28s %s\n", package, $2
+          }
+        '
+    done
+
+  log "Use the highest listed package that is supported by DGX OS for your GB10 image."
 }
 
 repair_debian_packages() {
@@ -322,6 +358,18 @@ detect_rhel_nvidia_packages() {
       }
     ' |
     sort -u
+}
+
+list_available_rhel_drivers() {
+  local pm="$1"
+
+  log "Refreshing ${pm} metadata."
+  run "$pm" makecache -y || true
+
+  log "Available NVIDIA driver packages:"
+  "$pm" list --available 'nvidia-driver*' 'cuda-drivers*' 2>/dev/null || true
+
+  log "Use the highest listed package that is supported by DGX OS for your GB10 image."
 }
 
 repair_rhel_packages() {
@@ -376,6 +424,20 @@ main() {
   parse_args "$@"
   require_linux_root
   print_inventory
+
+  if [[ "$LIST_AVAILABLE" -eq 1 ]]; then
+    if command -v apt-get >/dev/null 2>&1; then
+      list_available_debian_drivers
+    elif command -v dnf >/dev/null 2>&1; then
+      list_available_rhel_drivers dnf
+    elif command -v yum >/dev/null 2>&1; then
+      list_available_rhel_drivers yum
+    else
+      die "Unsupported package manager. Expected apt-get, dnf, or yum."
+    fi
+    exit 0
+  fi
+
   confirm_execution
   stop_nvidia_services
   write_nouveau_blacklist
