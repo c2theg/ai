@@ -2,7 +2,7 @@
 #   By: Christopher Gray
 #
 #   Updated: 6/18/2026
-#   Version: 0.0.4
+#   Version: 0.0.5
 #   wget --no-cache -O 'find_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/find_vllm.sh' && chmod u+x find_vllm.sh
 #
 # find_vllm.sh — Discover all vLLM instances on an Ubuntu 24.04+ host.
@@ -20,9 +20,16 @@
 # under systemd, in Docker, or via `vllm serve` / `python -m vllm...`.
 #
 # Usage:
-#   ./find_vllm.sh                # human-readable report
-#   ./find_vllm.sh --json         # machine-readable JSON array
-#   ./find_vllm.sh --host 1.2.3.4 # also probe a remote host's API (best-effort)
+#   ./find_vllm.sh                       # human-readable report
+#   ./find_vllm.sh --json                # machine-readable JSON array
+#   ./find_vllm.sh --host 1.2.3.4        # also probe a remote host's API
+#
+#   # Send a live test prompt to every detected/reachable instance and print
+#   # the model's reply (verifies the server actually generates, not just /health):
+#   ./find_vllm.sh --test                       # uses a default test prompt
+#   ./find_vllm.sh --prompt "Say hi in 5 words" # custom prompt (implies --test)
+#   ./find_vllm.sh --test --max-tokens 128      # cap the reply length
+#   ./find_vllm.sh --host 1.2.3.4 --test        # test a remote instance too
 #
 # No root required for discovery, but run with sudo to see processes/ports
 # owned by other users.
@@ -35,14 +42,22 @@ set -uo pipefail
 JSON=0
 REMOTE_HOST=""
 CURL_TIMEOUT=3
+TEST=0
+TEST_PROMPT="Reply with a single short sentence confirming you are online and name the model you are."
+MAX_TOKENS=64
+GEN_TIMEOUT=60
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --json) JSON=1; shift ;;
     --host) REMOTE_HOST="${2:-}"; shift 2 ;;
     --timeout) CURL_TIMEOUT="${2:-3}"; shift 2 ;;
+    --test) TEST=1; shift ;;
+    --prompt) TEST=1; TEST_PROMPT="${2:-}"; shift 2 ;;
+    --max-tokens) MAX_TOKENS="${2:-64}"; shift 2 ;;
+    --gen-timeout) GEN_TIMEOUT="${2:-60}"; shift 2 ;;
     -h|--help)
-      sed -n '2,30p' "$0"; exit 0 ;;
+      sed -n '2,38p' "$0"; exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -141,6 +156,86 @@ parse_models() {
     echo "$json" | grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' \
       | sed -E 's/.*"id"[^"]*"([^"]+)"/    - id: \1/'
   fi
+}
+
+# Pull the first served model id out of a /v1/models JSON blob.
+first_model_id() {
+  local json="$1"
+  if [[ $HAVE_JQ -eq 1 ]]; then
+    echo "$json" | jq -r '.data[0].id // empty' 2>/dev/null
+  else
+    echo "$json" | grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' | head -1 \
+      | sed -E 's/.*"id"[^"]*"([^"]+)"/\1/'
+  fi
+}
+
+# Send a test prompt to a vLLM OpenAI-compatible endpoint and print the reply.
+# $1=host $2=port $3=model-id (may be empty -> derived from /v1/models)
+# Tries /v1/chat/completions first, falls back to /v1/completions.
+send_test_prompt() {
+  local host="$1" port="$2" model="$3"
+  [[ $HAVE_CURL -eq 1 ]] || { echo "    ${C_WARN}(curl missing — cannot send test prompt)${C_RST}"; return 1; }
+  local base="http://${host}:${port}"
+
+  # Resolve a model id if we weren't handed one.
+  if [[ -z "$model" ]]; then
+    local mj; mj=$(curl -fsS --max-time "$CURL_TIMEOUT" "${base}/v1/models" 2>/dev/null)
+    model=$(first_model_id "$mj")
+  fi
+  [[ -z "$model" ]] && model="default"
+
+  # Build JSON payload (jq for safe escaping; manual fallback otherwise).
+  local chat_payload comp_payload
+  if [[ $HAVE_JQ -eq 1 ]]; then
+    chat_payload=$(jq -nc --arg m "$model" --arg p "$TEST_PROMPT" --argjson mt "$MAX_TOKENS" \
+      '{model:$m,messages:[{role:"user",content:$p}],max_tokens:$mt,temperature:0.2,stream:false}')
+    comp_payload=$(jq -nc --arg m "$model" --arg p "$TEST_PROMPT" --argjson mt "$MAX_TOKENS" \
+      '{model:$m,prompt:$p,max_tokens:$mt,temperature:0.2,stream:false}')
+  else
+    local esc; esc=$(printf '%s' "$TEST_PROMPT" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    chat_payload="{\"model\":\"${model}\",\"messages\":[{\"role\":\"user\",\"content\":\"${esc}\"}],\"max_tokens\":${MAX_TOKENS},\"temperature\":0.2,\"stream\":false}"
+    comp_payload="{\"model\":\"${model}\",\"prompt\":\"${esc}\",\"max_tokens\":${MAX_TOKENS},\"temperature\":0.2,\"stream\":false}"
+  fi
+
+  echo "    ${C_DIM}prompt:${C_RST} ${TEST_PROMPT}"
+  local t0 t1 elapsed resp reply endpoint
+  t0=$(date +%s.%N 2>/dev/null || date +%s)
+
+  # 1) chat completions
+  resp=$(curl -fsS --max-time "$GEN_TIMEOUT" -H 'Content-Type: application/json' \
+         -d "$chat_payload" "${base}/v1/chat/completions" 2>/dev/null)
+  if [[ -n "$resp" ]]; then
+    endpoint="/v1/chat/completions"
+    if [[ $HAVE_JQ -eq 1 ]]; then reply=$(echo "$resp" | jq -r '.choices[0].message.content // empty' 2>/dev/null); fi
+  fi
+
+  # 2) fall back to legacy completions
+  if [[ -z "${reply:-}" ]]; then
+    resp=$(curl -fsS --max-time "$GEN_TIMEOUT" -H 'Content-Type: application/json' \
+           -d "$comp_payload" "${base}/v1/completions" 2>/dev/null)
+    if [[ -n "$resp" ]]; then
+      endpoint="/v1/completions"
+      if [[ $HAVE_JQ -eq 1 ]]; then reply=$(echo "$resp" | jq -r '.choices[0].text // empty' 2>/dev/null); fi
+    fi
+  fi
+
+  t1=$(date +%s.%N 2>/dev/null || date +%s)
+  elapsed=$(awk "BEGIN{printf \"%.2f\", ${t1}-${t0}}" 2>/dev/null)
+
+  if [[ -z "$resp" ]]; then
+    echo "    ${C_WARN}no response (request failed or timed out after ${GEN_TIMEOUT}s)${C_RST}"
+    return 1
+  fi
+  if [[ -z "${reply:-}" ]]; then
+    # jq unavailable or schema unexpected — show raw payload trimmed.
+    echo "    ${C_WARN}could not parse reply; raw response:${C_RST}"
+    echo "      ${resp:0:600}"
+    return 1
+  fi
+
+  echo "    ${C_KEY}via:${C_RST} ${endpoint}  ${C_KEY}model:${C_RST} ${model}  ${C_KEY}latency:${C_RST} ${elapsed}s"
+  echo "    ${C_OK}reply:${C_RST} ${reply}"
+  return 0
 }
 
 # ----------------------------------------------------------------------------
@@ -263,6 +358,16 @@ print_instance() {
     parse_models "$api_models_json"
   fi
 
+  # Optional live test prompt (--test / --prompt).
+  if [[ $TEST -eq 1 ]]; then
+    echo "  ${C_KEY}Test prompt:${C_RST}"
+    if [[ -n "$probe_port" && "$api_health" == "200" ]] || [[ -n "$probe_port" && -n "$api_models_json" ]]; then
+      send_test_prompt "$probe_host" "$probe_port" "$(first_model_id "$api_models_json")"
+    else
+      echo "    ${C_WARN}skipped — no reachable API port for this instance${C_RST}"
+    fi
+  fi
+
   echo "  ${C_DIM}cmd: ${cmd}${C_RST}"
   echo
 }
@@ -278,8 +383,13 @@ if [[ $JSON -eq 0 ]]; then
     echo "${C_DIM}note: nvidia-smi not found — GPU/VRAM details unavailable${C_RST}"
   [[ $HAVE_CURL -eq 0 ]] && \
     echo "${C_DIM}note: curl not found — live API model query unavailable${C_RST}"
+  [[ $TEST -eq 1 ]] && \
+    echo "${C_DIM}test mode: sending a generation prompt to each reachable instance (max_tokens=${MAX_TOKENS}, gen-timeout=${GEN_TIMEOUT}s)${C_RST}"
   echo
 fi
+# --test output is human-readable; it is suppressed in --json mode.
+[[ $TEST -eq 1 && $JSON -eq 1 ]] && \
+  echo "warning: --test has no effect with --json (run without --json to see replies)" >&2
 
 if [[ -z "$PIDS" ]]; then
   if [[ $JSON -eq 1 ]]; then echo "[]"; else
@@ -317,6 +427,10 @@ if [[ -n "$REMOTE_HOST" && $HAVE_CURL -eq 1 ]]; then
     if probe_api "$REMOTE_HOST" "$p"; then
       echo "  ${C_OK}Port ${p}: reachable (health=${API_HEALTH})${C_RST}"
       parse_models "$API_MODELS_JSON"
+      if [[ $TEST -eq 1 ]]; then
+        echo "  ${C_KEY}Test prompt:${C_RST}"
+        send_test_prompt "$REMOTE_HOST" "$p" "$(first_model_id "$API_MODELS_JSON")"
+      fi
     fi
   done
   echo
