@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 #
+#  wget -O https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/find_vllm.sh && chmod +x find_vllm.sh && ./find_vllm.sh
+#
 # find_vllm.sh — Discover all vLLM instances on an Ubuntu 24.04+ host.
 #
 # For each running vLLM server it reports:
