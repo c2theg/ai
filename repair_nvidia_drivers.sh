@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
 #
 # Repair NVIDIA drivers on DGX Spark / GB10 Linux systems
-# Updated: 6/16/2026
-# Version: 0.0.4
+# Updated: 6/18/2026
+# Version: 0.0.8
+#
+#
+#  Latest Version Number: https://docs.nvidia.com/dgx/dgx-spark/release-notes.html
+#
 #
 # This script is designed to repair the NVIDIA driver stack on DGX Spark / GB10 Linux systems.
 # It can be run in dry-run mode to see what would be done, or in actual mode to perform the repair.
-# wget https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/repair_nvidia_drivers.sh && chmod +x repair_nvidia_drivers.sh && sudo ./repair_nvidia_drivers.sh
-
+#  wget -O ./repair_nvidia_drivers.sh https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/repair_nvidia_drivers.sh && chmod +x repair_nvidia_drivers.sh && sudo ./repair_nvidia_drivers.sh
+#
+#
+#  ./repair_nvidia_drivers.sh  --yes --install-missing --driver-package nvidia-driver-580
+#
+#----------------------------------
 set -Eeuo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
@@ -130,6 +138,25 @@ os_id_like() {
     # shellcheck disable=SC1091
     . /etc/os-release
     printf '%s %s\n' "${ID:-}" "${ID_LIKE:-}"
+  fi
+}
+
+run_initial_system_updates() {
+  log "Running initial system update phase."
+
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    run apt update
+    run apt dist-upgrade -y
+  else
+    log "apt not found; skipping requested apt update/dist-upgrade commands."
+  fi
+
+  if command -v fwupdmgr >/dev/null 2>&1; then
+    run fwupdmgr refresh --force
+    run fwupdmgr upgrade -y
+  else
+    log "fwupdmgr not found; skipping requested firmware update commands."
   fi
 }
 
@@ -320,6 +347,46 @@ list_available_debian_drivers() {
   log "Use the highest listed package that is supported by DGX OS for your GB10 image."
 }
 
+detect_nvidia_dkms_versions() {
+  {
+    if command -v dkms >/dev/null 2>&1; then
+      dkms status 2>/dev/null |
+        awk -F'[,/]' '/^nvidia\// {
+          version = $2
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", version)
+          if (version != "") {
+            print version
+          }
+        }'
+    fi
+
+    if [[ -d /var/lib/dkms/nvidia ]]; then
+      find /var/lib/dkms/nvidia -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null || true
+    fi
+  } | sort -u
+}
+
+force_install_nvidia_dkms() {
+  local kernel="${1:-$(uname -r)}"
+  local versions=()
+
+  if ! command -v dkms >/dev/null 2>&1; then
+    log "dkms not found; skipping NVIDIA DKMS force repair."
+    return 0
+  fi
+
+  mapfile -t versions < <(detect_nvidia_dkms_versions)
+  if [[ "${#versions[@]}" -eq 0 ]]; then
+    log "No NVIDIA DKMS versions found to force-install."
+    return 0
+  fi
+
+  for version in "${versions[@]}"; do
+    log "Force-installing NVIDIA DKMS module nvidia/${version} for kernel ${kernel}."
+    run dkms install -m nvidia -v "$version" -k "$kernel" --force || true
+  done
+}
+
 repair_debian_packages() {
   export DEBIAN_FRONTEND=noninteractive
 
@@ -328,6 +395,7 @@ repair_debian_packages() {
 
   log "Repairing apt/dpkg package state."
   run apt-get update
+  force_install_nvidia_dkms "$(uname -r)"
   run dpkg --configure -a
   run apt-get install -f -y
   run apt-get install --reinstall -y "linux-headers-$(uname -r)" dkms || true
@@ -343,8 +411,8 @@ repair_debian_packages() {
   fi
 
   if command -v dkms >/dev/null 2>&1; then
-    log "Running DKMS autoinstall for the current kernel."
-    run dkms autoinstall -k "$(uname -r)" || true
+    log "Running forced DKMS autoinstall for the current kernel."
+    run dkms autoinstall -k "$(uname -r)" --force || true
   fi
 }
 
@@ -392,8 +460,8 @@ repair_rhel_packages() {
   fi
 
   if command -v dkms >/dev/null 2>&1; then
-    log "Running DKMS autoinstall for the current kernel."
-    run dkms autoinstall -k "$(uname -r)" || true
+    log "Running forced DKMS autoinstall for the current kernel."
+    run dkms autoinstall -k "$(uname -r)" --force || true
   fi
 
   if command -v akmods >/dev/null 2>&1; then
@@ -439,6 +507,7 @@ main() {
   fi
 
   confirm_execution
+  run_initial_system_updates
   stop_nvidia_services
   write_nouveau_blacklist
   unload_conflicting_modules
