@@ -1,16 +1,29 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.1.8  |  Update: 5/26/2026
+# Christopher Gray  |  Version: 0.1.9  |  Update: 6/18/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
-#   wget --no-cache -O 'install_ai_spark.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark.sh' && chmod u+x install_ai_spark.sh
+#   wget --no-cache -O 'install_ai_spark_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark_vllm.sh' && chmod u+x install_ai_spark_vllm.sh
 #
 # Usage:
-#   ./install_ai_spark.sh              — full install: packages, docker, venv, download, serve
-#   ./install_ai_spark.sh --serve-only — skip install/download; jump straight to model serve
-#   ./install_ai_spark.sh -s           — same as --serve-only
+#   ./install_ai_spark_vllm.sh              — full install: packages, docker, venv, download, serve
+#   ./install_ai_spark_vllm.sh --serve-only — skip install/download; jump straight to model serve
+#   ./install_ai_spark_vllm.sh -s           — same as --serve-only
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.1.9  6/18/2026
+#   - Removed all four 120B+ "SUPER LARGE" models (Nemotron-3-Super-120B,
+#     Qwen3.5-122B BF16+FP8, GPT-OSS-120B). On a 128 GB unified GB10 / DGX Spark
+#     they load ~116 GB of weights then get OOM-killed (SIGKILL) during KV-cache
+#     allocation — confirmed in the wild. They need a discrete ≥140 GB GPU.
+#   - Fixed the VRAM pre-flight check to be unified-memory aware: nvidia-smi
+#     reports no memory.total on the GB10, so it now falls back to total system
+#     RAM (the real budget for weights + KV cache) and warns before an OOM.
+#   - OpenWebUI readiness wait now fails fast if the container exits, and gates
+#     the "ready"/auto-register block on a real /health check.
+#   - Remaining catalog all fits the 128 GB GB10: Qwen3.6-35B-A3B-FP8,
+#     Nemotron-3-Nano-30B-NVFP4, Gemma-4-31B, Gemma-4-26B-A4B, etc.
 #
 # v0.1.8  5/26/2026
 #   - Added Qwen/Qwen3.5-122B-A10B-FP8 (catalog idx 14, port 8033, ~62 GB VRAM)
@@ -99,8 +112,8 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.1.8
-Last Updated:  5/26/2026
+Version:  0.1.9
+Last Updated:  6/18/2026
 
 Update Yourself:
     wget --no-cache -O 'install_ai_spark.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark.sh' && chmod u+x install_ai_spark.sh
@@ -211,14 +224,12 @@ _add "BAAI/bge-reranker-v2-m3"                                   "bge-reranker-v
 _add "nvidia/parakeet-tdt-0.6b-v3"                               "parakeet-tdt-0.6b-v3"                  "Parakeet-TDT-0.6B v3 (ASR / NeMo)"       1    0      0  "ASR"
 _add "nvidia/nemotron-speech-streaming-en-0.6b"                  "nemotron-speech-streaming-en-0.6b"     "Nemotron-Speech-Streaming-0.6B (ASR)"    1    0      0  "ASR"
 
-# ── SUPER LARGE models (120B+ parameters) ─────────────────────────────────────
-# Info: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard
-# Note: these require nearly the entire GPU — do not run alongside other large models.
-# ⚠️  Verify HF repo IDs before downloading — these may require updated values.
-_add "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"             "NVIDIA-Nemotron-3-Super-120B-A12B-BF16" "Nemotron-3-Super-120B-A12B (BF16) [SUPER]" 120  115   8030  "Super Large"
-_add "Qwen/Qwen3.5-122B-A10B"                                    "Qwen3.5-122B-A10B"                     "Qwen3.5-122B-A10B (BF16) [SUPER]"           122  120   8031  "Super Large"
-_add "Qwen/Qwen3.5-122B-A10B-FP8"                               "Qwen3.5-122B-A10B-FP8"                 "Qwen3.5-122B-A10B (FP8) [SUPER] ★Rec"        62   65   8033  "Super Large"
-_add "openai/gpt-oss-120b"                                       "gpt-oss-120b"                          "GPT-OSS-120B [SUPER]"                       120  115   8032  "Super Large"
+# ── 120B+ "SUPER LARGE" models intentionally omitted (removed v0.1.9) ─────────
+# A 120B model is ~115–120 GB of weights (BF16 or FP8 alike), which does not fit
+# on a 128 GB unified GB10 with any room left for the KV cache → vLLM is
+# OOM-killed right after weight load. They need a discrete ≥140 GB GPU or
+# multi-GPU tensor-parallel. Re-add them here (and a serve block below) if you
+# move to such hardware.
 
 MODEL_TOTAL=${#MDL_HF[@]}
 
@@ -300,40 +311,65 @@ _check_vram() {
     echo ""
     echo "  ── VRAM Budget ──────────────────────────────────────────"
 
-    if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null 2>&1; then
+    # On discrete GPUs nvidia-smi reports memory.total. On a GB10 / DGX Spark the GPU
+    # shares one unified LPDDR5 pool with the CPU, so memory.total is "[N/A]"/Not
+    # Supported — fall back to total system RAM, which is the real budget for
+    # weights + KV cache. Without this fallback the old check produced a broken
+    # arithmetic value and silently failed to warn before an OOM.
+    local total_gb="" mem_source=""
+    if command -v nvidia-smi &>/dev/null; then
         local total_mib
         total_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs)
-        local total_gb=$(( total_mib / 1024 ))
-        local safe_gb=$(( total_gb * 90 / 100 ))
-
-        printf "  %-20s : %d GB\n" "GPU total" "$total_gb"
-        printf "  %-20s : %d GB  (90%%)\n" "Safe limit" "$safe_gb"
-        printf "  %-20s : %d GB\n" "Models require" "$total_required"
-        echo ""
-
-        local has_super=0
-        for idx in "${RUN_SELECTED[@]}"; do
-            [ "${MDL_CAT[$idx]}" = "Super Large" ] && has_super=1 && break
-        done
-
-        if [ "$has_super" = "1" ] && [ "${#RUN_SELECTED[@]}" -gt 1 ]; then
-            echo "  ⚠️  WARNING: You selected a SUPER LARGE model alongside other models."
-            echo "     Super Large models (120B+) need nearly all GPU VRAM."
-            echo "     Running multiple large models simultaneously will likely fail."
-            echo -n "  Continue anyway? [y/N]: "
-            read -r confirm
-            [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
-        elif [ "$total_required" -gt "$safe_gb" ]; then
-            echo "  ⚠️  WARNING: Selected models require ~${total_required} GB but safe limit is ${safe_gb} GB."
-            echo "     Consider deselecting some models."
-            echo -n "  Continue anyway? [y/N]: "
-            read -r confirm
-            [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
-        else
-            echo "  ✅ VRAM check OK — ${total_required} GB needed, ${total_gb} GB available"
+        if [[ "$total_mib" =~ ^[0-9]+$ ]] && [ "$total_mib" -gt 0 ]; then
+            total_gb=$(( total_mib / 1024 ))
+            mem_source="GPU VRAM"
         fi
+    fi
+    if [ -z "$total_gb" ]; then
+        local total_kb
+        total_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)
+        if [[ "$total_kb" =~ ^[0-9]+$ ]]; then
+            total_gb=$(( total_kb / 1024 / 1024 ))
+            mem_source="unified system RAM (GB10/shared pool)"
+        fi
+    fi
+
+    if [ -z "$total_gb" ]; then
+        echo "  ⚠️  Could not determine memory budget — skipping check"
+        echo "  ─────────────────────────────────────────────────────────"
+        return 0
+    fi
+
+    local safe_gb=$(( total_gb * 90 / 100 ))
+    printf "  %-20s : %d GB  (%s)\n" "Memory total" "$total_gb" "$mem_source"
+    printf "  %-20s : %d GB  (90%%)\n" "Safe limit" "$safe_gb"
+    printf "  %-20s : %d GB\n" "Models require" "$total_required"
+    echo ""
+
+    local has_super=0
+    for idx in "${RUN_SELECTED[@]}"; do
+        [ "${MDL_CAT[$idx]}" = "Super Large" ] && has_super=1 && break
+    done
+
+    if [ "$total_required" -gt "$safe_gb" ]; then
+        echo "  ⚠️  WARNING: selected models need ~${total_required} GB but the safe limit is ${safe_gb} GB."
+        if [ "$has_super" = "1" ]; then
+            echo "     A 120B+ (Super Large) model loads ~116 GB of weights. On a 128 GB unified"
+            echo "     GB10 that leaves no room for KV cache/activations, so vLLM is OOM-killed"
+            echo "     (SIGKILL) right after weight load. Prefer the 30–35B A3B models instead."
+        else
+            echo "     Consider deselecting some models."
+        fi
+        echo -n "  Continue anyway? [y/N]: "
+        read -r confirm
+        [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+    elif [ "$has_super" = "1" ] && [ "${#RUN_SELECTED[@]}" -gt 1 ]; then
+        echo "  ⚠️  WARNING: a Super Large model selected alongside others — they will not fit together."
+        echo -n "  Continue anyway? [y/N]: "
+        read -r confirm
+        [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
     else
-        echo "  ⚠️  nvidia-smi not available — skipping VRAM check"
+        echo "  ✅ Memory check OK — ${total_required} GB needed, ${total_gb} GB available"
     fi
     echo "  ─────────────────────────────────────────────────────────"
 }
@@ -735,66 +771,12 @@ fi
 #   print(model.transcribe(['your_audio.wav']))"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SUPER LARGE MODELS (120B+ parameters)
-# Info: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard
-# ⚠️  These require nearly the entire GPU. Do NOT run alongside other large models.
+# 120B+ "SUPER LARGE" models were removed in v0.1.9 — they do not fit on a 128 GB
+# unified GB10 / DGX Spark (a 120B model is ~115–120 GB of weights whether BF16 or
+# FP8, leaving no room for KV cache → OOM-killed right after weight load). They
+# need a discrete ≥140 GB GPU or multi-GPU tensor-parallel. Re-add the catalog
+# entries and serve blocks here if you move to such hardware.
 # ─────────────────────────────────────────────────────────────────────────────
-
-# ── catalog idx 12: Nemotron-3-Super-120B-A12B  (port 8030) ───────────────────
-if is_run_selected 12; then
-    echo "   ℹ️  Model info: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard"
-    echo "   ⚠️  SUPER LARGE — needs ~115 GB VRAM. Ensure no other large models are running."
-    _vllm_launch 12 \
-        --served-model-name "Nemotron-3-Super-120B-A12B" \
-        --dtype auto \
-        --gpu-memory-utilization 0.93 \
-        --max-model-len 8192 \
-        --enable-prefix-caching \
-        --trust-remote-code \
-        --enable-auto-tool-choice \
-        --tool-call-parser hermes
-fi
-
-# ── catalog idx 13: Qwen3.5-122B-A10B  (port 8031) ────────────────────────────
-if is_run_selected 13; then
-    echo "   ⚠️  SUPER LARGE — needs ~120 GB VRAM. Ensure no other large models are running."
-    _vllm_launch 13 \
-        --served-model-name "Qwen3.5-122B-A10B" \
-        --dtype auto \
-        --gpu-memory-utilization 0.93 \
-        --max-model-len 8192 \
-        --enable-prefix-caching \
-        --trust-remote-code \
-        --enable-auto-tool-choice \
-        --tool-call-parser hermes
-fi
-
-# ── catalog idx 14: Qwen3.5-122B-A10B-FP8  (port 8033) ★ Recommended ──────────
-# FP8 uses ~62 GB VRAM vs ~120 GB for BF16 — fits easily, allows longer context
-if is_run_selected 14; then
-    echo "   ★  FP8 version: ~62 GB VRAM, faster inference, longer context than BF16"
-    _vllm_launch 14 \
-        --served-model-name "Qwen3.5-122B-A10B-FP8" \
-        --dtype auto \
-        --gpu-memory-utilization 0.93 \
-        --max-model-len 32768 \
-        --enable-prefix-caching \
-        --trust-remote-code \
-        --enable-auto-tool-choice \
-        --tool-call-parser hermes
-fi
-
-# ── catalog idx 15: GPT-OSS-120B  (port 8032) ─────────────────────────────────
-if is_run_selected 15; then
-    echo "   ⚠️  SUPER LARGE — needs ~115 GB VRAM. Ensure no other large models are running."
-    _vllm_launch 15 \
-        --served-model-name "GPT-OSS-120B" \
-        --dtype auto \
-        --gpu-memory-utilization 0.93 \
-        --max-model-len 8192 \
-        --enable-prefix-caching \
-        --trust-remote-code
-fi
 
 #---------------------------------------------------------------------------------------------------------------
 #--- SearXNG (web search backend for OpenWebUI) ---
@@ -866,17 +848,28 @@ echo "Waiting for OpenWebUI to be ready..."
 OWUI_TIMEOUT=300
 OWUI_ELAPSED=0
 until curl -sf http://localhost:3000/health > /dev/null 2>&1; do
-    if [ "$OWUI_ELAPSED" -ge "$OWUI_TIMEOUT" ]; then
+    # Fail fast: if the container exited, don't burn the full timeout waiting on a dead box.
+    if ! docker ps --format '{{.Names}}' | grep -qx 'open-webui'; then
         echo ""
-        echo "⚠️  OpenWebUI did not become ready after ${OWUI_TIMEOUT}s — check: docker logs open-webui"
+        echo "❌ open-webui container is not running — it exited during startup."
+        echo "   Last 40 lines of logs:"
+        docker logs --tail 40 open-webui 2>&1 | sed 's/^/   | /'
+        echo "   → Full log: docker logs open-webui"
         break
     fi
-    printf "  [%ds] waiting...\n" "$OWUI_ELAPSED"
+    if [ "$OWUI_ELAPSED" -ge "$OWUI_TIMEOUT" ]; then
+        echo ""
+        echo "⚠️  OpenWebUI still not ready after ${OWUI_TIMEOUT}s (container is up). Recent logs:"
+        docker logs --tail 20 open-webui 2>&1 | sed 's/^/   | /'
+        echo "   → Keep watching: docker logs -f open-webui"
+        break
+    fi
+    printf "  [%ds] waiting... (container up; first boot downloads the embedding model)\n" "$OWUI_ELAPSED"
     sleep 5
     OWUI_ELAPSED=$((OWUI_ELAPSED + 5))
 done
 
-if [ "$OWUI_ELAPSED" -lt "$OWUI_TIMEOUT" ]; then
+if curl -sf http://localhost:3000/health > /dev/null 2>&1; then
     echo "✅ OpenWebUI ready at http://localhost:3000"
 
     # Build URL list dynamically from whatever is actually running
