@@ -2,7 +2,7 @@ All the databases are external to the application, and should not be managed by 
 
 Store settings in a json file (settings.json) in the application directory.
 Store authentication settings in a local .env file in the application directory.
-Default to no authentication and no encryption (TLS) for each server, unless otherwise specified., but provide config for authentication and encryption for each application, so it can be added in the future.
+Default to no authentication and no encryption (TLS) for each server, unless otherwise specified, and provide config key/values for authentication and encryption for each server, so it can be added in the future.
 
 The application uses the following databases. I will provide details about each database below.
 - MongoDB database for all data storage.
