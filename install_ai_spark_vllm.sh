@@ -29,6 +29,10 @@
 #     via vLLM's --task transcription (POST /v1/audio/transcriptions). ASR-class
 #     served models are skipped in the OpenWebUI chat auto-registration (they are
 #     STT endpoints, not chat) — wire them in under Admin → Audio → STT instead.
+#   - Standard models now share a single idle-sleep timeout (STANDARD_SLEEP_MINUTES,
+#     default 15). Before serving, the script prompts for the value (Enter = keep
+#     default, 0 = never sleep) and applies it to every Standard model. The chosen
+#     value flows through the existing per-port watchdog map.
 #
 # v0.1.9  6/25/2026
 #   - Model sleep: vLLM servers now launch with --enable-sleep-mode; a watchdog
@@ -178,6 +182,10 @@ OWUI_ADMIN_PASSWORD="Abc123!@#"
 # MEMORY & AI INFRASTRUCTURE
 # =============================================
 IDLE_SLEEP_MINUTES=15        # Offload models to CPU after this many idle minutes (0 = disabled)
+                             # Used as the fallback for any model without its own timeout.
+STANDARD_SLEEP_MINUTES=15    # Default idle-sleep timeout (minutes) for all Standard models.
+                             # The script prompts before serving so this can be overridden
+                             # at runtime (0 = never sleep). Press Enter at the prompt to accept.
 
 ENABLE_SQLITE_MEMORY=true    # SQLite DB for structured memory (exact facts, conversations)
 SQLITE_RETENTION_DAYS=60     # Delete records older than N days  (≈ 2 months)
@@ -255,6 +263,11 @@ _add() {
 }
 
 # ── Standard models ────────────────────────────────────────────────────────────
+# Sleep timeout: these all use STANDARD_SLEEP_MINUTES (prompted/overridable at
+# runtime). The catalog leaves SLEEP_MIN blank here; it is filled in for the whole
+# range below once the user confirms the timeout. The index span is captured in
+# STANDARD_INDICES so the chosen value can be applied to exactly these models.
+_STD_RANGE_START=${#MDL_HF[@]}
 #        HF Repo                                                   Local Dir                               Display Name                          Disk VRAM  Port  Category
 _add "Qwen/Qwen3.6-35B-A3B-FP8"                                  "Qwen3.6-35B-A3B-FP8"                   "Qwen3.6-35B-A3B (FP8)"                  35   38   8005  "General"
 _add "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"               "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"  "Nemotron-3-Nano-30B-A3B (NVFP4)"        15   18   8006  "General"
@@ -269,6 +282,11 @@ _add "BAAI/bge-reranker-v2-m3"                                   "bge-reranker-v
 _add "Qwen/Qwen3-Reranker-4B"                                    "Qwen3-Reranker-4B"                     "Qwen3-Reranker-4B (Reranking) ★Default"   8    9   8021  "Reranking"
 _add "nvidia/parakeet-tdt-0.6b-v3"                               "parakeet-tdt-0.6b-v3"                  "Parakeet-TDT-0.6B v3 (ASR / NeMo)"       1    0      0  "ASR"
 _add "nvidia/nemotron-speech-streaming-en-0.6b"                  "nemotron-speech-streaming-en-0.6b"     "Nemotron-Speech-Streaming-0.6B (ASR)"    1    0      0  "ASR"
+
+# Catalog indices of the Standard-models block above — used to apply the
+# runtime-chosen sleep timeout to exactly these models.
+STANDARD_INDICES=()
+for _si in $(seq "$_STD_RANGE_START" $(( ${#MDL_HF[@]} - 1 ))); do STANDARD_INDICES+=("$_si"); done
 
 # ── SUPER LARGE models (120B+ parameters) ─────────────────────────────────────
 # Info: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard
@@ -473,6 +491,49 @@ echo ""
 [ "$SERVE_ONLY" -eq 0 ] && echo "  Download : ${#DL_SELECTED[@]} model(s) selected"
 echo "  Serve    : ${#RUN_SELECTED[@]} model(s) selected"
 echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STANDARD-MODEL SLEEP TIMEOUT — prompt before serving, default STANDARD_SLEEP_MINUTES
+# Standard models offload to CPU after N idle minutes (auto-wake on next request).
+# Only asked when at least one servable Standard model is queued to serve.
+# ─────────────────────────────────────────────────────────────────────────────
+_std_servable_selected=0
+for _idx in "${RUN_SELECTED[@]}"; do
+    [ "${MDL_PORT[$_idx]}" = "0" ] && continue
+    for _s in "${STANDARD_INDICES[@]}"; do
+        [ "$_idx" = "$_s" ] && _std_servable_selected=1 && break
+    done
+    [ "$_std_servable_selected" = "1" ] && break
+done
+
+if [ "$_std_servable_selected" = "1" ]; then
+    echo "  ── Standard-model idle-sleep timeout ────────────────────────────"
+    echo "  Standard models offload to CPU after N idle minutes, then auto-wake"
+    echo "  on the next request."
+    printf "  Timeout in minutes [default %s, 0 = never sleep]: " "$STANDARD_SLEEP_MINUTES"
+    read -r _std_sleep_input
+
+    if [ -z "$_std_sleep_input" ]; then
+        _std_sleep_val="$STANDARD_SLEEP_MINUTES"
+    elif [[ "$_std_sleep_input" =~ ^[0-9]+$ ]]; then
+        _std_sleep_val="$_std_sleep_input"
+    else
+        echo "  ⚠️  '$_std_sleep_input' is not a number — using default ${STANDARD_SLEEP_MINUTES} min."
+        _std_sleep_val="$STANDARD_SLEEP_MINUTES"
+    fi
+
+    for _s in "${STANDARD_INDICES[@]}"; do
+        MDL_SLEEP[$_s]="$_std_sleep_val"
+    done
+
+    if [ "$_std_sleep_val" -eq 0 ]; then
+        echo "  ✅ Standard models will never auto-sleep."
+    else
+        echo "  ✅ Standard models will idle-sleep after ${_std_sleep_val} min."
+    fi
+    echo "  ─────────────────────────────────────────────────────────────────"
+    echo ""
+fi
 
 if [ "$SERVE_ONLY" -eq 1 ]; then
     # ── Serve-only mode: skip all install/download steps ──────────────────────
