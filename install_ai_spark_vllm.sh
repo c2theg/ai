@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.2.0  |  Update: 6/25/2026
+# Christopher Gray  |  Version: 0.2.1  |  Update: 6/25/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
@@ -11,6 +11,18 @@
 #   ./install_ai_spark_vllm.sh -s           — same as --serve-only
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.2.1  6/25/2026
+#   - Added _show_vllm_status(): prints RAM (and GPU, best-effort) utilization
+#     plus the models currently live in vLLM (probes each catalog port's
+#     /v1/models). Shown at startup (what a previous run left running) and again
+#     at the end (what has come up so far).
+#   - VRAM check: on unified-memory systems (DGX Spark / GB10) nvidia-smi reports
+#     memory.total as "[N/A]", which crashed the arithmetic. Now detected and
+#     handled — instead of a discrete-VRAM budget, _check_system_ram_budget()
+#     budgets against /proc/meminfo (total + MemAvailable), warns on memory
+#     pressure (>85% of total, or more than is free right now), and the same
+#     fallback is used when nvidia-smi is missing entirely.
 #
 # v0.2.0  6/25/2026
 #   - Per-model sleep timeout: the catalog _add() helper now takes an optional
@@ -138,7 +150,7 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.2.0
+Version:  0.2.1
 Last Updated:  6/25/2026
 
 Update Yourself:
@@ -327,6 +339,72 @@ DEFAULT_DL_INDICES=(10)
 DEFAULT_SERVE_INDICES=(10)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# STATUS SNAPSHOT — memory utilization + models currently live in vLLM
+# Probes every non-zero catalog port's /v1/models endpoint. Called once at
+# startup (shows what a previous run left running) and once at the end.
+# Arg: $1 = label for the section header (e.g. "STARTUP", "FINAL").
+# ─────────────────────────────────────────────────────────────────────────────
+_show_vllm_status() {
+    local label="$1"
+    echo ""
+    echo "  ══ vLLM / MEMORY STATUS — ${label} ══════════════════════════════"
+
+    # ---- System RAM (used / total) ----
+    local mt ma
+    mt=$(awk '/^MemTotal:/{print $2}'     /proc/meminfo 2>/dev/null)
+    ma=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)
+    if [[ "$mt" =~ ^[0-9]+$ ]] && [[ "$ma" =~ ^[0-9]+$ ]]; then
+        printf "  RAM     : %d / %d GB used  (%d%%)\n" \
+            "$(( (mt - ma) / 1024 / 1024 ))" "$(( mt / 1024 / 1024 ))" "$(( (mt - ma) * 100 / mt ))"
+    else
+        echo "  RAM     : /proc/meminfo unavailable"
+    fi
+
+    # ---- GPU (best effort; unified-memory systems report N/A for memory) ----
+    if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null 2>&1; then
+        local gutil gmu gmt
+        gutil=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs)
+        gmu=$(nvidia-smi --query-gpu=memory.used  --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs)
+        gmt=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs)
+        [[ "$gutil" =~ ^[0-9]+$ ]] && printf "  GPU     : %d%% compute utilization\n" "$gutil"
+        if [[ "$gmu" =~ ^[0-9]+$ ]] && [[ "$gmt" =~ ^[0-9]+$ ]]; then
+            printf "  GPU mem : %d / %d MiB used\n" "$gmu" "$gmt"
+        else
+            echo "  GPU mem : shared with system RAM (nvidia-smi reports N/A)"
+        fi
+    else
+        echo "  GPU     : nvidia-smi not available"
+    fi
+
+    # ---- Models currently live in vLLM (probe known catalog ports) ----
+    echo "  Models live in vLLM:"
+    local found=0 seen=""
+    for _i in $(seq 0 $((MODEL_TOTAL - 1))); do
+        local p="${MDL_PORT[$_i]}"
+        [ "$p" = "0" ] && continue
+        case " $seen " in *" $p "*) continue ;; esac
+        seen="$seen $p"
+        local resp
+        resp=$(curl -sf --max-time 2 "http://localhost:${p}/v1/models" 2>/dev/null) || continue
+        local ids
+        if command -v jq &>/dev/null; then
+            ids=$(echo "$resp" | jq -r '.data[].id' 2>/dev/null | paste -sd ',' -)
+        else
+            ids=$(echo "$resp" | grep -o '"id"[[:space:]]*:[[:space:]]*"[^"]*"' \
+                  | sed -E 's/.*"([^"]*)"$/\1/' | paste -sd ',' -)
+        fi
+        [ -z "$ids" ] && ids="(up — model id unknown)"
+        printf "    port %-6s : %s\n" "$p" "$ids"
+        found=1
+    done
+    [ "$found" = "0" ] && echo "    (none responding)"
+    echo "  ════════════════════════════════════════════════════════════════"
+}
+
+# Startup snapshot — what a previous run left running, before the clean-start kill.
+_show_vllm_status "STARTUP"
+
+# ─────────────────────────────────────────────────────────────────────────────
 # INTERACTIVE CHECKBOX SELECTION
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -404,6 +482,53 @@ _checkbox_menu() {
 # VRAM PRE-FLIGHT CHECK
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Budget required model memory against system RAM (for unified-memory systems
+# like the DGX Spark / GB10, where the GPU and CPU share one memory pool) and
+# do a live memory-pressure check against what is actually free right now.
+# Arg: $1 = total GB the selected models require.
+_check_system_ram_budget() {
+    local total_required="$1"
+    local mem_total_kb mem_avail_kb
+    mem_total_kb=$(awk '/^MemTotal:/{print $2}'     /proc/meminfo 2>/dev/null)
+    mem_avail_kb=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)
+
+    if ! [[ "$mem_total_kb" =~ ^[0-9]+$ ]]; then
+        echo "  ⚠️  Could not read /proc/meminfo — skipping memory check."
+        echo "     Selected models require ~${total_required} GB; ensure your RAM fits."
+        return 0
+    fi
+
+    local total_gb=$(( mem_total_kb / 1024 / 1024 ))
+    local avail_gb=0
+    [[ "$mem_avail_kb" =~ ^[0-9]+$ ]] && avail_gb=$(( mem_avail_kb / 1024 / 1024 ))
+    # 85% safe limit leaves headroom for the OS, KV cache, and the OpenWebUI /
+    # Qdrant / SearXNG containers that share the same RAM.
+    local safe_gb=$(( total_gb * 85 / 100 ))
+
+    printf "  %-20s : %d GB\n"          "System RAM total" "$total_gb"
+    printf "  %-20s : %d GB\n"          "Available now"    "$avail_gb"
+    printf "  %-20s : %d GB  (85%%)\n"  "Safe limit"       "$safe_gb"
+    printf "  %-20s : %d GB\n"          "Models require"   "$total_required"
+    echo ""
+
+    local pressure=""
+    if [ "$total_required" -gt "$safe_gb" ]; then
+        pressure="Models need ~${total_required} GB but the safe limit is ${safe_gb} GB (85% of ${total_gb} GB)."
+    elif [ "$avail_gb" -gt 0 ] && [ "$total_required" -gt "$avail_gb" ]; then
+        pressure="Models need ~${total_required} GB but only ${avail_gb} GB is free right now."
+    fi
+
+    if [ -n "$pressure" ]; then
+        echo "  ⚠️  MEMORY PRESSURE: $pressure"
+        echo "     KV cache, OpenWebUI, Qdrant, and the OS also draw from this pool."
+        echo -n "  Continue anyway? [y/N]: "
+        read -r confirm
+        [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+    else
+        echo "  ✅ Memory check OK — ${total_required} GB needed, ${total_gb} GB total / ${avail_gb} GB free"
+    fi
+}
+
 _check_vram() {
     local total_required=0
     for idx in "${RUN_SELECTED[@]}"; do
@@ -417,6 +542,17 @@ _check_vram() {
     if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null 2>&1; then
         local total_mib
         total_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs)
+
+        # Unified-memory systems (e.g. DGX Spark / GB10) report memory.total as
+        # "[N/A]". The GPU shares system RAM, so budget against that instead.
+        if ! [[ "$total_mib" =~ ^[0-9]+$ ]]; then
+            echo "  ℹ️  Unified memory detected (nvidia-smi VRAM = '${total_mib:-N/A}')."
+            echo "     GPU and CPU share one pool — budgeting against system RAM."
+            _check_system_ram_budget "$total_required"
+            echo "  ─────────────────────────────────────────────────────────"
+            return 0
+        fi
+
         local total_gb=$(( total_mib / 1024 ))
         local safe_gb=$(( total_gb * 90 / 100 ))
 
@@ -447,7 +583,8 @@ _check_vram() {
             echo "  ✅ VRAM check OK — ${total_required} GB needed, ${total_gb} GB available"
         fi
     else
-        echo "  ⚠️  nvidia-smi not available — skipping VRAM check"
+        echo "  ⚠️  nvidia-smi not available — budgeting against system RAM instead."
+        _check_system_ram_budget "$total_required"
     fi
     echo "  ─────────────────────────────────────────────────────────"
 }
@@ -1432,4 +1569,10 @@ for idx in "${RUN_SELECTED[@]}"; do
     echo "    ${MDL_NAME[$idx]} (port ${port}):"
     echo "      tail -f $VLLM_LOGS/vllm-${port}.log"
 done
+echo ""
+
+# Final snapshot — memory + which models have come up so far.
+_show_vllm_status "FINAL"
+echo "  ℹ️  vLLM models take ~5-10 min to finish loading; any not listed above are"
+echo "     likely still starting. Re-check later with: curl -s http://localhost:<port>/v1/models | jq ."
 echo ""
