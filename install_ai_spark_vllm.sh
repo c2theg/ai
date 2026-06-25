@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.1.9  |  Update: 6/18/2026
+# Christopher Gray  |  Version: 0.2.0  |  Update: 6/25/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
@@ -12,18 +12,40 @@
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
 #
-# v0.1.9  6/18/2026
-#   - Removed all four 120B+ "SUPER LARGE" models (Nemotron-3-Super-120B,
-#     Qwen3.5-122B BF16+FP8, GPT-OSS-120B). On a 128 GB unified GB10 / DGX Spark
-#     they load ~116 GB of weights then get OOM-killed (SIGKILL) during KV-cache
-#     allocation — confirmed in the wild. They need a discrete ≥140 GB GPU.
-#   - Fixed the VRAM pre-flight check to be unified-memory aware: nvidia-smi
-#     reports no memory.total on the GB10, so it now falls back to total system
-#     RAM (the real budget for weights + KV cache) and warns before an OOM.
-#   - OpenWebUI readiness wait now fails fast if the container exits, and gates
-#     the "ready"/auto-register block on a real /health check.
-#   - Remaining catalog all fits the 128 GB GB10: Qwen3.6-35B-A3B-FP8,
-#     Nemotron-3-Nano-30B-NVFP4, Gemma-4-31B, Gemma-4-26B-A4B, etc.
+# v0.2.0  6/25/2026
+#   - Per-model sleep timeout: the catalog _add() helper now takes an optional
+#     8th field SLEEP_MIN (idle minutes). When set, it overrides the global
+#     IDLE_SLEEP_MINUTES for that model only. The sleep watchdog was refactored
+#     from a single global IDLE_SECS to a per-port map (IDLE_SECS_BY_PORT), so
+#     different models can sleep on different schedules. Models with a SLEEP_MIN
+#     override sleep even if IDLE_SLEEP_MINUTES is 0 (global default disabled).
+#   - Added Qwen/Qwen3.5-4B-Instruct  (catalog idx 17, port 8012, ~10 GB VRAM)
+#     and Qwen/Qwen3.5-2B-Instruct    (catalog idx 18, port 8013, ~5 GB VRAM),
+#     both with SLEEP_MIN=60 (offload to CPU after 1 hour idle). Appended at the
+#     end of the catalog so existing indices and serve blocks are not shifted.
+#   - Added nvidia/nemotron-3.5-asr-streaming-0.6b (catalog idx 19) as a
+#     download-only ASR/NeMo model (VRAM=0, PORT=0) — not served via vLLM.
+#   - Added Qwen/Qwen3-ASR-1.7B (catalog idx 20, port 8014, ~5 GB VRAM) served
+#     via vLLM's --task transcription (POST /v1/audio/transcriptions). ASR-class
+#     served models are skipped in the OpenWebUI chat auto-registration (they are
+#     STT endpoints, not chat) — wire them in under Admin → Audio → STT instead.
+#
+# v0.1.9  6/25/2026
+#   - Model sleep: vLLM servers now launch with --enable-sleep-mode; a watchdog
+#     process monitors idle time and offloads model weights to CPU after
+#     IDLE_SLEEP_MINUTES (default 15) of inactivity.  Models auto-wake on the
+#     next inference request.  Watchdog log: $BASE_DIR/logs/sleep_watchdog.log
+#   - Added Qwen/Qwen3-Reranker-4B (catalog idx 10, port 8021, ~9 GB VRAM)
+#     Pre-selected by default (download + serve).  Generative yes/no reranker;
+#     clients score via logprobs on the "yes"/"no" tokens.  Uses max-model-len
+#     10000 and --max-logprobs 20 as recommended by HF model card.
+#   - Added SQLite structured memory ($BASE_DIR/memory/structured_memory.db)
+#     Schema: facts (key/value/category) + conversations tables.
+#     Retention: 60 days OR 100 MB — daily cleanup cron at 3am.
+#   - Added Qdrant vector DB container (port 6333 HTTP, 6334 gRPC)
+#     Long-term semantic memory for facts, notes, docs, and past conversations.
+#     Retention: 60 days OR 1 GB storage — daily cleanup cron at 4am.
+#     Dashboard: http://localhost:6333/dashboard
 #
 # v0.1.8  5/26/2026
 #   - Added Qwen/Qwen3.5-122B-A10B-FP8 (catalog idx 14, port 8033, ~62 GB VRAM)
@@ -112,11 +134,11 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.1.9
-Last Updated:  6/18/2026
+Version:  0.2.0
+Last Updated:  6/25/2026
 
 Update Yourself:
-    wget --no-cache -O 'install_ai_spark.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark.sh' && chmod u+x install_ai_spark.sh
+    wget --no-cache -O 'install_ai_spark_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark_vllm.sh' && chmod u+x install_ai_spark_vllm.sh
 
 
   YOU MUST HAVE A HUGGINGFACE ACCOUNT AND TOKEN TO DOWNLOAD MODELS!
@@ -151,6 +173,25 @@ BRAVE_SEARCH_API_KEY=""      # Brave Search API key — takes priority over Sear
 # =============================================
 OWUI_ADMIN_EMAIL="admin@local"
 OWUI_ADMIN_PASSWORD="Abc123!@#"
+
+# =============================================
+# MEMORY & AI INFRASTRUCTURE
+# =============================================
+IDLE_SLEEP_MINUTES=15        # Offload models to CPU after this many idle minutes (0 = disabled)
+
+ENABLE_SQLITE_MEMORY=true    # SQLite DB for structured memory (exact facts, conversations)
+SQLITE_RETENTION_DAYS=60     # Delete records older than N days  (≈ 2 months)
+SQLITE_MAX_MB=100            # Also prune oldest rows when DB exceeds this size
+
+ENABLE_QDRANT=true           # Qdrant vector DB for long-term semantic memory
+QDRANT_HTTP_PORT=6333        # Qdrant REST API port
+QDRANT_GRPC_PORT=6334        # Qdrant gRPC port
+QDRANT_RETENTION_DAYS=60     # Delete vectors older than N days  (≈ 2 months)
+QDRANT_MAX_GB=1              # Warn (and log) when storage exceeds this many GB
+
+MEMORY_DIR="$BASE_DIR/memory"
+SQLITE_DB="$MEMORY_DIR/structured_memory.db"
+QDRANT_DATA_DIR="$BASE_DIR/qdrant"
 
 # Load .env from same directory as this script — overrides tokens above if set there
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -191,9 +232,11 @@ fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MODEL CATALOG
-# Fields: HF_REPO | LOCAL_DIR | DISPLAY_NAME | DISK_GB | VRAM_GB | PORT | CATEGORY
-# VRAM_GB=0 → CPU/NeMo only — cannot be served via vLLM
-# PORT=0    → download-only (ASR/NeMo)
+# Fields: HF_REPO | LOCAL_DIR | DISPLAY_NAME | DISK_GB | VRAM_GB | PORT | CATEGORY | SLEEP_MIN(optional)
+# VRAM_GB=0   → CPU/NeMo only — cannot be served via vLLM
+# PORT=0      → download-only (ASR/NeMo)
+# SLEEP_MIN   → optional per-model idle-sleep timeout in minutes; overrides the
+#               global IDLE_SLEEP_MINUTES for this model only.  Omit to use global.
 # ─────────────────────────────────────────────────────────────────────────────
 MDL_HF=()
 MDL_DIR=()
@@ -202,11 +245,13 @@ MDL_DISK=()
 MDL_VRAM=()
 MDL_PORT=()
 MDL_CAT=()
+MDL_SLEEP=()
 
 _add() {
     local i=${#MDL_HF[@]}
     MDL_HF[$i]="$1"; MDL_DIR[$i]="$2"; MDL_NAME[$i]="$3"
     MDL_DISK[$i]="$4"; MDL_VRAM[$i]="$5"; MDL_PORT[$i]="$6"; MDL_CAT[$i]="$7"
+    MDL_SLEEP[$i]="${8:-}"
 }
 
 # ── Standard models ────────────────────────────────────────────────────────────
@@ -221,25 +266,55 @@ _add "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"        "Nemotron-3-Nan
 _add "BAAI/bge-m3"                                               "bge-m3"                                "BGE-M3 (Embeddings)"                     3    4   8011  "Embeddings"
 _add "Qwen/Qwen3-Embedding-4B"                                   "Qwen3-Embedding-4B"                    "Qwen3-Embedding-4B (Embeddings)"         8   10   8010  "Embeddings"
 _add "BAAI/bge-reranker-v2-m3"                                   "bge-reranker-v2-m3"                    "BGE-Reranker-v2-m3 (Reranking)"          2    3   8020  "Reranking"
+_add "Qwen/Qwen3-Reranker-4B"                                    "Qwen3-Reranker-4B"                     "Qwen3-Reranker-4B (Reranking) ★Default"   8    9   8021  "Reranking"
 _add "nvidia/parakeet-tdt-0.6b-v3"                               "parakeet-tdt-0.6b-v3"                  "Parakeet-TDT-0.6B v3 (ASR / NeMo)"       1    0      0  "ASR"
 _add "nvidia/nemotron-speech-streaming-en-0.6b"                  "nemotron-speech-streaming-en-0.6b"     "Nemotron-Speech-Streaming-0.6B (ASR)"    1    0      0  "ASR"
 
-# ── 120B+ "SUPER LARGE" models intentionally omitted (removed v0.1.9) ─────────
-# A 120B model is ~115–120 GB of weights (BF16 or FP8 alike), which does not fit
-# on a 128 GB unified GB10 with any room left for the KV cache → vLLM is
-# OOM-killed right after weight load. They need a discrete ≥140 GB GPU or
-# multi-GPU tensor-parallel. Re-add them here (and a serve block below) if you
-# move to such hardware.
+# ── SUPER LARGE models (120B+ parameters) ─────────────────────────────────────
+# Info: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard
+# Note: these require nearly the entire GPU — do not run alongside other large models.
+# ⚠️  Verify HF repo IDs before downloading — these may require updated values.
+_add "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"             "NVIDIA-Nemotron-3-Super-120B-A12B-BF16" "Nemotron-3-Super-120B-A12B (BF16) [SUPER]" 120  115   8030  "Super Large"
+_add "Qwen/Qwen3.5-122B-A10B"                                    "Qwen3.5-122B-A10B"                     "Qwen3.5-122B-A10B (BF16) [SUPER]"           122  120   8031  "Super Large"
+_add "Qwen/Qwen3.5-122B-A10B-FP8"                               "Qwen3.5-122B-A10B-FP8"                 "Qwen3.5-122B-A10B (FP8) [SUPER] ★Rec"        62   65   8033  "Super Large"
+_add "openai/gpt-oss-120b"                                       "gpt-oss-120b"                          "GPT-OSS-120B [SUPER]"                       120  115   8032  "Super Large"
+
+# ── Small models with a custom idle-sleep timeout ─────────────────────────────
+# These pass the optional 8th _add field (SLEEP_MIN) = 60, so the sleep watchdog
+# offloads them to CPU after 1 hour idle instead of the global IDLE_SLEEP_MINUTES.
+# Appended at the end of the catalog so the existing indices above (and their
+# matching serve blocks) are not shifted.
+#        HF Repo                       Local Dir              Display Name                              Disk VRAM  Port  Category    Sleep(min)
+_add "Qwen/Qwen3.5-4B-Instruct"      "Qwen3.5-4B-Instruct"  "Qwen3.5-4B-Instruct (BF16) [1h sleep]"   8   10   8012  "General"   60
+_add "Qwen/Qwen3.5-2B-Instruct"      "Qwen3.5-2B-Instruct"  "Qwen3.5-2B-Instruct (BF16) [1h sleep]"   4    5   8013  "General"   60
+
+# ── Additional ASR / NeMo model (download-only, not served via vLLM) ───────────
+# https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b
+# Appended here (not next to idx 11/12) to keep existing catalog indices stable.
+_add "nvidia/nemotron-3.5-asr-streaming-0.6b" "nemotron-3.5-asr-streaming-0.6b" "Nemotron-3.5-ASR-Streaming-0.6B (ASR)"   1    0      0  "ASR"
+
+# ── ASR model served via vLLM (transcription endpoint, gets a port) ───────────
+# https://huggingface.co/Qwen/Qwen3-ASR-1.7B
+# Unlike the NeMo ASR models above, this is served by vLLM (--task transcription)
+# and exposes POST /v1/audio/transcriptions. PORT is non-zero so it shows up in
+# the serve menu and can be selected like any other model.
+_add "Qwen/Qwen3-ASR-1.7B"           "Qwen3-ASR-1.7B"       "Qwen3-ASR-1.7B (ASR, served)"            4    5   8014  "ASR"
 
 MODEL_TOTAL=${#MDL_HF[@]}
+
+# ── Default pre-selected models ────────────────────────────────────────────────
+# Qwen3-Reranker-4B (catalog idx 10) is pre-selected for download and serve.
+# Users can deselect it in the interactive menus below.
+DEFAULT_DL_INDICES=(10)
+DEFAULT_SERVE_INDICES=(10)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INTERACTIVE CHECKBOX SELECTION
 # ─────────────────────────────────────────────────────────────────────────────
 
 _checkbox_menu() {
-    # Args: $1=title  $2=servable_only (true|false)  $3=result_var_name
-    local title="$1" servable_only="$2" result_var="$3"
+    # Args: $1=title  $2=servable_only (true|false)  $3=result_var_name  $4=defaults_var (optional)
+    local title="$1" servable_only="$2" result_var="$3" defaults_var="${4:-}"
 
     local -a menu_map=()
     for i in $(seq 0 $((MODEL_TOTAL - 1))); do
@@ -250,6 +325,16 @@ _checkbox_menu() {
 
     local -a sel=()
     for j in $(seq 0 $((count - 1))); do sel[$j]=0; done
+
+    # Pre-select any default catalog indices passed via defaults_var
+    if [ -n "$defaults_var" ]; then
+        local -n _defs_ref="$defaults_var"
+        for def_idx in "${_defs_ref[@]+${_defs_ref[@]}}"; do
+            for j in $(seq 0 $((count - 1))); do
+                [ "${menu_map[$j]}" = "$def_idx" ] && sel[$j]=1
+            done
+        done
+    fi
 
     while true; do
         echo ""
@@ -311,65 +396,40 @@ _check_vram() {
     echo ""
     echo "  ── VRAM Budget ──────────────────────────────────────────"
 
-    # On discrete GPUs nvidia-smi reports memory.total. On a GB10 / DGX Spark the GPU
-    # shares one unified LPDDR5 pool with the CPU, so memory.total is "[N/A]"/Not
-    # Supported — fall back to total system RAM, which is the real budget for
-    # weights + KV cache. Without this fallback the old check produced a broken
-    # arithmetic value and silently failed to warn before an OOM.
-    local total_gb="" mem_source=""
-    if command -v nvidia-smi &>/dev/null; then
+    if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null 2>&1; then
         local total_mib
         total_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | xargs)
-        if [[ "$total_mib" =~ ^[0-9]+$ ]] && [ "$total_mib" -gt 0 ]; then
-            total_gb=$(( total_mib / 1024 ))
-            mem_source="GPU VRAM"
-        fi
-    fi
-    if [ -z "$total_gb" ]; then
-        local total_kb
-        total_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)
-        if [[ "$total_kb" =~ ^[0-9]+$ ]]; then
-            total_gb=$(( total_kb / 1024 / 1024 ))
-            mem_source="unified system RAM (GB10/shared pool)"
-        fi
-    fi
+        local total_gb=$(( total_mib / 1024 ))
+        local safe_gb=$(( total_gb * 90 / 100 ))
 
-    if [ -z "$total_gb" ]; then
-        echo "  ⚠️  Could not determine memory budget — skipping check"
-        echo "  ─────────────────────────────────────────────────────────"
-        return 0
-    fi
+        printf "  %-20s : %d GB\n" "GPU total" "$total_gb"
+        printf "  %-20s : %d GB  (90%%)\n" "Safe limit" "$safe_gb"
+        printf "  %-20s : %d GB\n" "Models require" "$total_required"
+        echo ""
 
-    local safe_gb=$(( total_gb * 90 / 100 ))
-    printf "  %-20s : %d GB  (%s)\n" "Memory total" "$total_gb" "$mem_source"
-    printf "  %-20s : %d GB  (90%%)\n" "Safe limit" "$safe_gb"
-    printf "  %-20s : %d GB\n" "Models require" "$total_required"
-    echo ""
+        local has_super=0
+        for idx in "${RUN_SELECTED[@]}"; do
+            [ "${MDL_CAT[$idx]}" = "Super Large" ] && has_super=1 && break
+        done
 
-    local has_super=0
-    for idx in "${RUN_SELECTED[@]}"; do
-        [ "${MDL_CAT[$idx]}" = "Super Large" ] && has_super=1 && break
-    done
-
-    if [ "$total_required" -gt "$safe_gb" ]; then
-        echo "  ⚠️  WARNING: selected models need ~${total_required} GB but the safe limit is ${safe_gb} GB."
-        if [ "$has_super" = "1" ]; then
-            echo "     A 120B+ (Super Large) model loads ~116 GB of weights. On a 128 GB unified"
-            echo "     GB10 that leaves no room for KV cache/activations, so vLLM is OOM-killed"
-            echo "     (SIGKILL) right after weight load. Prefer the 30–35B A3B models instead."
-        else
+        if [ "$has_super" = "1" ] && [ "${#RUN_SELECTED[@]}" -gt 1 ]; then
+            echo "  ⚠️  WARNING: You selected a SUPER LARGE model alongside other models."
+            echo "     Super Large models (120B+) need nearly all GPU VRAM."
+            echo "     Running multiple large models simultaneously will likely fail."
+            echo -n "  Continue anyway? [y/N]: "
+            read -r confirm
+            [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+        elif [ "$total_required" -gt "$safe_gb" ]; then
+            echo "  ⚠️  WARNING: Selected models require ~${total_required} GB but safe limit is ${safe_gb} GB."
             echo "     Consider deselecting some models."
+            echo -n "  Continue anyway? [y/N]: "
+            read -r confirm
+            [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+        else
+            echo "  ✅ VRAM check OK — ${total_required} GB needed, ${total_gb} GB available"
         fi
-        echo -n "  Continue anyway? [y/N]: "
-        read -r confirm
-        [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
-    elif [ "$has_super" = "1" ] && [ "${#RUN_SELECTED[@]}" -gt 1 ]; then
-        echo "  ⚠️  WARNING: a Super Large model selected alongside others — they will not fit together."
-        echo -n "  Continue anyway? [y/N]: "
-        read -r confirm
-        [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
     else
-        echo "  ✅ Memory check OK — ${total_required} GB needed, ${total_gb} GB available"
+        echo "  ⚠️  nvidia-smi not available — skipping VRAM check"
     fi
     echo "  ─────────────────────────────────────────────────────────"
 }
@@ -386,7 +446,7 @@ if [ "$SERVE_ONLY" -eq 0 ]; then
     echo "════════════════════════════════════════════════════════════════════"
     echo "  STEP 1 of 2 — Select models to DOWNLOAD"
     echo "════════════════════════════════════════════════════════════════════"
-    _checkbox_menu "Available models (toggle with numbers, d=done):" "false" DL_SELECTED
+    _checkbox_menu "Available models (toggle with numbers, d=done):" "false" DL_SELECTED DEFAULT_DL_INDICES
 else
     echo ""
     echo "  ⏭️  --serve-only: skipping download step (Step 1)"
@@ -405,7 +465,7 @@ fi
 echo "  (ASR/NeMo models are download-only and excluded from this list)"
 echo "════════════════════════════════════════════════════════════════════"
 RUN_SELECTED=()
-_checkbox_menu "Models to serve with vLLM (toggle with numbers, d=done):" "true" RUN_SELECTED
+_checkbox_menu "Models to serve with vLLM (toggle with numbers, d=done):" "true" RUN_SELECTED DEFAULT_SERVE_INDICES
 
 _check_vram
 
@@ -599,9 +659,9 @@ _vllm_launch() {
     echo "--- Starting [idx $idx] $name on port $port ---"
     echo "    Model : $model_path"
     echo "    Log   : $log_file"
-    echo "    CMD   : $vllm_label $model_path --host 0.0.0.0 --port $port $*"
+    echo "    CMD   : $vllm_label $model_path --host 0.0.0.0 --port $port --enable-sleep-mode $*"
 
-    vllm_serve "$model_path" --host 0.0.0.0 --port "$port" "$@" >> "$log_file" 2>&1 &
+    vllm_serve "$model_path" --host 0.0.0.0 --port "$port" --enable-sleep-mode "$@" >> "$log_file" 2>&1 &
     local launch_pid=$!
     sleep 2
     if kill -0 "$launch_pid" 2>/dev/null; then
@@ -615,9 +675,211 @@ _vllm_launch() {
     fi
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SLEEP WATCHDOG — polls vLLM /metrics and offloads idle models to CPU
+# Args: one "port:idle_seconds" pair per model to watch. The idle threshold is
+#       per-port, so models can carry different sleep timeouts (catalog SLEEP_MIN).
+# ─────────────────────────────────────────────────────────────────────────────
+_start_sleep_watchdog() {
+    local -a watch_pairs=("$@")
+    [ "${#watch_pairs[@]}" -eq 0 ] && return 0
+
+    # Build the port list and the port→idle-seconds map from the pairs.
+    local ports_str="" idle_map=""
+    for pair in "${watch_pairs[@]}"; do
+        local p="${pair%%:*}" s="${pair##*:}"
+        ports_str="${ports_str}${ports_str:+ }${p}"
+        idle_map="${idle_map}${idle_map:+ }[${p}]=${s}"
+    done
+
+    local watchdog_script="$VLLM_LOGS/sleep_watchdog.sh"
+    cat > "$watchdog_script" << 'WATCHDOG_EOF'
+#!/usr/bin/env bash
+# vLLM sleep watchdog — generated by install_ai_spark_vllm.sh
+# Per-port idle threshold (seconds) — a model sleeps once idle past its own value.
+declare -A IDLE_SECS_BY_PORT=( __IDLE_MAP__ )
+PORTS=(__PORTS__)
+declare -A last_request_count
+declare -A last_active
+
+for port in "${PORTS[@]}"; do
+    cnt=$(curl -sf --max-time 5 "http://localhost:${port}/metrics" 2>/dev/null \
+        | awk '/^vllm:e2e_request_latency_seconds_count/{sum+=$2} END{print int(sum+0)}')
+    last_request_count[$port]="${cnt:-0}"
+    last_active[$port]=$(date +%s)
+done
+
+while true; do
+    sleep 60
+    now=$(date +%s)
+    for port in "${PORTS[@]}"; do
+        curl -sf --max-time 3 "http://localhost:${port}/health" > /dev/null 2>&1 || continue
+        new_cnt=$(curl -sf --max-time 5 "http://localhost:${port}/metrics" 2>/dev/null \
+            | awk '/^vllm:e2e_request_latency_seconds_count/{sum+=$2} END{print int(sum+0)}')
+        new_cnt="${new_cnt:-0}"
+        idle_secs="${IDLE_SECS_BY_PORT[$port]:-900}"
+        if [ "$new_cnt" != "${last_request_count[$port]:-0}" ]; then
+            last_request_count[$port]="$new_cnt"
+            last_active[$port]=$now
+        else
+            idle=$(( now - ${last_active[$port]:-$now} ))
+            if [ "$idle" -ge "$idle_secs" ]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] port ${port}: idle $((idle/60))m (threshold $((idle_secs/60))m) — sleeping (offloading to CPU)"
+                curl -sf -X POST "http://localhost:${port}/sleep" > /dev/null 2>&1 && \
+                    last_active[$port]=$now
+            fi
+        fi
+    done
+done
+WATCHDOG_EOF
+
+    sed -i \
+        -e "s|__IDLE_MAP__|${idle_map}|g" \
+        -e "s|__PORTS__|${ports_str}|g" \
+        "$watchdog_script"
+    chmod +x "$watchdog_script"
+
+    nohup "$watchdog_script" >> "$VLLM_LOGS/sleep_watchdog.log" 2>&1 &
+    local wpid=$!
+    echo "✅ Sleep watchdog started  pid=$wpid"
+    echo "   Per-port idle thresholds (min):"
+    for pair in "${watch_pairs[@]}"; do
+        printf "     port %-6s : %d min\n" "${pair%%:*}" "$(( ${pair##*:} / 60 ))"
+    done
+    echo "   Log: tail -f $VLLM_LOGS/sleep_watchdog.log"
+    echo "   Sleep API: POST http://localhost:<port>/sleep  |  POST .../wake_up"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SQLITE STRUCTURED MEMORY — exact fact storage, 2-month / 100 MB retention
+# ─────────────────────────────────────────────────────────────────────────────
+_setup_sqlite_memory() {
+    mkdir -p "$MEMORY_DIR"
+    if ! command -v sqlite3 &>/dev/null; then
+        echo "⚠️  sqlite3 not found — installing..."
+        sudo apt install -y sqlite3
+    fi
+
+    sqlite3 "$SQLITE_DB" << 'SQL_EOF'
+CREATE TABLE IF NOT EXISTS facts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    category    TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    source      TEXT,
+    confidence  REAL DEFAULT 1.0,
+    tags        TEXT,
+    UNIQUE(category, key)
+);
+CREATE TABLE IF NOT EXISTS conversations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    session_id  TEXT NOT NULL,
+    role        TEXT NOT NULL CHECK(role IN ('user','assistant','system')),
+    content     TEXT NOT NULL,
+    model       TEXT,
+    tokens_used INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_facts_created  ON facts(created_at);
+CREATE INDEX IF NOT EXISTS idx_facts_category ON facts(category);
+CREATE INDEX IF NOT EXISTS idx_conv_created   ON conversations(created_at);
+CREATE INDEX IF NOT EXISTS idx_conv_session   ON conversations(session_id);
+SQL_EOF
+
+    echo "✅ SQLite structured memory initialized: $SQLITE_DB"
+
+    cat > "$MEMORY_DIR/sqlite_maintain.sh" << MAINT_EOF
+#!/usr/bin/env bash
+DB="$SQLITE_DB"
+MAX_MB=$SQLITE_MAX_MB
+RETENTION_DAYS=$SQLITE_RETENTION_DAYS
+
+sqlite3 "\$DB" "DELETE FROM facts         WHERE created_at < datetime('now', '-\${RETENTION_DAYS} days');"
+sqlite3 "\$DB" "DELETE FROM conversations WHERE created_at < datetime('now', '-\${RETENTION_DAYS} days');"
+sqlite3 "\$DB" "VACUUM;"
+
+SIZE_MB=\$(du -sm "\$DB" 2>/dev/null | cut -f1)
+while [ "\${SIZE_MB:-0}" -gt "\$MAX_MB" ]; do
+    sqlite3 "\$DB" "DELETE FROM facts         WHERE id IN (SELECT id FROM facts         ORDER BY created_at ASC LIMIT 500);"
+    sqlite3 "\$DB" "DELETE FROM conversations WHERE id IN (SELECT id FROM conversations ORDER BY created_at ASC LIMIT 500);"
+    sqlite3 "\$DB" "VACUUM;"
+    SIZE_MB=\$(du -sm "\$DB" 2>/dev/null | cut -f1)
+done
+echo "[\$(date '+%Y-%m-%d %H:%M:%S')] SQLite maintenance done. Size: \${SIZE_MB:-?}MB / ${SQLITE_MAX_MB}MB max"
+MAINT_EOF
+
+    chmod +x "$MEMORY_DIR/sqlite_maintain.sh"
+    (crontab -l 2>/dev/null | grep -v "sqlite_maintain"; \
+     echo "0 3 * * * $MEMORY_DIR/sqlite_maintain.sh >> $VLLM_LOGS/sqlite_maintain.log 2>&1") | crontab -
+    echo "✅ SQLite retention: ${SQLITE_RETENTION_DAYS} days / ${SQLITE_MAX_MB} MB — daily cleanup at 3am"
+    echo "   DB path : $SQLITE_DB"
+    echo "   Maintain: $MEMORY_DIR/sqlite_maintain.sh"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QDRANT VECTOR MEMORY — semantic memory, 2-month / 1 GB retention
+# ─────────────────────────────────────────────────────────────────────────────
+_setup_qdrant() {
+    mkdir -p "$QDRANT_DATA_DIR/storage" "$QDRANT_DATA_DIR/config"
+
+    cat > "$QDRANT_DATA_DIR/config/production.yaml" << 'QDRANT_CFG_EOF'
+storage:
+  storage_path: /qdrant/storage
+service:
+  http_port: 6333
+  grpc_port: 6334
+QDRANT_CFG_EOF
+
+    docker pull qdrant/qdrant:latest
+    docker run -d \
+        --name qdrant \
+        --network host \
+        -v "$QDRANT_DATA_DIR/storage:/qdrant/storage:rw" \
+        -v "$QDRANT_DATA_DIR/config:/qdrant/config:ro" \
+        qdrant/qdrant:latest
+
+    echo "✅ Qdrant vector DB started"
+    echo "   HTTP API : http://localhost:${QDRANT_HTTP_PORT}"
+    echo "   gRPC     : localhost:${QDRANT_GRPC_PORT}"
+    echo "   Dashboard: http://localhost:${QDRANT_HTTP_PORT}/dashboard"
+
+    cat > "$QDRANT_DATA_DIR/qdrant_maintain.sh" << QDRANT_MAINT_EOF
+#!/usr/bin/env bash
+QDRANT_URL="http://localhost:${QDRANT_HTTP_PORT}"
+MAX_GB=$QDRANT_MAX_GB
+DATA_DIR="$QDRANT_DATA_DIR/storage"
+CUTOFF=\$(date -d "-${QDRANT_RETENTION_DAYS} days" +%s 2>/dev/null || \
+          date -v -${QDRANT_RETENTION_DAYS}d     +%s 2>/dev/null)
+
+for col in \$(curl -sf "\$QDRANT_URL/collections" 2>/dev/null \
+             | jq -r '.result.collections[].name' 2>/dev/null); do
+    curl -sf -X POST "\$QDRANT_URL/collections/\${col}/points/delete" \
+        -H "Content-Type: application/json" \
+        -d "{\"filter\":{\"must\":[{\"key\":\"created_at\",\"range\":{\"lt\":\$CUTOFF}}]}}" > /dev/null
+done
+
+SIZE_BYTES=\$(du -sb "\$DATA_DIR" 2>/dev/null | cut -f1)
+SIZE_GB=\$(( \${SIZE_BYTES:-0} / 1073741824 ))
+if [ "\${SIZE_GB:-0}" -gt "\$MAX_GB" ]; then
+    echo "[\$(date '+%Y-%m-%d %H:%M:%S')] WARNING: Qdrant storage \${SIZE_GB}GB exceeds \${MAX_GB}GB limit"
+    echo "   Prune collections manually or reduce QDRANT_RETENTION_DAYS."
+fi
+echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Qdrant maintenance done. Storage: \${SIZE_GB:-?}GB / ${QDRANT_MAX_GB}GB max"
+QDRANT_MAINT_EOF
+
+    chmod +x "$QDRANT_DATA_DIR/qdrant_maintain.sh"
+    (crontab -l 2>/dev/null | grep -v "qdrant_maintain"; \
+     echo "0 4 * * * $QDRANT_DATA_DIR/qdrant_maintain.sh >> $VLLM_LOGS/qdrant_maintain.log 2>&1") | crontab -
+    echo "✅ Qdrant retention: ${QDRANT_RETENTION_DAYS} days / ${QDRANT_MAX_GB} GB — daily cleanup at 4am"
+    echo "   Note: store 'created_at' (Unix epoch) as a payload field in each point for age-based pruning."
+    echo "   Maintain: $QDRANT_DATA_DIR/qdrant_maintain.sh"
+}
+
 echo "--- Clean start: killing all vLLM processes and removing old logs ---"
-docker stop open-webui searxng 2>/dev/null || true
-docker rm   open-webui searxng 2>/dev/null || true
+docker stop open-webui searxng qdrant 2>/dev/null || true
+docker rm   open-webui searxng qdrant 2>/dev/null || true
 pkill -9 -f "vllm serve"        2>/dev/null || true
 pkill -9 -f "vllm.entrypoints"  2>/dev/null || true
 pkill -9 -f "VLLM::EngineCore"  2>/dev/null || true
@@ -764,19 +1026,134 @@ if is_run_selected 9; then
         --trust-remote-code
 fi
 
-# ── catalog idx 10 & 11: ASR / NeMo — download only, not served via vLLM ──────
+# ── catalog idx 10: Qwen3-Reranker-4B  (port 8021) ★ Default ─────────────────
+# Generative yes/no reranker — clients score via logprobs on "yes"/"no" tokens.
+# Usage: POST /v1/completions with logprobs=1; compare P("yes") vs P("no").
+if is_run_selected 10; then
+    _vllm_launch 10 \
+        --served-model-name "Qwen3-Reranker-4B" \
+        --dtype auto \
+        --gpu-memory-utilization 0.80 \
+        --max-model-len 10000 \
+        --enable-prefix-caching \
+        --max-logprobs 20 \
+        --trust-remote-code
+fi
+
+# ── catalog idx 11, 12 & 19: ASR / NeMo — download only, not served via vLLM ──
+# (idx 19 = nemotron-3.5-asr-streaming-0.6b, appended at the end of the catalog)
 # To use: python3 -c "
 #   import nemo.collections.asr as nemo_asr
 #   model = nemo_asr.models.EncDecRNNTBPEModel.restore_from('$MODELS_DIR/parakeet-tdt-0.6b-v3/model.nemo')
 #   print(model.transcribe(['your_audio.wav']))"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 120B+ "SUPER LARGE" models were removed in v0.1.9 — they do not fit on a 128 GB
-# unified GB10 / DGX Spark (a 120B model is ~115–120 GB of weights whether BF16 or
-# FP8, leaving no room for KV cache → OOM-killed right after weight load). They
-# need a discrete ≥140 GB GPU or multi-GPU tensor-parallel. Re-add the catalog
-# entries and serve blocks here if you move to such hardware.
+# SUPER LARGE MODELS (120B+ parameters)
+# Info: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard
+# ⚠️  These require nearly the entire GPU. Do NOT run alongside other large models.
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ── catalog idx 13: Nemotron-3-Super-120B-A12B  (port 8030) ───────────────────
+if is_run_selected 13; then
+    echo "   ℹ️  Model info: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard"
+    echo "   ⚠️  SUPER LARGE — needs ~115 GB VRAM. Ensure no other large models are running."
+    _vllm_launch 13 \
+        --served-model-name "Nemotron-3-Super-120B-A12B" \
+        --dtype auto \
+        --gpu-memory-utilization 0.93 \
+        --max-model-len 8192 \
+        --enable-prefix-caching \
+        --trust-remote-code \
+        --enable-auto-tool-choice \
+        --tool-call-parser hermes
+fi
+
+# ── catalog idx 14: Qwen3.5-122B-A10B  (port 8031) ────────────────────────────
+if is_run_selected 14; then
+    echo "   ⚠️  SUPER LARGE — needs ~120 GB VRAM. Ensure no other large models are running."
+    _vllm_launch 14 \
+        --served-model-name "Qwen3.5-122B-A10B" \
+        --dtype auto \
+        --gpu-memory-utilization 0.93 \
+        --max-model-len 8192 \
+        --enable-prefix-caching \
+        --trust-remote-code \
+        --enable-auto-tool-choice \
+        --tool-call-parser hermes
+fi
+
+# ── catalog idx 15: Qwen3.5-122B-A10B-FP8  (port 8033) ★ Recommended ──────────
+# FP8 uses ~62 GB VRAM vs ~120 GB for BF16 — fits easily, allows longer context
+if is_run_selected 15; then
+    echo "   ★  FP8 version: ~62 GB VRAM, faster inference, longer context than BF16"
+    _vllm_launch 15 \
+        --served-model-name "Qwen3.5-122B-A10B-FP8" \
+        --dtype auto \
+        --gpu-memory-utilization 0.93 \
+        --max-model-len 32768 \
+        --enable-prefix-caching \
+        --trust-remote-code \
+        --enable-auto-tool-choice \
+        --tool-call-parser hermes
+fi
+
+# ── catalog idx 16: GPT-OSS-120B  (port 8032) ─────────────────────────────────
+if is_run_selected 16; then
+    echo "   ⚠️  SUPER LARGE — needs ~115 GB VRAM. Ensure no other large models are running."
+    _vllm_launch 16 \
+        --served-model-name "GPT-OSS-120B" \
+        --dtype auto \
+        --gpu-memory-utilization 0.93 \
+        --max-model-len 8192 \
+        --enable-prefix-caching \
+        --trust-remote-code
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SMALL MODELS WITH 1-HOUR IDLE-SLEEP  (catalog SLEEP_MIN=60)
+# Same serve path as the standard models; the longer sleep timeout is handled
+# entirely by the watchdog via each model's MDL_SLEEP entry (see catalog above).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── catalog idx 17: Qwen3.5-4B-Instruct  (port 8012)  [1h idle-sleep] ─────────
+if is_run_selected 17; then
+    _vllm_launch 17 \
+        --served-model-name "Qwen3.5-4B-Instruct" \
+        --dtype auto \
+        --gpu-memory-utilization 0.30 \
+        --max-model-len 32768 \
+        --enable-prefix-caching \
+        --trust-remote-code \
+        --enable-auto-tool-choice \
+        --tool-call-parser hermes
+fi
+
+# ── catalog idx 18: Qwen3.5-2B-Instruct  (port 8013)  [1h idle-sleep] ─────────
+if is_run_selected 18; then
+    _vllm_launch 18 \
+        --served-model-name "Qwen3.5-2B-Instruct" \
+        --dtype auto \
+        --gpu-memory-utilization 0.20 \
+        --max-model-len 32768 \
+        --enable-prefix-caching \
+        --trust-remote-code \
+        --enable-auto-tool-choice \
+        --tool-call-parser hermes
+fi
+
+# ── catalog idx 20: Qwen3-ASR-1.7B  (port 8014)  [served as transcription] ────
+# Served via vLLM's transcription task — exposes POST /v1/audio/transcriptions.
+# NOTE: this is an audio/STT endpoint, not chat, so it is intentionally skipped
+# in the OpenWebUI chat auto-registration below. To use it in OpenWebUI, set it
+# under Admin Settings → Audio → STT (OpenAI-compatible URL http://localhost:8014/v1).
+if is_run_selected 20; then
+    _vllm_launch 20 \
+        --served-model-name "Qwen3-ASR-1.7B" \
+        --task transcription \
+        --dtype auto \
+        --gpu-memory-utilization 0.20 \
+        --trust-remote-code
+fi
 
 #---------------------------------------------------------------------------------------------------------------
 #--- SearXNG (web search backend for OpenWebUI) ---
@@ -814,12 +1191,16 @@ fi
 echo "--- Starting OpenWebUI container ---"
 docker pull ghcr.io/open-webui/open-webui:main
 
-# Pick the first served model's port as the primary OpenWebUI endpoint
+# Pick the first served NON-ASR model's port as the primary OpenWebUI chat
+# endpoint. ASR models are transcription endpoints (not chat), so they must not
+# become the primary — they are also skipped in the registration loop below.
 OWUI_PRIMARY_PORT=8005
-if [ "${#RUN_SELECTED[@]}" -gt 0 ]; then
-    first_run_idx="${RUN_SELECTED[0]}"
+for first_run_idx in "${RUN_SELECTED[@]}"; do
+    [ "${MDL_PORT[$first_run_idx]}" = "0" ] && continue
+    [ "${MDL_CAT[$first_run_idx]}" = "ASR" ] && continue
     OWUI_PRIMARY_PORT="${MDL_PORT[$first_run_idx]}"
-fi
+    break
+done
 
 OWUI_ENV_ARGS=(
     -e PORT=3000
@@ -848,28 +1229,17 @@ echo "Waiting for OpenWebUI to be ready..."
 OWUI_TIMEOUT=300
 OWUI_ELAPSED=0
 until curl -sf http://localhost:3000/health > /dev/null 2>&1; do
-    # Fail fast: if the container exited, don't burn the full timeout waiting on a dead box.
-    if ! docker ps --format '{{.Names}}' | grep -qx 'open-webui'; then
-        echo ""
-        echo "❌ open-webui container is not running — it exited during startup."
-        echo "   Last 40 lines of logs:"
-        docker logs --tail 40 open-webui 2>&1 | sed 's/^/   | /'
-        echo "   → Full log: docker logs open-webui"
-        break
-    fi
     if [ "$OWUI_ELAPSED" -ge "$OWUI_TIMEOUT" ]; then
         echo ""
-        echo "⚠️  OpenWebUI still not ready after ${OWUI_TIMEOUT}s (container is up). Recent logs:"
-        docker logs --tail 20 open-webui 2>&1 | sed 's/^/   | /'
-        echo "   → Keep watching: docker logs -f open-webui"
+        echo "⚠️  OpenWebUI did not become ready after ${OWUI_TIMEOUT}s — check: docker logs open-webui"
         break
     fi
-    printf "  [%ds] waiting... (container up; first boot downloads the embedding model)\n" "$OWUI_ELAPSED"
+    printf "  [%ds] waiting...\n" "$OWUI_ELAPSED"
     sleep 5
     OWUI_ELAPSED=$((OWUI_ELAPSED + 5))
 done
 
-if curl -sf http://localhost:3000/health > /dev/null 2>&1; then
+if [ "$OWUI_ELAPSED" -lt "$OWUI_TIMEOUT" ]; then
     echo "✅ OpenWebUI ready at http://localhost:3000"
 
     # Build URL list dynamically from whatever is actually running
@@ -888,6 +1258,15 @@ if curl -sf http://localhost:3000/health > /dev/null 2>&1; then
     for idx in "${RUN_SELECTED[@]}"; do
         port="${MDL_PORT[$idx]}"
         [ "$port" = "0" ] && continue
+        # ASR models expose /v1/audio/transcriptions, not chat — registering them
+        # as chat connections would create a broken entry. Wire them into
+        # OpenWebUI under Admin → Audio → STT instead.
+        if [ "${MDL_CAT[$idx]}" = "ASR" ]; then
+            echo "   ℹ️  ${MDL_NAME[$idx]} (port ${port}) is an ASR/transcription endpoint —"
+            echo "      skipping chat registration. Add it under Admin → Audio → STT:"
+            echo "      OpenAI-compatible URL: http://localhost:${port}/v1"
+            continue
+        fi
         dir="${MDL_DIR[$idx]}"
         if [ -f "$MODELS_DIR/$dir/config.json" ]; then
             _owui_add "http://localhost:${port}/v1" "${MDL_NAME[$idx]}"
@@ -935,6 +1314,42 @@ if curl -sf http://localhost:3000/health > /dev/null 2>&1; then
 
     echo ""
     echo "  ⏳ Allow 5-10 minutes for vLLM models to finish loading before they appear."
+fi
+
+#---------------------------------------------------------------------------------------------------------------
+#--- SQLite Structured Memory ---
+if [ "$ENABLE_SQLITE_MEMORY" = "true" ]; then
+    echo "--- Setting up SQLite structured memory ---"
+    _setup_sqlite_memory
+fi
+
+#--- Qdrant Vector Memory ---
+if [ "$ENABLE_QDRANT" = "true" ]; then
+    echo "--- Starting Qdrant vector DB ---"
+    _setup_qdrant
+fi
+
+#--- Sleep Watchdog ---
+# Each model's effective idle timeout is its catalog SLEEP_MIN override, or the
+# global IDLE_SLEEP_MINUTES when no override is set. A model with an effective
+# timeout of 0 (or empty global) is skipped, so per-model timeouts still apply
+# even if the global default is disabled.
+if [ "${#RUN_SELECTED[@]}" -gt 0 ]; then
+    _WATCH_PAIRS=()
+    for _idx in "${RUN_SELECTED[@]}"; do
+        _p="${MDL_PORT[$_idx]}"
+        [ "$_p" = "0" ] && continue
+        _mins="${MDL_SLEEP[$_idx]:-}"
+        [ -z "$_mins" ] && _mins="$IDLE_SLEEP_MINUTES"
+        [ "$_mins" -gt 0 ] 2>/dev/null || continue
+        _WATCH_PAIRS+=("${_p}:$((_mins * 60))")
+    done
+    if [ "${#_WATCH_PAIRS[@]}" -gt 0 ]; then
+        echo "--- Starting vLLM sleep watchdog ---"
+        _start_sleep_watchdog "${_WATCH_PAIRS[@]}"
+    else
+        echo "--- Sleep watchdog skipped (no served model has an idle-sleep timeout) ---"
+    fi
 fi
 
 echo ""
