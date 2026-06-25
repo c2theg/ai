@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.2.1  |  Update: 6/25/2026
+# Christopher Gray  |  Version: 0.2.2  |  Update: 6/25/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
@@ -13,6 +13,17 @@
 # ── Changelog ─────────────────────────────────────────────────────────────────
 #
 # v0.2.1  6/25/2026
+#   - Selection menus now display models sorted by type → size → name (cosmetic).
+#     Sorting is applied to the menu view only; catalog indices are untouched so
+#     serve blocks / DEFAULT_*_INDICES / STANDARD_INDICES keep working.
+#   - Retuned --gpu-memory-utilization for every servable model to match the DGX
+#     Spark / GB10 UNIFIED memory pool (~121 GB). vLLM reserves fraction × pool
+#     up front, so the old discrete-GPU fractions over-reserved system RAM (e.g.
+#     the 4B reranker at 0.80 grabbed ~97 GB). New values target each model's
+#     real footprint + KV headroom (rerankers/embeddings 0.05-0.12, small Qwen
+#     0.07-0.12, mid dense 0.40-0.65), so multiple models can coexist. The 120B+
+#     Super Large models stay near 0.93 (they need the whole pool); FP8 122B
+#     lowered 0.93 → 0.75. See the calibration note above the serve blocks.
 #   - Added _show_vllm_status(): prints RAM (and GPU, best-effort) utilization
 #     plus the models currently live in vLLM (probes each catalog port's
 #     /v1/models). Shown at startup (what a previous run left running) and again
@@ -417,6 +428,33 @@ _checkbox_menu() {
         [ "$servable_only" = "true" ] && [ "${MDL_PORT[$i]}" = "0" ] && continue
         menu_map+=("$i")
     done
+
+    # ── Display order: group by type, then size (VRAM, ascending), then name ───
+    # COSMETIC ONLY. This reorders what the menu shows without changing catalog
+    # indices, so every serve block, DEFAULT_*_INDICES, and STANDARD_INDICES keep
+    # working unchanged. (Physically reordering the _add lines would shift indices
+    # and mis-map serve blocks — the v0.1.5 bug.)
+    if [ "${#menu_map[@]}" -gt 1 ]; then
+        local -a _sortable=()
+        local _mi _crank
+        for _mi in "${menu_map[@]}"; do
+            case "${MDL_CAT[$_mi]}" in
+                General)       _crank=1 ;;
+                Coding)        _crank=2 ;;
+                Reasoning)     _crank=3 ;;
+                Embeddings)    _crank=4 ;;
+                Reranking)     _crank=5 ;;
+                ASR)           _crank=6 ;;
+                "Super Large") _crank=7 ;;
+                *)             _crank=9 ;;
+            esac
+            _sortable+=("$(printf '%d|%04d|%s|%d' "$_crank" "${MDL_VRAM[$_mi]}" "${MDL_NAME[$_mi]}" "$_mi")")
+        done
+        menu_map=()
+        while IFS='|' read -r _ _ _ _mi; do menu_map+=("$_mi"); done \
+            < <(printf '%s\n' "${_sortable[@]}" | sort -t'|' -k1,1n -k2,2n -k3,3)
+    fi
+
     local count=${#menu_map[@]}
 
     local -a sel=()
@@ -505,27 +543,46 @@ _check_system_ram_budget() {
     # Qdrant / SearXNG containers that share the same RAM.
     local safe_gb=$(( total_gb * 85 / 100 ))
 
-    printf "  %-20s : %d GB\n"          "System RAM total" "$total_gb"
-    printf "  %-20s : %d GB\n"          "Available now"    "$avail_gb"
-    printf "  %-20s : %d GB  (85%%)\n"  "Safe limit"       "$safe_gb"
-    printf "  %-20s : %d GB\n"          "Models require"   "$total_required"
+    local used_gb=$(( total_gb - avail_gb ))
+    printf "  %-20s : %3d GB   total physical RAM on this box\n"               "System RAM total" "$total_gb"
+    printf "  %-20s : %3d GB   in use right now (OS, containers, old models)\n" "In use now"        "$used_gb"
+    printf "  %-20s : %3d GB   free right now\n"                               "Available now"     "$avail_gb"
+    printf "  %-20s : %3d GB   most you should load (85%% of total)\n"          "Safe limit"        "$safe_gb"
+    printf "  %-20s : %3d GB   sum of selected models' VRAM estimates\n"        "Models require"    "$total_required"
     echo ""
 
-    local pressure=""
+    # Two distinct conditions, with different meanings and advice:
+    #   capacity  — models exceed the safe limit; they won't fit even when idle.
+    #   transient — models fit overall, but not enough is free this instant
+    #               (usually a previous run's models, killed later in this script).
+    local pressure="" kind=""
     if [ "$total_required" -gt "$safe_gb" ]; then
-        pressure="Models need ~${total_required} GB but the safe limit is ${safe_gb} GB (85% of ${total_gb} GB)."
+        kind="capacity"
+        pressure="Models need ~${total_required} GB, over the ${safe_gb} GB safe limit (85% of ${total_gb} GB)."
     elif [ "$avail_gb" -gt 0 ] && [ "$total_required" -gt "$avail_gb" ]; then
-        pressure="Models need ~${total_required} GB but only ${avail_gb} GB is free right now."
+        kind="transient"
+        pressure="Models need ~${total_required} GB but only ${avail_gb} GB is free this instant (${used_gb} GB already in use)."
     fi
 
     if [ -n "$pressure" ]; then
         echo "  ⚠️  MEMORY PRESSURE: $pressure"
-        echo "     KV cache, OpenWebUI, Qdrant, and the OS also draw from this pool."
+        if [ "$kind" = "transient" ]; then
+            echo "     This is almost always because a PREVIOUS run's models are still"
+            echo "     loaded (see the 'STARTUP' snapshot above). This script kills old"
+            echo "     vLLM processes a few steps from now, which frees that RAM — so since"
+            echo "     ${total_required} GB is under the ${safe_gb} GB safe limit, you can most"
+            echo "     likely continue. If models then fail, watch their logs for OOM errors."
+        else
+            echo "     ${total_required} GB won't fit safely even on an idle box. KV cache,"
+            echo "     OpenWebUI, Qdrant, and the OS also draw from this same shared pool."
+            echo "     Deselect some models, or pick smaller / quantized (FP8/NVFP4) variants."
+        fi
         echo -n "  Continue anyway? [y/N]: "
         read -r confirm
         [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
     else
-        echo "  ✅ Memory check OK — ${total_required} GB needed, ${total_gb} GB total / ${avail_gb} GB free"
+        echo "  ✅ Memory check OK — need ~${total_required} GB; ${avail_gb} GB free now,"
+        echo "     ${safe_gb} GB safe limit, ${total_gb} GB total."
     fi
 }
 
@@ -1105,12 +1162,25 @@ fi
 # Catalog indices are assigned by _add() in order of appearance above — they
 # must match here exactly, or the wrong model serve block will fire.
 
+# ─────────────────────────────────────────────────────────────────────────────
+# --gpu-memory-utilization is calibrated for the DGX Spark / GB10 UNIFIED memory
+# pool (~121 GB shared by GPU + CPU). vLLM reserves (fraction × total pool) up
+# front for weights + KV cache, so on unified memory a high fraction reserves a
+# huge slice of system RAM even for a tiny model. Each fraction below targets
+# roughly the model's real footprint (catalog VRAM_GB) plus KV headroom, so
+# several models can coexist without oversubscribing the shared pool.
+#   Rough guide on a 121 GB box:  0.10 ≈ 12 GB,  0.25 ≈ 30 GB,  0.60 ≈ 73 GB.
+# The 120B+ "Super Large" models intentionally stay near 0.93 — they genuinely
+# need almost the whole pool and are meant to run alone. On a DISCRETE GPU these
+# fractions instead mean fraction-of-VRAM; retune if you move off the Spark.
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ── catalog idx 0: Qwen3.6-35B-A3B-FP8  (port 8005) ──────────────────────────
 if is_run_selected 0; then
     _vllm_launch 0 \
         --served-model-name "Qwen3.6-35B-A3B" \
         --dtype auto \
-        --gpu-memory-utilization 0.73 \
+        --gpu-memory-utilization 0.40 \
         --max-model-len 32768 \
         --enable-prefix-caching \
         --trust-remote-code \
@@ -1125,7 +1195,7 @@ if is_run_selected 1; then
         --served-model-name "Nemotron-3-Nano-30B-NVFP4" \
         --dtype auto \
         --quantization modelopt_fp4 \
-        --gpu-memory-utilization 0.85 \
+        --gpu-memory-utilization 0.20 \
         --max-model-len 32768 \
         --max-num-seqs 178 \
         --enable-prefix-caching \
@@ -1139,7 +1209,7 @@ if is_run_selected 2; then
     _vllm_launch 2 \
         --served-model-name "Qwen3-Coder-30B" \
         --dtype auto \
-        --gpu-memory-utilization 0.85 \
+        --gpu-memory-utilization 0.62 \
         --max-model-len 32768 \
         --enable-prefix-caching \
         --trust-remote-code
@@ -1150,7 +1220,7 @@ if is_run_selected 3; then
     _vllm_launch 3 \
         --served-model-name "DeepSeek-R1-Distill-Qwen-32B" \
         --dtype auto \
-        --gpu-memory-utilization 0.85 \
+        --gpu-memory-utilization 0.65 \
         --max-model-len 32768 \
         --enable-prefix-caching \
         --trust-remote-code
@@ -1188,7 +1258,7 @@ if is_run_selected 6; then
     _vllm_launch 6 \
         --served-model-name "Nemotron-3-Nano-Omni-30B-A3B" \
         --dtype bfloat16 \
-        --gpu-memory-utilization 0.85 \
+        --gpu-memory-utilization 0.62 \
         --max-model-len 32768 \
         --enable-prefix-caching \
         --trust-remote-code
@@ -1200,7 +1270,7 @@ if is_run_selected 7; then
         --served-model-name "bge-m3" \
         --task embedding \
         --dtype auto \
-        --gpu-memory-utilization 0.30 \
+        --gpu-memory-utilization 0.06 \
         --trust-remote-code
 fi
 
@@ -1210,7 +1280,7 @@ if is_run_selected 8; then
         --served-model-name "Qwen3-Embedding-4B" \
         --task embedding \
         --dtype auto \
-        --gpu-memory-utilization 0.50 \
+        --gpu-memory-utilization 0.12 \
         --trust-remote-code
 fi
 
@@ -1220,7 +1290,7 @@ if is_run_selected 9; then
         --served-model-name "bge-reranker-v2-m3" \
         --task classify \
         --dtype auto \
-        --gpu-memory-utilization 0.50 \
+        --gpu-memory-utilization 0.05 \
         --trust-remote-code
 fi
 
@@ -1231,7 +1301,7 @@ if is_run_selected 10; then
     _vllm_launch 10 \
         --served-model-name "Qwen3-Reranker-4B" \
         --dtype auto \
-        --gpu-memory-utilization 0.80 \
+        --gpu-memory-utilization 0.12 \
         --max-model-len 10000 \
         --enable-prefix-caching \
         --max-logprobs 20 \
@@ -1287,7 +1357,7 @@ if is_run_selected 15; then
     _vllm_launch 15 \
         --served-model-name "Qwen3.5-122B-A10B-FP8" \
         --dtype auto \
-        --gpu-memory-utilization 0.93 \
+        --gpu-memory-utilization 0.75 \
         --max-model-len 32768 \
         --enable-prefix-caching \
         --trust-remote-code \
@@ -1318,7 +1388,7 @@ if is_run_selected 17; then
     _vllm_launch 17 \
         --served-model-name "Qwen3.5-4B-Instruct" \
         --dtype auto \
-        --gpu-memory-utilization 0.30 \
+        --gpu-memory-utilization 0.12 \
         --max-model-len 32768 \
         --enable-prefix-caching \
         --trust-remote-code \
@@ -1331,7 +1401,7 @@ if is_run_selected 18; then
     _vllm_launch 18 \
         --served-model-name "Qwen3.5-2B-Instruct" \
         --dtype auto \
-        --gpu-memory-utilization 0.20 \
+        --gpu-memory-utilization 0.07 \
         --max-model-len 32768 \
         --enable-prefix-caching \
         --trust-remote-code \
@@ -1349,7 +1419,7 @@ if is_run_selected 20; then
         --served-model-name "Qwen3-ASR-1.7B" \
         --task transcription \
         --dtype auto \
-        --gpu-memory-utilization 0.20 \
+        --gpu-memory-utilization 0.07 \
         --trust-remote-code
 fi
 
