@@ -12,6 +12,14 @@
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
 #
+# v0.2.2  6/25/2026
+#   - Before the memory budget check, the script now detects a previous run's
+#     still-loaded vLLM models and asks whether to shut them down first (default
+#     yes). Killing them frees their reserved memory so "Available now" reflects
+#     a clean slate instead of stale reservations. The vLLM kill logic is now a
+#     shared _kill_vllm_processes() helper used by both this prompt and the later
+#     clean-start step.
+#
 # v0.2.1  6/25/2026
 #   - Selection menus now display models sorted by type → size → name (cosmetic).
 #     Sorting is applied to the menu view only; catalog indices are untouched so
@@ -161,7 +169,7 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.2.1
+Version:  0.2.2
 Last Updated:  6/25/2026
 
 Update Yourself:
@@ -586,6 +594,37 @@ _check_system_ram_budget() {
     fi
 }
 
+# Kill any running vLLM model processes (a previous run's, or this script's).
+# Shared by the optional pre-check shutdown and the later clean-start.
+_kill_vllm_processes() {
+    pkill -9 -f "vllm serve"        2>/dev/null || true
+    pkill -9 -f "vllm.entrypoints"  2>/dev/null || true
+    pkill -9 -f "VLLM::EngineCore"  2>/dev/null || true
+    pkill -9 -f "vllm.engine"       2>/dev/null || true
+}
+
+# Ask whether to shut down a previous run's still-loaded models before the memory
+# check, so "Available now" reflects a clean slate instead of stale reservations.
+# Only prompts when vLLM processes are actually detected.
+_maybe_shutdown_existing_models() {
+    pgrep -f "vllm serve" >/dev/null 2>&1 || pgrep -f "vllm.entrypoints" >/dev/null 2>&1 || return 0
+
+    echo ""
+    echo "  ⚠️  vLLM model(s) from a previous run are still loaded and holding memory"
+    echo "      (see the STARTUP snapshot above). Shutting them down now frees that"
+    echo "      memory so the budget check below reflects a clean slate."
+    echo -n "  Shut down existing models now? [Y/n]: "
+    read -r _kill_ans
+    if [[ "$_kill_ans" =~ ^[Nn]$ ]]; then
+        echo "  → Keeping existing models; 'Available now' will still include them."
+    else
+        echo "  → Stopping existing vLLM processes..."
+        _kill_vllm_processes
+        sleep 3
+        echo "  ✅ Existing models stopped — memory freed."
+    fi
+}
+
 _check_vram() {
     local total_required=0
     for idx in "${RUN_SELECTED[@]}"; do
@@ -678,6 +717,9 @@ echo "  (ASR/NeMo models are download-only and excluded from this list)"
 echo "════════════════════════════════════════════════════════════════════"
 RUN_SELECTED=()
 _checkbox_menu "Models to serve with vLLM (toggle with numbers, d=done):" "true" RUN_SELECTED DEFAULT_SERVE_INDICES
+
+# Offer to free a previous run's models before measuring available memory.
+_maybe_shutdown_existing_models
 
 _check_vram
 
@@ -1135,10 +1177,7 @@ QDRANT_MAINT_EOF
 echo "--- Clean start: killing all vLLM processes and removing old logs ---"
 docker stop open-webui searxng qdrant 2>/dev/null || true
 docker rm   open-webui searxng qdrant 2>/dev/null || true
-pkill -9 -f "vllm serve"        2>/dev/null || true
-pkill -9 -f "vllm.entrypoints"  2>/dev/null || true
-pkill -9 -f "VLLM::EngineCore"  2>/dev/null || true
-pkill -9 -f "vllm.engine"       2>/dev/null || true
+_kill_vllm_processes
 sleep 3
 rm -f "$VLLM_LOGS"/vllm-*.log
 echo "✅ Old vLLM processes killed and logs cleared"
