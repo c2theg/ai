@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.2.2  |  Update: 6/25/2026
+# Christopher Gray  |  Version: 0.2.3  |  Update: 6/25/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
@@ -11,6 +11,14 @@
 #   ./install_ai_spark_vllm.sh -s           — same as --serve-only
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.2.3  6/25/2026
+#   - Removed --chat-template-kwargs from Qwen3.6-35B-A3B serve block (requires
+#     vLLM ≥0.6.x). Without the flag the model runs in thinking mode by default.
+#   - Removed --task (embedding/classify/transcription) from all serve blocks;
+#     the flag requires vLLM ≥0.6.x — older builds auto-infer task from model
+#     config. Affected: bge-m3, Qwen3-Embedding-4B, bge-reranker-v2-m3,
+#     Qwen3-ASR-1.7B. Upgrade vLLM with `pip install -U vllm` to restore both.
 #
 # v0.2.2  6/25/2026
 #   - Before the memory budget check, the script now detects a previous run's
@@ -169,7 +177,7 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.2.2
+Version:  0.2.3
 Last Updated:  6/25/2026
 
 Update Yourself:
@@ -1224,8 +1232,7 @@ if is_run_selected 0; then
         --enable-prefix-caching \
         --trust-remote-code \
         --enable-auto-tool-choice \
-        --tool-call-parser hermes \
-        --chat-template-kwargs '{"enable_thinking": false}'
+        --tool-call-parser hermes
 fi
 
 # ── catalog idx 1: NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4  (port 8006) ─────────
@@ -1307,7 +1314,6 @@ fi
 if is_run_selected 7; then
     _vllm_launch 7 \
         --served-model-name "bge-m3" \
-        --task embedding \
         --dtype auto \
         --gpu-memory-utilization 0.06 \
         --trust-remote-code
@@ -1317,7 +1323,6 @@ fi
 if is_run_selected 8; then
     _vllm_launch 8 \
         --served-model-name "Qwen3-Embedding-4B" \
-        --task embedding \
         --dtype auto \
         --gpu-memory-utilization 0.12 \
         --trust-remote-code
@@ -1327,7 +1332,6 @@ fi
 if is_run_selected 9; then
     _vllm_launch 9 \
         --served-model-name "bge-reranker-v2-m3" \
-        --task classify \
         --dtype auto \
         --gpu-memory-utilization 0.05 \
         --trust-remote-code
@@ -1456,7 +1460,6 @@ fi
 if is_run_selected 20; then
     _vllm_launch 20 \
         --served-model-name "Qwen3-ASR-1.7B" \
-        --task transcription \
         --dtype auto \
         --gpu-memory-utilization 0.07 \
         --trust-remote-code
