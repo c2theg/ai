@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.2.4  |  Update: 6/25/2026
+# Christopher Gray  |  Version: 0.2.5  |  Update: 6/25/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
@@ -11,6 +11,18 @@
 #   ./install_ai_spark_vllm.sh -s           — same as --serve-only
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.2.5  6/25/2026
+#   - Bumped Qwen3-Embedding-4B gpu-memory-utilization 0.50 → 0.60. The embedding
+#     model starts right after the 35B and the 35B's in-flight + residual memory
+#     (old killed process + new loading) pushed the baseline over the 60.5 GB
+#     budget at 0.50. The reranker worked because by the time it starts the
+#     embedding has already exited and freed its slot.
+#   - Bumped Qwen3.5-4B-Instruct 0.12 → 0.50 and Qwen3.5-2B-Instruct 0.07 → 0.45
+#     for the same reason (same launch-order problem when 35B is pre-loaded).
+#   - Fixed sleep watchdog endpoint: tries POST /v1/sleep first (vLLM ≥0.20.x),
+#     falls back to POST /sleep. The reranker log showed 404 on /sleep because
+#     vLLM 0.20.x uses the /v1/ prefix for this endpoint.
 #
 # v0.2.4  6/25/2026
 #   - Raised --gpu-memory-utilization for embedding/reranker models (0.05-0.12 →
@@ -188,7 +200,7 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.2.4
+Version:  0.2.5
 Last Updated:  6/25/2026
 
 Update Yourself:
@@ -1041,8 +1053,11 @@ while true; do
             idle=$(( now - ${last_active[$port]:-$now} ))
             if [ "$idle" -ge "$idle_secs" ]; then
                 echo "[$(date '+%Y-%m-%d %H:%M:%S')] port ${port}: idle $((idle/60))m (threshold $((idle_secs/60))m) — sleeping (offloading to CPU)"
-                curl -sf -X POST "http://localhost:${port}/sleep" > /dev/null 2>&1 && \
+                # Try /v1/sleep first (vLLM ≥0.20.x), fall back to /sleep (older)
+                if curl -sf -X POST "http://localhost:${port}/v1/sleep" > /dev/null 2>&1 || \
+                   curl -sf -X POST "http://localhost:${port}/sleep"    > /dev/null 2>&1; then
                     last_active[$port]=$now
+                fi
             fi
         fi
     done
@@ -1340,7 +1355,7 @@ if is_run_selected 8; then
     _vllm_launch 8 \
         --served-model-name "Qwen3-Embedding-4B" \
         --dtype auto \
-        --gpu-memory-utilization 0.50 \
+        --gpu-memory-utilization 0.60 \
         --max-model-len 8192 \
         --trust-remote-code
 fi
@@ -1449,7 +1464,7 @@ if is_run_selected 17; then
     _vllm_launch 17 \
         --served-model-name "Qwen3.5-4B-Instruct" \
         --dtype auto \
-        --gpu-memory-utilization 0.12 \
+        --gpu-memory-utilization 0.50 \
         --max-model-len 32768 \
         --enable-prefix-caching \
         --trust-remote-code \
@@ -1462,7 +1477,7 @@ if is_run_selected 18; then
     _vllm_launch 18 \
         --served-model-name "Qwen3.5-2B-Instruct" \
         --dtype auto \
-        --gpu-memory-utilization 0.07 \
+        --gpu-memory-utilization 0.45 \
         --max-model-len 32768 \
         --enable-prefix-caching \
         --trust-remote-code \
