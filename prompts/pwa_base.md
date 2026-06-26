@@ -37,7 +37,7 @@ Notifications and background features:
 * Add background sync support where available
 * Provide safe fallbacks for browsers that do not support background sync or push
 * Do not break the app when unsupported PWA APIs are missing
-* Provide realtime updates to the user interface via websockets
+* Provide realtime notification to the user interface via websockets and VAPID keys for web push authorization
 
 Realtime communication:
 
@@ -75,6 +75,7 @@ Security and quality:
 * Validate push subscription and upload endpoints server-side
 * Make the implementation accessible and keyboard-friendly
 * Add error handling and user-friendly fallback messages
+* Disable all spell checking and auto completes on forms which contain password input boxes. 
 
 Testing:
 
