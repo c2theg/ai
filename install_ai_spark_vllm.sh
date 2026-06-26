@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.2.5  |  Update: 6/25/2026
+# Christopher Gray  |  Version: 0.2.6  |  Update: 6/26/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
@@ -11,6 +11,16 @@
 #   ./install_ai_spark_vllm.sh -s           — same as --serve-only
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.2.6  6/26/2026
+#   - Fixed HF repo IDs for small Qwen3.5 dense models: Qwen/Qwen3.5-4B-Instruct
+#     and Qwen/Qwen3.5-2B-Instruct → Qwen/Qwen3.5-4B and Qwen/Qwen3.5-2B
+#     (the repos have no -Instruct suffix). Updated catalog, local dirs,
+#     serve block --served-model-name args, and changelog refs.
+#   - Fixed download loop to check exit code: now prints ❌ on failure instead of
+#     falsely printing ✅ regardless of whether huggingface-cli succeeded.
+#   - Added Qwen/Qwen3.5-9B (catalog idx 21, port 8015, ~18 GB VRAM)
+#     with SLEEP_MIN=60 (same idle-sleep pattern as the 2B/4B small models).
 #
 # v0.2.5  6/25/2026
 #   - Bumped Qwen3-Embedding-4B gpu-memory-utilization 0.50 → 0.60. The embedding
@@ -200,8 +210,8 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.2.5
-Last Updated:  6/25/2026
+Version:  0.2.6
+Last Updated:  6/26/2026
 
 Update Yourself:
     wget --no-cache -O 'install_ai_spark_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark_vllm.sh' && chmod u+x install_ai_spark_vllm.sh
@@ -365,8 +375,9 @@ _add "openai/gpt-oss-120b"                                       "gpt-oss-120b" 
 # Appended at the end of the catalog so the existing indices above (and their
 # matching serve blocks) are not shifted.
 #        HF Repo                       Local Dir              Display Name                              Disk VRAM  Port  Category    Sleep(min)
-_add "Qwen/Qwen3.5-4B-Instruct"      "Qwen3.5-4B-Instruct"  "Qwen3.5-4B-Instruct (BF16) [1h sleep]"   8   10   8012  "General"   60
-_add "Qwen/Qwen3.5-2B-Instruct"      "Qwen3.5-2B-Instruct"  "Qwen3.5-2B-Instruct (BF16) [1h sleep]"   4    5   8013  "General"   60
+_add "Qwen/Qwen3.5-4B"               "Qwen3.5-4B"           "Qwen3.5-4B (BF16) [1h sleep]"            8   10   8012  "General"   60
+_add "Qwen/Qwen3.5-2B"               "Qwen3.5-2B"           "Qwen3.5-2B (BF16) [1h sleep]"            4    5   8013  "General"   60
+_add "Qwen/Qwen3.5-9B"               "Qwen3.5-9B"           "Qwen3.5-9B (BF16) [1h sleep]"           18   18   8015  "General"   60
 
 # ── Additional ASR / NeMo model (download-only, not served via vLLM) ───────────
 # https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b
@@ -908,8 +919,11 @@ else
                 echo "    ⚠️  SUPER LARGE model (~${MDL_DISK[$idx]} GB) — this will take a while."
                 echo "    ℹ️  Nemotron-3-Super info: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard"
             fi
-            $HF_DL "${MDL_HF[$idx]}" --local-dir "$MODELS_DIR/${MDL_DIR[$idx]}"
-            echo "✅ ${MDL_NAME[$idx]} downloaded"
+            if $HF_DL "${MDL_HF[$idx]}" --local-dir "$MODELS_DIR/${MDL_DIR[$idx]}"; then
+                echo "✅ ${MDL_NAME[$idx]} downloaded"
+            else
+                echo "❌ ${MDL_NAME[$idx]} download FAILED (see error above) — skipping."
+            fi
         done
     fi
 
@@ -1459,10 +1473,10 @@ fi
 # entirely by the watchdog via each model's MDL_SLEEP entry (see catalog above).
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── catalog idx 17: Qwen3.5-4B-Instruct  (port 8012)  [1h idle-sleep] ─────────
+# ── catalog idx 17: Qwen3.5-4B  (port 8012)  [1h idle-sleep] ─────────────────
 if is_run_selected 17; then
     _vllm_launch 17 \
-        --served-model-name "Qwen3.5-4B-Instruct" \
+        --served-model-name "Qwen3.5-4B" \
         --dtype auto \
         --gpu-memory-utilization 0.50 \
         --max-model-len 32768 \
@@ -1472,12 +1486,25 @@ if is_run_selected 17; then
         --tool-call-parser hermes
 fi
 
-# ── catalog idx 18: Qwen3.5-2B-Instruct  (port 8013)  [1h idle-sleep] ─────────
+# ── catalog idx 18: Qwen3.5-2B  (port 8013)  [1h idle-sleep] ─────────────────
 if is_run_selected 18; then
     _vllm_launch 18 \
-        --served-model-name "Qwen3.5-2B-Instruct" \
+        --served-model-name "Qwen3.5-2B" \
         --dtype auto \
         --gpu-memory-utilization 0.45 \
+        --max-model-len 32768 \
+        --enable-prefix-caching \
+        --trust-remote-code \
+        --enable-auto-tool-choice \
+        --tool-call-parser hermes
+fi
+
+# ── catalog idx 21: Qwen3.5-9B  (port 8015)  [1h idle-sleep] ─────────────────
+if is_run_selected 21; then
+    _vllm_launch 21 \
+        --served-model-name "Qwen3.5-9B" \
+        --dtype auto \
+        --gpu-memory-utilization 0.50 \
         --max-model-len 32768 \
         --enable-prefix-caching \
         --trust-remote-code \
