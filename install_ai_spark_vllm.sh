@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.2.3  |  Update: 6/25/2026
+# Christopher Gray  |  Version: 0.2.4  |  Update: 6/25/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
@@ -11,6 +11,17 @@
 #   ./install_ai_spark_vllm.sh -s           — same as --serve-only
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.2.4  6/25/2026
+#   - Raised --gpu-memory-utilization for embedding/reranker models (0.05-0.12 →
+#     0.45-0.50). Root cause: vLLM v0.20.2's KV-cache profiler measures ALL
+#     running processes' GPU footprint as the baseline on unified memory, so a
+#     35B model already loaded (~38 GB) pushes the available KV-cache budget
+#     negative at the old 0.12 fraction (14.5 GB budget < 46 GB baseline).
+#     New values give each small model a budget > (38 GB + its weights) GB.
+#   - Added --max-model-len 8192 to bge-m3, Qwen3-Embedding-4B, bge-reranker-v2-m3.
+#     Embedding models default to 40960-token context which requires a huge KV
+#     cache; 8192 is more than enough for typical document embedding workloads.
 #
 # v0.2.3  6/25/2026
 #   - Removed --chat-template-kwargs from Qwen3.6-35B-A3B serve block (requires
@@ -177,7 +188,7 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.2.3
+Version:  0.2.4
 Last Updated:  6/25/2026
 
 Update Yourself:
@@ -1210,16 +1221,16 @@ fi
 # must match here exactly, or the wrong model serve block will fire.
 
 # ─────────────────────────────────────────────────────────────────────────────
-# --gpu-memory-utilization is calibrated for the DGX Spark / GB10 UNIFIED memory
-# pool (~121 GB shared by GPU + CPU). vLLM reserves (fraction × total pool) up
-# front for weights + KV cache, so on unified memory a high fraction reserves a
-# huge slice of system RAM even for a tiny model. Each fraction below targets
-# roughly the model's real footprint (catalog VRAM_GB) plus KV headroom, so
-# several models can coexist without oversubscribing the shared pool.
-#   Rough guide on a 121 GB box:  0.10 ≈ 12 GB,  0.25 ≈ 30 GB,  0.60 ≈ 73 GB.
-# The 120B+ "Super Large" models intentionally stay near 0.93 — they genuinely
-# need almost the whole pool and are meant to run alone. On a DISCRETE GPU these
-# fractions instead mean fraction-of-VRAM; retune if you move off the Spark.
+# --gpu-memory-utilization on unified memory (DGX Spark / GB10, ~121 GB shared):
+# vLLM's KV-cache profiler measures TOTAL system GPU memory in use as the
+# baseline — this includes weights from ALL other running vLLM processes, not
+# just this one. So when a 35B model is already loaded (~38 GB), even a tiny
+# model needs a budget > (38 + its own weights) GB, i.e. utilization > 0.38.
+# That is why embedding/reranker models use 0.45-0.50 here despite being small:
+# the fraction buys enough headroom over the 35B's footprint to allow KV cache
+# allocation. These fractions "over-subscribe" the pool on paper but in practice
+# only 1-2 models are hot at a time (sleep watchdog offloads the rest to CPU).
+#   Rough guide on a 121 GB box:  0.40 ≈ 48 GB,  0.50 ≈ 61 GB,  0.75 ≈ 91 GB.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── catalog idx 0: Qwen3.6-35B-A3B-FP8  (port 8005) ──────────────────────────
@@ -1311,20 +1322,26 @@ if is_run_selected 6; then
 fi
 
 # ── catalog idx 7: BAAI/bge-m3  (port 8011) ───────────────────────────────────
+# gpu-memory-utilization is intentionally high (0.45): on unified memory vLLM's
+# KV-cache profiler includes ALL running processes' GPU footprint in the baseline,
+# so the 35B model's ~38 GB shows up here. Budget must exceed (38 + model) GB.
 if is_run_selected 7; then
     _vllm_launch 7 \
         --served-model-name "bge-m3" \
         --dtype auto \
-        --gpu-memory-utilization 0.06 \
+        --gpu-memory-utilization 0.45 \
+        --max-model-len 8192 \
         --trust-remote-code
 fi
 
 # ── catalog idx 8: Qwen3-Embedding-4B  (port 8010) ────────────────────────────
+# max-model-len capped at 8192 — model default is 40960 (enormous KV footprint).
 if is_run_selected 8; then
     _vllm_launch 8 \
         --served-model-name "Qwen3-Embedding-4B" \
         --dtype auto \
-        --gpu-memory-utilization 0.12 \
+        --gpu-memory-utilization 0.50 \
+        --max-model-len 8192 \
         --trust-remote-code
 fi
 
@@ -1333,7 +1350,8 @@ if is_run_selected 9; then
     _vllm_launch 9 \
         --served-model-name "bge-reranker-v2-m3" \
         --dtype auto \
-        --gpu-memory-utilization 0.05 \
+        --gpu-memory-utilization 0.45 \
+        --max-model-len 8192 \
         --trust-remote-code
 fi
 
@@ -1344,7 +1362,7 @@ if is_run_selected 10; then
     _vllm_launch 10 \
         --served-model-name "Qwen3-Reranker-4B" \
         --dtype auto \
-        --gpu-memory-utilization 0.12 \
+        --gpu-memory-utilization 0.50 \
         --max-model-len 10000 \
         --enable-prefix-caching \
         --max-logprobs 20 \
