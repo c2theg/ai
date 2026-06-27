@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.2.6  |  Update: 6/26/2026
+# Christopher Gray  |  Version: 0.2.8  |  Update: 6/27/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
 #   wget --no-cache -O 'install_ai_spark_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark_vllm.sh' && chmod u+x install_ai_spark_vllm.sh
+#
+# Move to DGX Spark / GB10:
+#   scp install_ai_spark_vllm.sh root@<dgx-ip>:/home/user/install_ai_spark_vllm.sh
+#   
+#   scp install_ai_spark_vllm.sh cgray@10.11.1.20:/home/cgray/install_ai_spark_vllm.sh
 #
 # Usage:
 #   ./install_ai_spark_vllm.sh              — full install: packages, docker, venv, download, serve
@@ -11,6 +16,23 @@
 #   ./install_ai_spark_vllm.sh -s           — same as --serve-only
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.2.8  6/27/2026
+#   - Sequential model startup: _vllm_launch now polls GET /v1/models after
+#     launch and blocks until the model reports ready (or 12-minute timeout).
+#     Each model fully loads before the next one starts, so later models see a
+#     stable baseline when the KV-cache profiler runs — no more OOM from racing
+#     concurrent startups. Also detects if the process dies mid-load and prints
+#     the tail of the log immediately.
+#   - Qwen3.5-9B gpu-memory-utilization raised 0.50 → 0.75 and max-model-len
+#     capped at 16384. When Nemotron-3-Nano-Omni-30B (~62 GB) is already loaded,
+#     0.75×121=90.75 GB budget leaves ~10 GB for KV cache after 9B weights.
+#
+# v0.2.7  6/26/2026
+#   - Raised Qwen3-Reranker-4B gpu-memory-utilization 0.50 → 0.55. With more
+#     models now loaded concurrently (4B/2B/9B small models), the KV-cache
+#     profiler baseline crept to ~61.2 GB — just 0.71 GB over the 60.5 GB
+#     budget at 0.50. New 0.55 budget (66.6 GB) gives ~5 GB KV headroom.
 #
 # v0.2.6  6/26/2026
 #   - Fixed HF repo IDs for small Qwen3.5 dense models: Qwen/Qwen3.5-4B-Instruct
@@ -210,8 +232,8 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.2.6
-Last Updated:  6/26/2026
+Version:  0.2.8
+Last Updated:  6/27/2026
 
 Update Yourself:
     wget --no-cache -O 'install_ai_spark_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark_vllm.sh' && chmod u+x install_ai_spark_vllm.sh
@@ -1006,15 +1028,37 @@ _vllm_launch() {
     vllm_serve "$model_path" --host 0.0.0.0 --port "$port" --enable-sleep-mode "$@" >> "$log_file" 2>&1 &
     local launch_pid=$!
     sleep 2
-    if kill -0 "$launch_pid" 2>/dev/null; then
-        echo "✅ $name started  pid=$launch_pid  port=$port"
-        echo "   → Logs  : tail -f $log_file"
-        echo "   → Status: curl -s http://localhost:${port}/v1/models | jq ."
-    else
+    if ! kill -0 "$launch_pid" 2>/dev/null; then
         echo "⚠️  $name (pid $launch_pid) exited immediately — last 30 lines of log:"
         tail -30 "$log_file" 2>/dev/null | sed 's/^/   | /'
         echo "   → Full log: cat $log_file"
+        return 1
     fi
+
+    echo "✅ $name launched  pid=$launch_pid  port=$port"
+    echo "   → Log: tail -f $log_file"
+    echo "   ⏳ Waiting for model to finish loading before starting the next one..."
+
+    local elapsed=0 timeout=720  # 12-minute max (large models take ~5-10 min)
+    while true; do
+        if ! kill -0 "$launch_pid" 2>/dev/null; then
+            echo "   ❌ $name process died during loading — last 30 lines:"
+            tail -30 "$log_file" 2>/dev/null | sed 's/^/   | /'
+            return 1
+        fi
+        if curl -sf --max-time 5 "http://localhost:${port}/v1/models" > /dev/null 2>&1; then
+            echo "   ✅ $name ready on port $port  (${elapsed}s)"
+            echo "   → Status: curl -s http://localhost:${port}/v1/models | jq ."
+            return 0
+        fi
+        if [ "$elapsed" -ge "$timeout" ]; then
+            echo "   ⚠️  $name not ready after ${timeout}s — moving on; check: tail -f $log_file"
+            return 0
+        fi
+        sleep 15
+        elapsed=$((elapsed + 15))
+        printf "   [%ds] still loading...\n" "$elapsed"
+    done
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1391,7 +1435,7 @@ if is_run_selected 10; then
     _vllm_launch 10 \
         --served-model-name "Qwen3-Reranker-4B" \
         --dtype auto \
-        --gpu-memory-utilization 0.50 \
+        --gpu-memory-utilization 0.55 \
         --max-model-len 10000 \
         --enable-prefix-caching \
         --max-logprobs 20 \
@@ -1500,12 +1544,14 @@ if is_run_selected 18; then
 fi
 
 # ── catalog idx 21: Qwen3.5-9B  (port 8015)  [1h idle-sleep] ─────────────────
+# gpu-memory-utilization 0.75: when Nemotron-3-Nano-Omni-30B (~62 GB) is the
+# co-resident model, 0.75×121=90.75 GB budget leaves ~10 GB for KV after weights.
 if is_run_selected 21; then
     _vllm_launch 21 \
         --served-model-name "Qwen3.5-9B" \
         --dtype auto \
-        --gpu-memory-utilization 0.50 \
-        --max-model-len 32768 \
+        --gpu-memory-utilization 0.75 \
+        --max-model-len 16384 \
         --enable-prefix-caching \
         --trust-remote-code \
         --enable-auto-tool-choice \
