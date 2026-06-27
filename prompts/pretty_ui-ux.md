@@ -1,3 +1,5 @@
+## Updated: 6/27/2026 | Version: 0.0.12
+
 You are updating an existing web application with a modern, production-quality web interface.
 
 Goal:
@@ -230,6 +232,8 @@ Frontend Behavior Requirements:
 * Show toast notifications for success, warning, and error messages.
 * Show clear validation messages on forms.
 * Add confirmation dialogs before destructive actions.
+* Use (https://sweetalert2.github.io/) SweetAlerts2 for all dialog / modal prompts
+* Always auto-close conformation prompt windows after 5 seconds
 * Add reusable components for cards, buttons, forms, tables, charts, modals, drawers, badges, alerts, and settings panels.
 * Make the interface feel fast and smooth.
 * Use subtle animations and transitions, but avoid anything excessive.
