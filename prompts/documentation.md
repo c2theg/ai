@@ -1,4 +1,4 @@
-## Updated: 6/28/2026 | Version: 0.0.10
+## Updated: 6/28/2026 | Version: 0.0.18
 
 
 # Add Animated Diagrams, Automation Scripts, and Weekly Documentation Updates
