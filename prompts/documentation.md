@@ -1,3 +1,6 @@
+## Updated: 6/28/2026 | Version: 0.0.10
+
+
 # Add Animated Diagrams, Automation Scripts, and Weekly Documentation Updates
 
 Update the documentation builder so it also creates visual, animated, and automatically refreshed documentation.
@@ -754,3 +757,7 @@ After implementation, provide a concise summary with:
 7. How to disable the weekly update job.
 8. Any assumptions made.
 9. Any areas that need manual review.
+
+
+Create a commandline installer script to install all needed dependances to generate the documentation markdown files, web pages, pdf's, python environments, etc. 
+Include the cronjobs needed, and generate links to documentation homepage (docs/site/index.html)
