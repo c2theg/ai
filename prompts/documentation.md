@@ -761,3 +761,5 @@ After implementation, provide a concise summary with:
 
 Create a commandline installer script to install all needed dependances to generate the documentation markdown files, web pages, pdf's, python environments, etc. 
 Include the cronjobs needed, and generate links to documentation homepage (docs/site/index.html)
+
+Update the application webpage to include a link to this documentation home page, at docs/site/index.html
