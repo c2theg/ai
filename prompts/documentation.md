@@ -763,3 +763,8 @@ Create a commandline installer script to install all needed dependances to gener
 Include the cronjobs needed, and generate links to documentation homepage (docs/site/index.html)
 
 Update the application webpage to include a link to this documentation home page, at docs/site/index.html
+
+By default, only allow this documentation to be loaded if the user is local via RFC1918 address space, or via VPN or Tailscale or other form of private addressing.  Provide a meants to disable this on a page by page basis. ie: allow Sales documentation to the public, but restrict Architecure, Development and Training to internal access only.  Include documentation on how to enable / disable this security on the architecture documentation page. 
+
+Architecture page should include security controls documentation too. 
+
