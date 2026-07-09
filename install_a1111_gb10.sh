@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 #    By: Christopher Gray
-#    Version: 0.0.6
+#    Version: 0.0.7
 #    Updated: 7/9/2026
 #
 #   Installer:
 #     curl -sSL https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_a1111_gb10.sh | bash
+#
+#   0.0.7: works when run detached (curl | bash) — guards unset BASH_SOURCE,
+#          fetches the Dockerfile itself, and fixes the apt env-prefix bug.
 #
 # install_a1111_gb10.sh — one-shot installer for Automatic1111 (Stable Diffusion
 # WebUI) on an NVIDIA DGX Spark / GB10 (arm64 + Blackwell), reachable over the LAN.
@@ -47,9 +50,30 @@ TORCH_COMMAND="${A1111_TORCH_COMMAND:-pip install torch torchvision --index-url 
 # Optional login. Empty = OPEN to everyone on the LAN. Set A1111_GRADIO_AUTH=user:pass to require a login.
 GRADIO_AUTH="${A1111_GRADIO_AUTH:-}"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "${SCRIPT_DIR}"
-DATA_DIR="${A1111_DATA_DIR:-${SCRIPT_DIR}/runtime/automatic1111}"
+# Where to fetch build files from when run detached (curl | bash) rather than
+# from a checked-out copy of the repo. The Dockerfile has no COPY/ADD, so the
+# single file IS the whole build context.
+REPO_RAW="${A1111_REPO_RAW:-https://raw.githubusercontent.com/c2theg/ai/refs/heads/main}"
+DOCKERFILE_URL="${A1111_DOCKERFILE_URL:-${REPO_RAW}/Dockerfile.automatic1111}"
+
+# Resolve our own location. Under `curl | bash` there is no script file, so
+# BASH_SOURCE is unset — guard it (set -u) and fall back to detached mode.
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+else
+  SCRIPT_DIR=""
+fi
+
+# Build context: prefer a synced checkout (Dockerfile next to this script);
+# otherwise a self-managed work dir we fetch the Dockerfile into.
+if [ -n "${SCRIPT_DIR}" ] && [ -f "${SCRIPT_DIR}/Dockerfile.automatic1111" ]; then
+  BUILD_DIR="${SCRIPT_DIR}"
+  FETCH_DOCKERFILE=0
+else
+  BUILD_DIR="${A1111_WORK_DIR:-${HOME:-/root}/.a1111-gb10}"
+  FETCH_DOCKERFILE=1
+fi
+DATA_DIR="${A1111_DATA_DIR:-${BUILD_DIR}/runtime/automatic1111}"
 
 # ──────────────────────────────── helpers ────────────────────────────────────
 c_g=$'\033[32m'; c_y=$'\033[33m'; c_r=$'\033[31m'; c_b=$'\033[1m'; c_0=$'\033[0m'
@@ -123,7 +147,9 @@ else
     | sed "s#deb https://#deb [signed-by=${KEYRING}] https://#g" \
     | ${SUDO} tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
   ${SUDO} apt-get update
-  ${SUDO} DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-container-toolkit
+  # `env` sets the var reliably whether ${SUDO} is empty (root) or 'sudo'; a bare
+  # `${SUDO} VAR=val cmd` mis-parses VAR=val as the command when ${SUDO} is empty.
+  ${SUDO} env DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-container-toolkit
   ${SUDO} nvidia-ctk runtime configure --runtime=docker
   ${SUDO} systemctl restart docker
   log "Toolkit installed and Docker restarted."
@@ -149,7 +175,17 @@ fi
 
 # ──────────────────────────────── 6. build ───────────────────────────────────
 step "6/8  Build the A1111 image (Blackwell torch) — first build takes a while"
-[ -f Dockerfile.automatic1111 ] || die "Dockerfile.automatic1111 not found in ${SCRIPT_DIR} (is the repo fully synced here?)."
+mkdir -p "${BUILD_DIR}"
+if [ "${FETCH_DOCKERFILE}" -eq 1 ]; then
+  log "Detached run — fetching Dockerfile → ${BUILD_DIR}/Dockerfile.automatic1111"
+  curl -fsSL "${DOCKERFILE_URL}" -o "${BUILD_DIR}/Dockerfile.automatic1111" \
+    || die "Could not download the Dockerfile from ${DOCKERFILE_URL}
+    (set A1111_DOCKERFILE_URL / A1111_REPO_RAW if it lives elsewhere)."
+else
+  log "Building from synced repo at ${BUILD_DIR}"
+fi
+cd "${BUILD_DIR}"
+[ -f Dockerfile.automatic1111 ] || die "Dockerfile.automatic1111 not found in ${BUILD_DIR}."
 log "base image:  ${BASE_IMAGE}"
 log "torch:       ${TORCH_COMMAND}"
 ${SUDO} docker build --pull \
@@ -188,7 +224,7 @@ ${SUDO} docker run -d \
   -v "${DATA_DIR}/models:/app/models" \
   -v "${DATA_DIR}/outputs:/app/outputs" \
   -v "${DATA_DIR}/extensions:/app/extensions" \
-  "${IMAGE}" "${extra_args[@]}" >/dev/null
+  "${IMAGE}" ${extra_args[@]+"${extra_args[@]}"} >/dev/null
 log "Container started."
 
 # ─────────────────────────────── 8. verify ───────────────────────────────────
