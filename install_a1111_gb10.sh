@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 #    By: Christopher Gray
-#    Version: 0.0.7
+#    Version: 0.0.8
 #    Updated: 7/9/2026
 #
 #   Installer:
 #     curl -sSL https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_a1111_gb10.sh | bash
 #
-#   0.0.7: works when run detached (curl | bash) — guards unset BASH_SOURCE,
-#          fetches the Dockerfile itself, and fixes the apt env-prefix bug.
+#   0.0.8: fully self-contained — embeds the Dockerfile, so a detached run needs
+#          nothing else hosted (set A1111_DOCKERFILE_URL to override).
+#   0.0.7: works when run detached (curl | bash) — guards unset BASH_SOURCE and
+#          fixes the apt env-prefix bug.
 #
 # install_a1111_gb10.sh — one-shot installer for Automatic1111 (Stable Diffusion
 # WebUI) on an NVIDIA DGX Spark / GB10 (arm64 + Blackwell), reachable over the LAN.
@@ -50,11 +52,10 @@ TORCH_COMMAND="${A1111_TORCH_COMMAND:-pip install torch torchvision --index-url 
 # Optional login. Empty = OPEN to everyone on the LAN. Set A1111_GRADIO_AUTH=user:pass to require a login.
 GRADIO_AUTH="${A1111_GRADIO_AUTH:-}"
 
-# Where to fetch build files from when run detached (curl | bash) rather than
-# from a checked-out copy of the repo. The Dockerfile has no COPY/ADD, so the
-# single file IS the whole build context.
-REPO_RAW="${A1111_REPO_RAW:-https://raw.githubusercontent.com/c2theg/ai/refs/heads/main}"
-DOCKERFILE_URL="${A1111_DOCKERFILE_URL:-${REPO_RAW}/Dockerfile.automatic1111}"
+# When run detached (curl | bash) the Dockerfile isn't on disk. By default we
+# write the copy EMBEDDED at the bottom of this script (fully self-contained —
+# nothing else to host). Set A1111_DOCKERFILE_URL to fetch it from a URL instead.
+DOCKERFILE_URL="${A1111_DOCKERFILE_URL:-}"
 
 # Resolve our own location. Under `curl | bash` there is no script file, so
 # BASH_SOURCE is unset — guard it (set -u) and fall back to detached mode.
@@ -99,6 +100,93 @@ except Exception:
 finally:
     s.close()
 PY
+}
+
+# Embedded copy of Dockerfile.automatic1111 so a detached `curl | bash` run has
+# no second file to host. KEEP IN SYNC with Dockerfile.automatic1111 in the repo
+# (the quoted heredoc means everything below is written verbatim — no expansion).
+write_dockerfile() {
+  cat > "$1" <<'__A1111_DOCKERFILE__'
+# syntax=docker/dockerfile:1.7
+#
+# Automatic1111 (Stable Diffusion WebUI), containerized. (Embedded copy — see
+# install_a1111_gb10.sh; mirror of Dockerfile.automatic1111.)
+ARG BASE_IMAGE=ubuntu:22.04
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
+    venv_dir=-
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git python3 python3-pip python-is-python3 \
+      libgl1 libglib2.0-0 libgoogle-perftools4 bc wget ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pin to a released tag so the sub-repo commit hashes are reproducible.
+WORKDIR /app
+RUN git clone https://github.com/AUTOMATIC1111/stable-diffusion-webui.git . \
+    && git checkout v1.10.1
+
+# Anonymous clone; GIT_TERMINAL_PROMPT=0 fails fast instead of hanging. Do NOT
+# set GIT_ASKPASS=/bin/true (empty creds → GitHub 404s public repos).
+ENV GIT_TERMINAL_PROMPT=0
+
+# Upstream DELETED github.com/Stability-AI/stablediffusion; w-e-w (an A1111 core
+# maintainer) mirrors it with the exact pinned commit. A1111 reads each sub-repo
+# URL from an env var, so this redirects both build-time and runtime clones.
+ENV STABLE_DIFFUSION_REPO=https://github.com/w-e-w/stablediffusion.git
+
+# Clone the pinned sub-repos explicitly (webui.sh --exit returns before the
+# clone stage). URL env-name + commit are read from launch_utils.py and honor
+# the env override above; each is fetched by exact SHA into a detached HEAD so
+# A1111's own git_clone() sees the expected HEAD and never hits the network.
+RUN python3 <<'PY'
+import os, re, subprocess
+src = open("modules/launch_utils.py").read()
+def resolve(var):
+    m = re.search(rf"{var}\s*=\s*os\.environ\.get\(\s*[\"']([^\"']+)[\"']\s*,\s*[\"']([^\"']+)[\"']", src)
+    if not m:
+        raise SystemExit(f"could not parse {var} in launch_utils.py")
+    env_name, default = m.group(1), m.group(2)
+    return os.environ.get(env_name, default)
+repos = [
+    ("stable_diffusion_repo",    "stable_diffusion_commit_hash",    "stable-diffusion-stability-ai"),
+    ("stable_diffusion_xl_repo", "stable_diffusion_xl_commit_hash", "generative-models"),
+    ("k_diffusion_repo",         "k_diffusion_commit_hash",         "k-diffusion"),
+    ("blip_repo",                "blip_commit_hash",                "BLIP"),
+    ("assets_repo",              "assets_commit_hash",              "stable-diffusion-webui-assets"),
+]
+os.makedirs("repositories", exist_ok=True)
+for url_var, hash_var, dirname in repos:
+    url, commit = resolve(url_var), resolve(hash_var)
+    dest = os.path.join("repositories", dirname)
+    print(f"==> {url} @ {commit} -> {dest}", flush=True)
+    subprocess.run(["git", "init", "-q", dest], check=True)
+    subprocess.run(["git", "-C", dest, "remote", "add", "origin", url], check=True)
+    subprocess.run(["git", "-C", dest, "fetch", "-q", "--depth=1", "origin", commit], check=True)
+    subprocess.run(["git", "-C", dest, "checkout", "-q", "FETCH_HEAD"], check=True)
+PY
+
+# TORCH_COMMAND: A1111's default targets an x86 CUDA-12.1 wheel that has no
+# arm64/Blackwell build. Pass a cu128 (or newer) wheel for the DGX Spark/GB10.
+ARG TORCH_COMMAND=""
+RUN if [ -n "$TORCH_COMMAND" ]; then export TORCH_COMMAND="$TORCH_COMMAND"; fi; \
+    ./webui.sh -f --skip-torch-cuda-test --skip-python-version-check --exit
+RUN python3 -m pip install -r requirements_versions.txt
+
+# Fail the build if the sub-repo clones didn't land.
+RUN set -eux; for repo in \
+      stable-diffusion-stability-ai generative-models k-diffusion BLIP \
+      stable-diffusion-webui-assets; do \
+      test -d "repositories/$repo/.git" || { echo "MISSING repositories/$repo — bootstrap did not complete"; exit 1; }; \
+    done
+
+VOLUME ["/app/models", "/app/outputs", "/app/extensions"]
+EXPOSE 7860
+ENTRYPOINT ["./webui.sh", "-f", "--listen", "--api", "--port", "7860"]
+__A1111_DOCKERFILE__
 }
 
 # ─────────────────────────────── 1. preflight ────────────────────────────────
@@ -177,10 +265,14 @@ fi
 step "6/8  Build the A1111 image (Blackwell torch) — first build takes a while"
 mkdir -p "${BUILD_DIR}"
 if [ "${FETCH_DOCKERFILE}" -eq 1 ]; then
-  log "Detached run — fetching Dockerfile → ${BUILD_DIR}/Dockerfile.automatic1111"
-  curl -fsSL "${DOCKERFILE_URL}" -o "${BUILD_DIR}/Dockerfile.automatic1111" \
-    || die "Could not download the Dockerfile from ${DOCKERFILE_URL}
-    (set A1111_DOCKERFILE_URL / A1111_REPO_RAW if it lives elsewhere)."
+  if [ -n "${DOCKERFILE_URL}" ]; then
+    log "Detached run — fetching Dockerfile from ${DOCKERFILE_URL}"
+    curl -fsSL "${DOCKERFILE_URL}" -o "${BUILD_DIR}/Dockerfile.automatic1111" \
+      || die "Could not download the Dockerfile from ${DOCKERFILE_URL}"
+  else
+    log "Detached run — writing embedded Dockerfile → ${BUILD_DIR}/Dockerfile.automatic1111"
+    write_dockerfile "${BUILD_DIR}/Dockerfile.automatic1111"
+  fi
 else
   log "Building from synced repo at ${BUILD_DIR}"
 fi
