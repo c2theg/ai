@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 #    By: Christopher Gray
-#    Version: 0.0.5
+#    Version: 0.0.6
 #    Updated: 7/9/2026
+#
+#   Installer:
+#     curl -sSL https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_a1111_gb10.sh | bash
+#
 # install_a1111_gb10.sh — one-shot installer for Automatic1111 (Stable Diffusion
 # WebUI) on an NVIDIA DGX Spark / GB10 (arm64 + Blackwell), reachable over the LAN.
 #
