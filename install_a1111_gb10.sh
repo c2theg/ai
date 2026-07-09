@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 #    By: Christopher Gray
-#    Version: 0.0.8
+#    Version: 0.0.9
 #    Updated: 7/9/2026
 #
 #   Installer:
 #     curl -sSL https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_a1111_gb10.sh | bash
 #
+#   0.0.9: add build-essential + python3-dev so arm64 source-only wheels
+#          (psutil, …) compile during the build.
 #   0.0.8: fully self-contained — embeds the Dockerfile, so a detached run needs
 #          nothing else hosted (set A1111_DOCKERFILE_URL to override).
 #   0.0.7: works when run detached (curl | bash) — guards unset BASH_SOURCE and
@@ -119,8 +121,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     venv_dir=-
 
+# build-essential + python3-dev: on arm64 several requirements (psutil, …) have
+# no prebuilt wheel and compile from source (needs a C toolchain + Py headers).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      git python3 python3-pip python-is-python3 \
+      git python3 python3-pip python3-dev python-is-python3 build-essential \
       libgl1 libglib2.0-0 libgoogle-perftools4 bc wget ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
