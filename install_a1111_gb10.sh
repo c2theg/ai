@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 #    By: Christopher Gray
-#    Version: 0.0.9
+#    Version: 0.1.0
 #    Updated: 7/9/2026
 #
 #   Installer:
 #     curl -sSL https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_a1111_gb10.sh | bash
 #
+#   0.1.0: seed SDXL checkpoints host-side on install (new step 7) — realistic,
+#          photorealistic, concept-art, product-render, cyberpunk. Idempotent
+#          (skips files already downloaded). Civitai's download endpoint now
+#          401s without an API key, so the three Civitai models each have a
+#          tokenless HuggingFace fallback (used when Civitai is unavailable or
+#          CIVITAI_API_TOKEN is unset). Toggle A1111_DOWNLOAD_MODELS=0, subset
+#          A1111_MODELS="realistic,cyberpunk", auth CIVITAI_API_TOKEN.
 #   0.0.9: add build-essential + python3-dev so arm64 source-only wheels
 #          (psutil, …) compile during the build.
 #   0.0.8: fully self-contained — embeds the Dockerfile, so a detached run needs
@@ -78,6 +85,35 @@ else
 fi
 DATA_DIR="${A1111_DATA_DIR:-${BUILD_DIR}/runtime/automatic1111}"
 
+# ─────────────────────────── model checkpoints ───────────────────────────────
+# On install we seed the A1111 checkpoint dir on the HOST. It has to be host-side:
+# /app/models is a bind mount, so anything baked into the image at that path is
+# shadowed at runtime. Files land in ${DATA_DIR}/models/Stable-diffusion.
+#   A1111_DOWNLOAD_MODELS=0            skip all checkpoint downloads
+#   A1111_MODELS="realistic,cyberpunk" download only these keys (default: all)
+#   CIVITAI_API_TOKEN=xxxx            attached to the Civitai-hosted checkpoints
+DOWNLOAD_MODELS="${A1111_DOWNLOAD_MODELS:-1}"
+MODELS_FILTER="${A1111_MODELS:-all}"
+CIVITAI_TOKEN="${CIVITAI_API_TOKEN:-${A1111_CIVITAI_TOKEN:-}}"
+
+# One SDXL checkpoint per requested category, as:
+#     key | primary_filename | primary_url | fallback_filename | fallback_url
+# The downloader tries the primary, then the (tokenless) fallback if the primary
+# fails. HuggingFace /resolve/ URLs are tokenless direct downloads; Civitai URLs
+# are public but its download endpoint now returns HTTP 401 without an API key —
+# so each Civitai model has a tokenless HF fallback for when Civitai is
+# unavailable or CIVITAI_API_TOKEN is unset. Set CIVITAI_API_TOKEN to get the
+# exact Civitai models instead of the fallback.
+HF_REALVIS="https://huggingface.co/SG161222/RealVisXL_V5.0/resolve/main/RealVisXL_V5.0_fp16.safetensors"
+HF_SDXL_BASE="https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors"
+CHECKPOINTS=(
+  "realistic|RealVisXL_V5.0_fp16.safetensors|${HF_REALVIS}||"
+  "photorealistic|Juggernaut-XI-byRunDiffusion.safetensors|https://huggingface.co/RunDiffusion/Juggernaut-XI-v11/resolve/main/Juggernaut-XI-byRunDiffusion.safetensors||"
+  "concept-art|artUniverse_v80SDXL.safetensors|https://civitai.com/api/download/models/2653358|sd_xl_base_1.0.safetensors|${HF_SDXL_BASE}"
+  "product-render|easyProductPhotoXL_v20.safetensors|https://civitai.com/api/download/models/434028|RealVisXL_V5.0_fp16.safetensors|${HF_REALVIS}"
+  "cyberpunk|sdxlHK_v12.safetensors|https://civitai.com/api/download/models/1654136|sd_xl_base_1.0.safetensors|${HF_SDXL_BASE}"
+)
+
 # ──────────────────────────────── helpers ────────────────────────────────────
 c_g=$'\033[32m'; c_y=$'\033[33m'; c_r=$'\033[31m'; c_b=$'\033[1m'; c_0=$'\033[0m'
 log()  { printf '%s\n' "${c_g}▶${c_0} $*"; }
@@ -102,6 +138,84 @@ except Exception:
 finally:
     s.close()
 PY
+}
+
+# Byte size of a file, portable across Linux (DGX host) and BSD/macOS.
+file_size() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || echo 0; }
+
+model_selected() {
+  # $1 = key; true when MODELS_FILTER is 'all' or its comma list contains the key.
+  [ "${MODELS_FILTER}" = "all" ] && return 0
+  case ",${MODELS_FILTER}," in *",$1,"*) return 0;; *) return 1;; esac
+}
+
+fetch_checkpoint() {
+  # $1=url  $2=dest.part  — resumable download via wget (preferred) or curl.
+  local url="$1" tmp="$2"
+  case "$url" in
+    *civitai.com*)
+      if [ -n "${CIVITAI_TOKEN}" ]; then
+        case "$url" in
+          *\?*) url="${url}&token=${CIVITAI_TOKEN}";;
+             *) url="${url}?token=${CIVITAI_TOKEN}";;
+        esac
+      fi ;;
+  esac
+  if command -v wget >/dev/null 2>&1; then
+    wget --show-progress -q -c -O "$tmp" "$url"
+  elif command -v curl >/dev/null 2>&1; then
+    curl -fL -C - -o "$tmp" "$url"
+  else
+    warn "Neither wget nor curl is installed — cannot download checkpoints."; return 1
+  fi
+}
+
+present() { [ -f "$1" ] && [ "$(file_size "$1")" -gt 1073741824 ]; }
+
+# Download one (filename,url) candidate into $dir. Echoes "ok"/"small"/"fail".
+try_candidate() {
+  local dir="$1" fname="$2" url="$3" dest="${1}/${2}" sz
+  [ -n "$fname" ] && [ -n "$url" ] || { echo "skip"; return; }
+  if present "$dest"; then echo "ok"; return; fi   # a prior category already got it
+  if fetch_checkpoint "$url" "${dest}.part"; then
+    sz="$(file_size "${dest}.part")"
+    # A redirect-to-login (e.g. Civitai 401) returns a tiny page; reject <100MB.
+    if [ "$sz" -lt 104857600 ]; then
+      warn "    got only ${sz} bytes (likely an auth redirect) — discarding ${fname}."
+      rm -f "${dest}.part"; echo "small"
+    else
+      mv -f "${dest}.part" "$dest"; log "    ${fname}: done ($((sz/1024/1024)) MB)." >&2; echo "ok"
+    fi
+  else
+    rm -f "${dest}.part"; echo "fail"
+  fi
+}
+
+download_checkpoints() {
+  local dir="${DATA_DIR}/models/Stable-diffusion"
+  mkdir -p "$dir"
+  local ok=0 skip=0 fail=0 entry key f1 u1 f2 u2 r
+  for entry in "${CHECKPOINTS[@]}"; do
+    IFS='|' read -r key f1 u1 f2 u2 <<<"$entry"
+    model_selected "$key" || continue
+    # Already have the primary or its fallback? Nothing to do.
+    if present "${dir}/${f1}" || { [ -n "$f2" ] && present "${dir}/${f2}"; }; then
+      log "✓ ${key}: already present — skipping."; skip=$((skip+1)); continue
+    fi
+    log "↓ ${key}: fetching ${f1} …"
+    r="$(try_candidate "$dir" "$f1" "$u1")"
+    if [ "$r" != "ok" ] && [ -n "$f2" ]; then
+      warn "  ${key}: primary unavailable — falling back to ${f2}"
+      r="$(try_candidate "$dir" "$f2" "$u2")"
+    fi
+    case "$r" in
+      ok) ok=$((ok+1));;
+      *)  warn "  ${key}: could not obtain a checkpoint — continuing (it just won't show in the dropdown)."; fail=$((fail+1));;
+    esac
+  done
+  log "Checkpoints: ${ok} obtained, ${skip} already present, ${fail} failed → ${dir}"
+  [ "$fail" -gt 0 ] && warn "Some checkpoints failed; A1111 still runs with whatever landed."
+  return 0
 }
 
 # Embedded copy of Dockerfile.automatic1111 so a detached `curl | bash` run has
@@ -194,7 +308,7 @@ __A1111_DOCKERFILE__
 }
 
 # ─────────────────────────────── 1. preflight ────────────────────────────────
-step "1/8  Preflight"
+step "1/9  Preflight"
 ARCH="$(uname -m)"
 if [ "${ARCH}" != "aarch64" ] && [ "${ARCH}" != "arm64" ]; then
   warn "This machine is '${ARCH}', not arm64. This script targets the DGX Spark / GB10."
@@ -215,7 +329,7 @@ else
 fi
 
 # ─────────────────────────────── 2. docker ───────────────────────────────────
-step "2/8  Docker engine"
+step "2/9  Docker engine"
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   log "Docker present: $(docker --version)"
 else
@@ -226,7 +340,7 @@ else
 fi
 
 # ──────────────────────── 3. NVIDIA Container Toolkit ─────────────────────────
-step "3/8  NVIDIA Container Toolkit"
+step "3/9  NVIDIA Container Toolkit"
 if docker info 2>/dev/null | grep -qi 'Runtimes:.*nvidia' || \
    docker info 2>/dev/null | grep -qi '"nvidia"'; then
   log "NVIDIA container runtime already wired into Docker."
@@ -248,7 +362,7 @@ else
 fi
 
 # ────────────────────────── 4. prove GPU-in-Docker ───────────────────────────
-step "4/8  Verify a container can see the GPU"
+step "4/9  Verify a container can see the GPU"
 if ${SUDO} docker run --rm --gpus all "${BASE_IMAGE}" nvidia-smi -L >/tmp/a1111_gpu_check 2>&1; then
   log "GPU visible inside containers:"; sed 's/^/    /' /tmp/a1111_gpu_check
 else
@@ -257,7 +371,7 @@ else
 fi
 
 # ─────────────────────────────── 5. firewall ─────────────────────────────────
-step "5/8  LAN firewall"
+step "5/9  LAN firewall"
 if command -v ufw >/dev/null 2>&1 && ${SUDO} ufw status 2>/dev/null | grep -qi '^Status: active'; then
   ${SUDO} ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true
   log "Opened ${PORT}/tcp in ufw."
@@ -266,7 +380,7 @@ else
 fi
 
 # ──────────────────────────────── 6. build ───────────────────────────────────
-step "6/8  Build the A1111 image (Blackwell torch) — first build takes a while"
+step "6/9  Build the A1111 image (Blackwell torch) — first build takes a while"
 mkdir -p "${BUILD_DIR}"
 if [ "${FETCH_DOCKERFILE}" -eq 1 ]; then
   if [ -n "${DOCKERFILE_URL}" ]; then
@@ -292,8 +406,18 @@ ${SUDO} docker build --pull \
   || die "Image build failed — see the error above (this is where a bad torch wheel or a network issue surfaces)."
 log "Built ${IMAGE}."
 
-# ──────────────────────────────── 7. run ─────────────────────────────────────
-step "7/8  (Re)start the container"
+# ─────────────────────────── 7. download checkpoints ─────────────────────────
+step "7/9  Seed SDXL checkpoints (host-side; skips any already downloaded)"
+if [ "${DOWNLOAD_MODELS}" != "0" ]; then
+  log "Target: ${DATA_DIR}/models/Stable-diffusion  (filter: ${MODELS_FILTER})"
+  [ -z "${CIVITAI_TOKEN}" ] && warn "CIVITAI_API_TOKEN not set — public Civitai models still work, but set it if any download comes back as an auth redirect."
+  download_checkpoints
+else
+  log "A1111_DOWNLOAD_MODELS=0 — skipping checkpoint downloads."
+fi
+
+# ──────────────────────────────── 8. run ─────────────────────────────────────
+step "8/9  (Re)start the container"
 mkdir -p "${DATA_DIR}/models" "${DATA_DIR}/outputs" "${DATA_DIR}/extensions"
 if ${SUDO} docker ps -a --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"; then
   log "Removing previous container '${CONTAINER_NAME}' …"
@@ -323,8 +447,8 @@ ${SUDO} docker run -d \
   "${IMAGE}" ${extra_args[@]+"${extra_args[@]}"} >/dev/null
 log "Container started."
 
-# ─────────────────────────────── 8. verify ───────────────────────────────────
-step "8/8  Verify (first start downloads the ~4GB default model — allow a few minutes)"
+# ─────────────────────────────── 9. verify ───────────────────────────────────
+step "9/9  Verify (allow a few minutes for the API to come up)"
 API="http://127.0.0.1:${PORT}/sdapi/v1/sd-models"
 ok=0
 for i in $(seq 1 60); do
@@ -355,6 +479,9 @@ $( [ -n "${IP}" ] && printf '  LAN:        http://%s:%s   (use this URL from oth
   Logs:       ${SUDO:+sudo }docker logs -f ${CONTAINER_NAME}
   Stop:       ${SUDO:+sudo }docker rm -f ${CONTAINER_NAME}
   Update:     re-run this script (rebuilds with --pull, recreates the container)
+  Models:     ${DATA_DIR}/models/Stable-diffusion  (drop more .safetensors here)
+              re-run with A1111_MODELS="realistic,cyberpunk" for a subset, or
+              A1111_DOWNLOAD_MODELS=0 to skip; CIVITAI_API_TOKEN for Civitai auth.
 
 ${c_b}Point the transcription app at this box${c_0} (on the app host, e.g. ai2-strixhelo):
   In the app's AI Providers page, set the Automatic1111 / image_generation
