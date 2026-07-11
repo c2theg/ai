@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 #    By: Christopher Gray
-#    Version: 0.1.0
+#    Version: 0.1.1
 #    Updated: 7/11/2026
+#
+#    This script installs the ASR sidecar on an NVIDIA DGX Spark / GB10 (arm64 + Blackwell).
+#
+#    curl -sSL https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_asr_gb10.sh | bash
 #
 #   Installer:
 #     ./install_asr_gb10.sh        (from a synced checkout — preferred)
