@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  vllm_killer.sh  |  Version: 1.1.0  |  7/11/2026
+# Christopher Gray  |  vllm_killer.sh  |  Version: 1.1.1  |  7/11/2026
 # Stop every vLLM instance (and the sleep watchdog) to free all memory and start
+#
+# Download and install:
+#   wget --no-cache -O 'vllm_killer.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/vllm_killer.sh' && chmod u+x vllm_killer.sh
+#
+#
 # from scratch. Companion to install_ai_spark_vllm.sh.
 #
 # Usage:
