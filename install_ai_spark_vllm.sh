@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.3.3  |  Update: 7/11/2026
+# Christopher Gray  |  Version: 0.3.4  |  Update: 7/11/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
@@ -37,6 +37,19 @@
 #   (interactive) or reclaims it only from a prior vLLM process (headless).
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.3.4  7/11/2026
+#   - Auto-update vLLM (AUTO_UPDATE_VLLM=true): before serving, the script checks
+#     PyPI for a newer vLLM and upgrades the venv if one is out (version-aware, so
+#     it never downgrades a local nightly). Runs in every mode; best-effort so a
+#     network error just logs and continues. Set false to pin the installed
+#     version. Motivation: NVFP4 MoE checkpoints (Qwen3.6-35B-A3B-NVFP4) fail on
+#     vLLM 0.20.2 with "KeyError: '…experts.w2_input_scale'" — newer vLLM adds the
+#     modelopt NVFP4 expert-scale support.
+#   - Failure diagnostics: _show_log_tail now extracts the real "ClassName:
+#     message" exception line (last one, minus vLLM's generic wrapper) instead of
+#     the earliest error-ish line, which had false-matched the huge INFO config
+#     dump on substrings like device_config=cuda.
 #
 # v0.3.3  7/11/2026
 #   - Qwen3-Reranker-4B is no longer pre-selected — DEFAULT_DL_INDICES and
@@ -201,7 +214,7 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.3.3
+Version:  0.3.4
 Last Updated:  7/11/2026
 
 Update Yourself:
@@ -241,6 +254,15 @@ BASE_PORT=8010
 # including --serve-only and headless --start. Set false to keep the old behavior
 # of skipping a missing model instead.
 AUTO_DOWNLOAD=true
+
+# Before serving, check PyPI for a newer vLLM and upgrade the venv if one exists.
+# Runs in every mode (including headless --start / cron). Best-effort: a network
+# error or PyPI hiccup is logged and skipped, never blocking model startup.
+# ⚠️  Trade-off: this reaches the network every run and a vLLM upgrade wheel can
+# be large/slow, so a cron @reboot start may take longer. It also means a bad
+# upstream release could regress a working stack — set false to pin the installed
+# version once you have one that works (e.g. after NVFP4 support lands).
+AUTO_UPDATE_VLLM=true
 
 # =============================================
 # OPTIONAL FEATURES — toggle on/off
@@ -1037,6 +1059,69 @@ _check_vram() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# vLLM AUTO-UPDATE — upgrade the venv's vLLM to the latest PyPI release if newer.
+# Best-effort: never fails the run. Called once VENV_DIR is known (all modes).
+# ─────────────────────────────────────────────────────────────────────────────
+_maybe_update_vllm() {
+    [ "${AUTO_UPDATE_VLLM:-true}" = "true" ] || return 0
+    local py="$VENV_DIR/bin/python" pip="$VENV_DIR/bin/pip"
+    if [ ! -x "$py" ] || [ ! -x "$pip" ]; then
+        echo "ℹ️  vLLM auto-update skipped — venv python/pip not found under $VENV_DIR"
+        return 0
+    fi
+
+    echo "--- Checking for a newer vLLM (AUTO_UPDATE_VLLM=true) ---"
+    local cur
+    cur=$("$py" -c 'import vllm; print(vllm.__version__)' 2>/dev/null)
+    if [ -z "$cur" ]; then
+        echo "⚠️  vllm not importable in the venv — installing the latest release…"
+        "$pip" install -U vllm 2>&1 | tail -4
+        "$py" -c 'import vllm; print("✅ vllm installed:", vllm.__version__)' 2>/dev/null \
+            || echo "❌ vllm still not importable — check the pip output above."
+        return 0
+    fi
+
+    # Latest stable version from PyPI (jq preferred; grep fallback). Best-effort.
+    local latest pypi_json
+    pypi_json=$(curl -sf --max-time 8 https://pypi.org/pypi/vllm/json 2>/dev/null)
+    if [ -n "$pypi_json" ]; then
+        if command -v jq >/dev/null 2>&1; then
+            latest=$(printf '%s' "$pypi_json" | jq -r '.info.version' 2>/dev/null)
+        else
+            latest=$(printf '%s' "$pypi_json" \
+                | grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 \
+                | sed -E 's/.*"([^"]*)"$/\1/')
+        fi
+    fi
+    # Fallback to pip's own index query if PyPI JSON was unreachable.
+    [ -z "${latest:-}" ] && latest=$("$pip" index versions vllm 2>/dev/null \
+        | sed -n 's/.*LATEST:[[:space:]]*//p' | head -1)
+
+    if [ -z "${latest:-}" ]; then
+        echo "ℹ️  vLLM $cur installed — couldn't reach PyPI to check for updates; keeping current."
+        return 0
+    fi
+
+    # Upgrade only if $latest is strictly newer than $cur (version-aware sort), so
+    # a locally-installed nightly is never downgraded to the PyPI stable.
+    local newest
+    newest=$(printf '%s\n%s\n' "$cur" "$latest" | sort -V 2>/dev/null | tail -1)
+    if [ "$cur" = "$latest" ] || [ "$newest" = "$cur" ]; then
+        echo "✅ vLLM is up to date ($cur; PyPI latest $latest)."
+        return 0
+    fi
+
+    echo "⬆️  vLLM $cur → $latest available — upgrading…"
+    if "$pip" install -U vllm 2>&1 | tail -4; then
+        local new
+        new=$("$py" -c 'import vllm; print(vllm.__version__)' 2>/dev/null)
+        echo "✅ vLLM upgraded to ${new:-$latest}."
+    else
+        echo "⚠️  vLLM upgrade failed — continuing with $cur."
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # STEP 1 — Select models to download  (skipped in --serve-only mode)
 # ─────────────────────────────────────────────────────────────────────────────
 DL_SELECTED=()
@@ -1263,6 +1348,10 @@ else
     echo "✅ All selected models downloaded to $MODELS_DIR"
 fi  # end SERVE_ONLY check
 
+# Upgrade vLLM if a newer release is out (best-effort; VENV_DIR is set by now in
+# both full-install and --serve-only/headless modes).
+_maybe_update_vllm
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SERVE selected models with vLLM
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1315,10 +1404,20 @@ _show_log_tail() {
     local log_file="$1" n="${2:-60}"
     tail -"$n" "$log_file" 2>/dev/null | sed 's/^/   | /'
     local rc
-    rc=$(grep -niE 'error|exception|traceback|out of memory|no such|not supported|unsupported|assert|no available memory|KeyError|ValueError|RuntimeError|OSError|CUDA' \
-         "$log_file" 2>/dev/null | grep -viE 'stack trace|during handling|self\.|return ' | head -6)
+    # Primary: real raised-exception lines ("ClassName: message"), minus vLLM's
+    # generic wrapper and traceback frames. The LAST such line is usually the true
+    # cause — EngineCore raises it before the APIServer's "Engine core
+    # initialization failed. See root cause above" wrapper. Matching the
+    # "Error:/Exception:" signature also skips the huge INFO config dump (which
+    # otherwise false-matches on substrings like device_config=cuda).
+    rc=$(grep -aE '[A-Za-z_][A-Za-z0-9_.]*(Error|Exception): ' "$log_file" 2>/dev/null \
+         | grep -avE 'File "|Engine core initialization failed|See root cause above' \
+         | tail -3)
+    # Fallback: broad phrase grep if no clean exception line was found.
+    [ -z "$rc" ] && rc=$(grep -aiE 'out of memory|not supported|unsupported|no kernel|no such file|assertion|is not implemented|failed to' \
+         "$log_file" 2>/dev/null | grep -avE 'INFO |DEBUG |File "' | tail -3)
     if [ -n "$rc" ]; then
-        echo "   ── likely root cause (earliest error lines in the full log) ──"
+        echo "   ── likely root cause (exception lines from the full log) ──"
         printf '%s\n' "$rc" | sed 's/^/   » /'
     fi
     echo "   → Full log: cat $log_file"
