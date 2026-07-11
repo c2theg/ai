@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.2.8  |  Update: 6/27/2026
+# Christopher Gray  |  Version: 0.3.0  |  Update: 7/11/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
@@ -15,7 +15,51 @@
 #   ./install_ai_spark_vllm.sh --serve-only — skip install/download; jump straight to model serve
 #   ./install_ai_spark_vllm.sh -s           — same as --serve-only
 #
+#   Headless / boot-time serving (no prompts — safe for cron):
+#   ./install_ai_spark_vllm.sh --start <spec>        — start 1+ models non-interactively
+#       <spec> = model[:port][,model[:port]...]      — model = local dir name, HF repo id,
+#                                                      or catalog index; port overrides the
+#                                                      catalog default. --start is repeatable.
+#       e.g.  --start Qwen3.6-35B-A3B-NVFP4
+#             --start "Qwen3.6-35B-A3B-NVFP4:9000,Qwen3-Reranker-4B"
+#   ./install_ai_spark_vllm.sh --install-cron <spec> — install an @reboot crontab entry that
+#                                                      runs --start <spec> at every boot
+#   ./install_ai_spark_vllm.sh --remove-cron         — remove that @reboot entry
+#   ./install_ai_spark_vllm.sh --list-models         — print the servable-model catalog and exit
+#
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.3.0  7/11/2026
+#   - Added nvidia/Qwen3.6-35B-A3B-NVFP4  (catalog idx 22, port 8016, ~22 GB)
+#     and unsloth/Qwen3.6-35B-A3B-NVFP4-Fast (catalog idx 23, port 8017, ~22 GB).
+#     NVFP4 (4-bit) halves the FP8 footprint — both use --quantization modelopt_fp4.
+#   - Headless startup mode: --start "model[:port],..." serves 1+ models with NO
+#     prompts (skips install, menus, memory prompts, docker containers, OpenWebUI).
+#     Models are matched by local dir name, HF repo id, or catalog index; an
+#     optional :port overrides the catalog port. Designed for cron @reboot.
+#   - --install-cron <spec> writes the @reboot crontab entry for you (and
+#     --remove-cron deletes it). --list-models prints the catalog and exits.
+#   - REFACTOR: replaced the ~280 lines of per-index `if is_run_selected N`
+#     serve blocks with one _serve_model() dispatching on the HF repo id, plus a
+#     single loop over RUN_SELECTED. Serve args can no longer silently mis-map
+#     when catalog indices shift (the v0.1.5 bug class is now impossible).
+#   - BUGFIX (found during refactor): Qwen3.5-9B is really catalog idx 19 (its
+#     _add line sits before the two appended ASR entries), but its serve block
+#     checked idx 21 — so selecting 9B launched NOTHING, and selecting
+#     Qwen3-ASR-1.7B (really idx 21) launched the 9B serve args. Fixed
+#     automatically by the repo-id dispatch above.
+#   - _vllm_launch: readiness poll now hits /health (cheaper than /v1/models)
+#     every 5s instead of every 15s, printing progress every 30s — small models
+#     become ready up to ~14s sooner; log noise unchanged.
+#   - _kill_vllm_processes now also kills a previous run's sleep_watchdog.sh so
+#     watchdogs no longer stack across restarts.
+#   - Removed dead helpers is_dl_selected/is_run_selected (unused after refactor).
+#
+# v0.2.9  6/27/2026
+#   - Per-model sleep prompt: replaced the single "Standard models timeout"
+#     prompt with a prompt for every selected servable model. Default shown in
+#     brackets is the catalog SLEEP_MIN override if set, else IDLE_SLEEP_MINUTES.
+#     User can set a different idle-sleep timeout for each model before serving.
 #
 # v0.2.8  6/27/2026
 #   - Sequential model startup: _vllm_launch now polls GET /v1/models after
@@ -212,9 +256,40 @@
 # [ cond ] && action patterns and || true guards that conflict with -e.
 set -uo pipefail
 
+# ─── argument parsing ─────────────────────────────────────────────────────────
 SERVE_ONLY=0
-[ "${1:-}" = "--serve-only" ] && SERVE_ONLY=1
-[ "${1:-}" = "-s"           ] && SERVE_ONLY=1
+HEADLESS=0        # set by --start: non-interactive serve of START_SPECS, then exit
+LIST_MODELS=0
+START_SPECS=""    # comma-separated model[:port] specs collected from --start
+CRON_ACTION=""    # install | remove
+CRON_SPEC=""
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --serve-only|-s) SERVE_ONLY=1 ;;
+        --start)
+            [ "$#" -ge 2 ] || { echo "❌ --start needs a model spec, e.g. --start 'Model:8016,Model2'"; exit 1; }
+            shift; START_SPECS="${START_SPECS:+$START_SPECS,}$1" ;;
+        --start=*)       START_SPECS="${START_SPECS:+$START_SPECS,}${1#--start=}" ;;
+        --install-cron)
+            [ "$#" -ge 2 ] || { echo "❌ --install-cron needs a model spec, e.g. --install-cron 'Model:8016'"; exit 1; }
+            shift; CRON_ACTION="install"; CRON_SPEC="$1" ;;
+        --install-cron=*) CRON_ACTION="install"; CRON_SPEC="${1#--install-cron=}" ;;
+        --remove-cron)   CRON_ACTION="remove" ;;
+        --list-models)   LIST_MODELS=1 ;;
+        -h|--help)
+            # Print the Usage block from the header (stop at the first Changelog line).
+            sed -n '/^# Usage:/,$p' "$0" | sed -n '1,/^# ── Changelog/p' | sed '$d' | sed 's/^# \{0,1\}//'
+            exit 0 ;;
+        *) echo "⚠️  Unknown argument: $1 (see --help)" ;;
+    esac
+    shift
+done
+
+if [ -n "$START_SPECS" ]; then
+    HEADLESS=1
+    SERVE_ONLY=1   # headless mode never installs or downloads
+fi
 
 echo "
 
@@ -232,8 +307,8 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.2.8
-Last Updated:  6/27/2026
+Version:  0.3.0
+Last Updated:  7/11/2026
 
 Update Yourself:
     wget --no-cache -O 'install_ai_spark_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark_vllm.sh' && chmod u+x install_ai_spark_vllm.sh
@@ -413,6 +488,14 @@ _add "nvidia/nemotron-3.5-asr-streaming-0.6b" "nemotron-3.5-asr-streaming-0.6b" 
 # the serve menu and can be selected like any other model.
 _add "Qwen/Qwen3-ASR-1.7B"           "Qwen3-ASR-1.7B"       "Qwen3-ASR-1.7B (ASR, served)"            4    5   8014  "ASR"
 
+# ── Qwen3.6-35B-A3B NVFP4 quantizations (added v0.3.0) ────────────────────────
+# NVFP4 is ~4-bit: ~20 GB weights vs ~35 GB for the FP8 build at idx 0.
+# https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4
+# https://huggingface.co/unsloth/Qwen3.6-35B-A3B-NVFP4-Fast
+#        HF Repo                                Local Dir                       Display Name                              Disk VRAM  Port  Category
+_add "nvidia/Qwen3.6-35B-A3B-NVFP4"          "Qwen3.6-35B-A3B-NVFP4"        "Qwen3.6-35B-A3B (NVFP4, nvidia)"         20   22   8016  "General"
+_add "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast"    "Qwen3.6-35B-A3B-NVFP4-Fast"   "Qwen3.6-35B-A3B (NVFP4-Fast, unsloth)"   20   22   8017  "General"
+
 MODEL_TOTAL=${#MDL_HF[@]}
 
 # ── Default pre-selected models ────────────────────────────────────────────────
@@ -420,6 +503,118 @@ MODEL_TOTAL=${#MDL_HF[@]}
 # Users can deselect it in the interactive menus below.
 DEFAULT_DL_INDICES=(10)
 DEFAULT_SERVE_INDICES=(10)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HEADLESS HELPERS — model resolution, catalog listing, @reboot cron management
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Resolve a user-supplied model reference to a catalog index (echoed on stdout).
+# Accepts: catalog index, local dir name, full HF repo id, or the repo basename.
+# Matching is case-insensitive. Returns 1 if not found or not servable (PORT=0).
+_resolve_model() {
+    local q="$1" i lq dir_lc hf_lc
+    if [[ "$q" =~ ^[0-9]+$ ]]; then
+        [ "$q" -lt "$MODEL_TOTAL" ] && [ "${MDL_PORT[$q]}" != "0" ] && { echo "$q"; return 0; }
+        return 1
+    fi
+    lq="$(printf '%s' "$q" | tr '[:upper:]' '[:lower:]')"
+    for i in $(seq 0 $((MODEL_TOTAL - 1))); do
+        [ "${MDL_PORT[$i]}" = "0" ] && continue
+        dir_lc="$(printf '%s' "${MDL_DIR[$i]}" | tr '[:upper:]' '[:lower:]')"
+        hf_lc="$(printf '%s' "${MDL_HF[$i]}"  | tr '[:upper:]' '[:lower:]')"
+        if [ "$lq" = "$dir_lc" ] || [ "$lq" = "$hf_lc" ] || [ "$lq" = "${hf_lc##*/}" ]; then
+            echo "$i"; return 0
+        fi
+    done
+    return 1
+}
+
+# Print every servable model (PORT != 0) — the names accepted by --start.
+_list_servable_models() {
+    echo ""
+    printf "  %-4s  %-42s  %-52s  %5s  %6s\n" "Idx" "Name for --start (local dir)" "HF repo" "Port" "VRAM"
+    printf "  %-4s  %-42s  %-52s  %5s  %6s\n" "---" "----------------------------" "-------" "----" "----"
+    local i
+    for i in $(seq 0 $((MODEL_TOTAL - 1))); do
+        [ "${MDL_PORT[$i]}" = "0" ] && continue
+        printf "  %-4d  %-42s  %-52s  %5s  %3d GB\n" \
+            "$i" "${MDL_DIR[$i]}" "${MDL_HF[$i]}" "${MDL_PORT[$i]}" "${MDL_VRAM[$i]}"
+    done
+    echo ""
+}
+
+# Parse a "model[:port],model[:port],..." spec into RUN_SELECTED, applying any
+# per-model port overrides directly to MDL_PORT so logs / watchdog / status all
+# see the overridden port. Exits with the catalog listed on any bad entry.
+_resolve_start_specs() {
+    local spec="$1" part m p idx
+    local -a parts
+    IFS=',' read -ra parts <<< "$spec"
+    for part in "${parts[@]}"; do
+        part="${part//[[:space:]]/}"
+        [ -z "$part" ] && continue
+        m="${part%%:*}"; p=""
+        [[ "$part" == *:* ]] && p="${part##*:}"
+        if ! idx=$(_resolve_model "$m"); then
+            echo "❌ Unknown or non-servable model: '$m'"
+            echo "   Use one of the names below (or a catalog index):"
+            _list_servable_models
+            exit 1
+        fi
+        if [ -n "$p" ]; then
+            [[ "$p" =~ ^[0-9]+$ ]] || { echo "❌ Invalid port '$p' for model '$m'"; exit 1; }
+            MDL_PORT[$idx]="$p"
+        fi
+        RUN_SELECTED+=("$idx")
+        echo "  ✅ --start: ${MDL_NAME[$idx]}  →  port ${MDL_PORT[$idx]}"
+    done
+    [ "${#RUN_SELECTED[@]}" -eq 0 ] && { echo "❌ --start: no models resolved from '$spec'"; exit 1; }
+}
+
+# Install/replace the @reboot crontab entry that re-launches models at boot.
+# The 60s sleep gives the network / GPU driver time to come up; adjust if needed.
+_install_boot_cron() {
+    local spec="$1"
+    # Validate the whole spec first — do not write a broken crontab entry.
+    local -a parts; local part m p
+    IFS=',' read -ra parts <<< "$spec"
+    for part in "${parts[@]}"; do
+        part="${part//[[:space:]]/}"
+        [ -z "$part" ] && continue
+        m="${part%%:*}"; p=""
+        [[ "$part" == *:* ]] && p="${part##*:}"
+        _resolve_model "$m" >/dev/null || { echo "❌ Unknown model '$m' in cron spec:"; _list_servable_models; exit 1; }
+        [ -n "$p" ] && ! [[ "$p" =~ ^[0-9]+$ ]] && { echo "❌ Invalid port '$p' for '$m'"; exit 1; }
+    done
+
+    local script_path="$SCRIPT_DIR/$(basename "$0")"
+    local cron_line="@reboot sleep 60 && mkdir -p '$BASE_DIR/logs' && '$script_path' --start '$spec' >> '$BASE_DIR/logs/startup_vllm.log' 2>&1"
+    ( crontab -l 2>/dev/null | grep -vE "$(basename "$0")' --start" ; echo "$cron_line" ) | crontab -
+    echo "✅ @reboot cron entry installed:"
+    echo "   $cron_line"
+    echo "   Boot log: $BASE_DIR/logs/startup_vllm.log"
+    echo "   Remove with: $0 --remove-cron"
+}
+
+_remove_boot_cron() {
+    if crontab -l 2>/dev/null | grep -qE "$(basename "$0")' --start"; then
+        crontab -l 2>/dev/null | grep -vE "$(basename "$0")' --start" | crontab -
+        echo "✅ @reboot vLLM startup cron entry removed."
+    else
+        echo "ℹ️  No @reboot vLLM startup cron entry found — nothing to remove."
+    fi
+}
+
+# ── One-shot actions: list catalog / manage cron, then exit ──────────────────
+if [ "$LIST_MODELS" -eq 1 ]; then
+    _list_servable_models
+    exit 0
+fi
+if [ "$CRON_ACTION" = "install" ]; then
+    _install_boot_cron "$CRON_SPEC"; exit 0
+elif [ "$CRON_ACTION" = "remove" ]; then
+    _remove_boot_cron; exit 0
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STATUS SNAPSHOT — memory utilization + models currently live in vLLM
@@ -665,6 +860,8 @@ _kill_vllm_processes() {
     pkill -9 -f "vllm.entrypoints"  2>/dev/null || true
     pkill -9 -f "VLLM::EngineCore"  2>/dev/null || true
     pkill -9 -f "vllm.engine"       2>/dev/null || true
+    # Also stop a previous run's sleep watchdog so watchdogs don't stack.
+    pkill -f "sleep_watchdog.sh"    2>/dev/null || true
 }
 
 # Ask whether to shut down a previous run's still-loaded models before the memory
@@ -749,9 +946,6 @@ _check_vram() {
     echo "  ─────────────────────────────────────────────────────────"
 }
 
-is_dl_selected()  { for i in "${DL_SELECTED[@]}";  do [ "$i" = "$1" ] && return 0; done; return 1; }
-is_run_selected() { for i in "${RUN_SELECTED[@]}"; do [ "$i" = "$1" ] && return 0; done; return 1; }
-
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 1 — Select models to download  (skipped in --serve-only mode)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -770,22 +964,30 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 2 — Select models to serve
 # ─────────────────────────────────────────────────────────────────────────────
-echo ""
-echo "════════════════════════════════════════════════════════════════════"
-if [ "$SERVE_ONLY" -eq 0 ]; then
-    echo "  STEP 2 of 2 — Select models to SERVE with vLLM"
-else
-    echo "  Select models to SERVE with vLLM"
-fi
-echo "  (ASR/NeMo models are download-only and excluded from this list)"
-echo "════════════════════════════════════════════════════════════════════"
 RUN_SELECTED=()
-_checkbox_menu "Models to serve with vLLM (toggle with numbers, d=done):" "true" RUN_SELECTED DEFAULT_SERVE_INDICES
+if [ "$HEADLESS" -eq 1 ]; then
+    echo ""
+    echo "════════════════════════════════════════════════════════════════════"
+    echo "  HEADLESS MODE (--start) — no prompts, serving requested models"
+    echo "════════════════════════════════════════════════════════════════════"
+    _resolve_start_specs "$START_SPECS"
+else
+    echo ""
+    echo "════════════════════════════════════════════════════════════════════"
+    if [ "$SERVE_ONLY" -eq 0 ]; then
+        echo "  STEP 2 of 2 — Select models to SERVE with vLLM"
+    else
+        echo "  Select models to SERVE with vLLM"
+    fi
+    echo "  (ASR/NeMo models are download-only and excluded from this list)"
+    echo "════════════════════════════════════════════════════════════════════"
+    _checkbox_menu "Models to serve with vLLM (toggle with numbers, d=done):" "true" RUN_SELECTED DEFAULT_SERVE_INDICES
 
-# Offer to free a previous run's models before measuring available memory.
-_maybe_shutdown_existing_models
+    # Offer to free a previous run's models before measuring available memory.
+    _maybe_shutdown_existing_models
 
-_check_vram
+    _check_vram
+fi
 
 echo ""
 [ "$SERVE_ONLY" -eq 0 ] && echo "  Download : ${#DL_SELECTED[@]} model(s) selected"
@@ -793,44 +995,49 @@ echo "  Serve    : ${#RUN_SELECTED[@]} model(s) selected"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STANDARD-MODEL SLEEP TIMEOUT — prompt before serving, default STANDARD_SLEEP_MINUTES
-# Standard models offload to CPU after N idle minutes (auto-wake on next request).
-# Only asked when at least one servable Standard model is queued to serve.
+# PER-MODEL IDLE-SLEEP TIMEOUT — prompt for each selected servable model
+# Models offload weights to CPU after N idle minutes (auto-wake on next request).
+# Default shown in brackets: catalog SLEEP_MIN override if set, else IDLE_SLEEP_MINUTES.
 # ─────────────────────────────────────────────────────────────────────────────
-_std_servable_selected=0
+_has_servable=0
 for _idx in "${RUN_SELECTED[@]}"; do
     [ "${MDL_PORT[$_idx]}" = "0" ] && continue
-    for _s in "${STANDARD_INDICES[@]}"; do
-        [ "$_idx" = "$_s" ] && _std_servable_selected=1 && break
-    done
-    [ "$_std_servable_selected" = "1" ] && break
+    _has_servable=1; break
 done
 
-if [ "$_std_servable_selected" = "1" ]; then
-    echo "  ── Standard-model idle-sleep timeout ────────────────────────────"
-    echo "  Standard models offload to CPU after N idle minutes, then auto-wake"
-    echo "  on the next request."
-    printf "  Timeout in minutes [default %s, 0 = never sleep]: " "$STANDARD_SLEEP_MINUTES"
-    read -r _std_sleep_input
-
-    if [ -z "$_std_sleep_input" ]; then
-        _std_sleep_val="$STANDARD_SLEEP_MINUTES"
-    elif [[ "$_std_sleep_input" =~ ^[0-9]+$ ]]; then
-        _std_sleep_val="$_std_sleep_input"
-    else
-        echo "  ⚠️  '$_std_sleep_input' is not a number — using default ${STANDARD_SLEEP_MINUTES} min."
-        _std_sleep_val="$STANDARD_SLEEP_MINUTES"
-    fi
-
-    for _s in "${STANDARD_INDICES[@]}"; do
-        MDL_SLEEP[$_s]="$_std_sleep_val"
+# Headless mode: never prompt — each model keeps its catalog SLEEP_MIN override,
+# or falls back to the global IDLE_SLEEP_MINUTES (handled by the watchdog setup).
+if [ "$_has_servable" = "1" ] && [ "$HEADLESS" -eq 0 ]; then
+    echo "  ── Per-model idle-sleep timeout ─────────────────────────────────"
+    echo "  Each model offloads weights to CPU after N idle minutes, then"
+    echo "  auto-wakes on the next request.  Press Enter to accept the default."
+    echo ""
+    for _idx in "${RUN_SELECTED[@]}"; do
+        [ "${MDL_PORT[$_idx]}" = "0" ] && continue
+        _default="${MDL_SLEEP[$_idx]:-$IDLE_SLEEP_MINUTES}"
+        [ -z "$_default" ] && _default=0
+        printf "  %-48s [default %s min, 0=never]: " "${MDL_NAME[$_idx]}" "$_default"
+        read -r _sleep_input
+        if [ -z "$_sleep_input" ]; then
+            MDL_SLEEP[$_idx]="$_default"
+        elif [[ "$_sleep_input" =~ ^[0-9]+$ ]]; then
+            MDL_SLEEP[$_idx]="$_sleep_input"
+        else
+            echo "  ⚠️  Invalid — using default ${_default} min."
+            MDL_SLEEP[$_idx]="$_default"
+        fi
     done
-
-    if [ "$_std_sleep_val" -eq 0 ]; then
-        echo "  ✅ Standard models will never auto-sleep."
-    else
-        echo "  ✅ Standard models will idle-sleep after ${_std_sleep_val} min."
-    fi
+    echo ""
+    echo "  Sleep timeouts confirmed:"
+    for _idx in "${RUN_SELECTED[@]}"; do
+        [ "${MDL_PORT[$_idx]}" = "0" ] && continue
+        _mins="${MDL_SLEEP[$_idx]:-0}"
+        if [ "$_mins" -eq 0 ] 2>/dev/null; then
+            printf "    %-48s : never\n" "${MDL_NAME[$_idx]}"
+        else
+            printf "    %-48s : %d min\n" "${MDL_NAME[$_idx]}" "$_mins"
+        fi
+    done
     echo "  ─────────────────────────────────────────────────────────────────"
     echo ""
 fi
@@ -1039,14 +1246,18 @@ _vllm_launch() {
     echo "   → Log: tail -f $log_file"
     echo "   ⏳ Waiting for model to finish loading before starting the next one..."
 
-    local elapsed=0 timeout=720  # 12-minute max (large models take ~5-10 min)
+    # Poll every 5s (was 15s) so small models are detected ready up to ~14s
+    # sooner; print progress only every 30s so the log stays as quiet as before.
+    # /health is cheaper than /v1/models and returns 200 once the engine is up.
+    local elapsed=0 timeout=720 poll=5  # 12-minute max (large models take ~5-10 min)
     while true; do
         if ! kill -0 "$launch_pid" 2>/dev/null; then
             echo "   ❌ $name process died during loading — last 30 lines:"
             tail -30 "$log_file" 2>/dev/null | sed 's/^/   | /'
             return 1
         fi
-        if curl -sf --max-time 5 "http://localhost:${port}/v1/models" > /dev/null 2>&1; then
+        if curl -sf --max-time 5 "http://localhost:${port}/health" > /dev/null 2>&1 || \
+           curl -sf --max-time 5 "http://localhost:${port}/v1/models" > /dev/null 2>&1; then
             echo "   ✅ $name ready on port $port  (${elapsed}s)"
             echo "   → Status: curl -s http://localhost:${port}/v1/models | jq ."
             return 0
@@ -1055,9 +1266,9 @@ _vllm_launch() {
             echo "   ⚠️  $name not ready after ${timeout}s — moving on; check: tail -f $log_file"
             return 0
         fi
-        sleep 15
-        elapsed=$((elapsed + 15))
-        printf "   [%ds] still loading...\n" "$elapsed"
+        sleep "$poll"
+        elapsed=$((elapsed + poll))
+        [ $((elapsed % 30)) -eq 0 ] && printf "   [%ds] still loading...\n" "$elapsed"
     done
 }
 
@@ -1066,6 +1277,23 @@ _vllm_launch() {
 # Args: one "port:idle_seconds" pair per model to watch. The idle threshold is
 #       per-port, so models can carry different sleep timeouts (catalog SLEEP_MIN).
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Build _WATCH_PAIRS ("port:idle_seconds") from RUN_SELECTED. Each model uses its
+# MDL_SLEEP value (catalog override or the runtime-prompted value), falling back
+# to the global IDLE_SLEEP_MINUTES; models with an effective 0 are skipped.
+_build_watch_pairs() {
+    _WATCH_PAIRS=()
+    local _idx _p _mins
+    for _idx in "${RUN_SELECTED[@]}"; do
+        _p="${MDL_PORT[$_idx]}"
+        [ "$_p" = "0" ] && continue
+        _mins="${MDL_SLEEP[$_idx]:-}"
+        [ -z "$_mins" ] && _mins="$IDLE_SLEEP_MINUTES"
+        [ "$_mins" -gt 0 ] 2>/dev/null || continue
+        _WATCH_PAIRS+=("${_p}:$((_mins * 60))")
+    done
+}
+
 _start_sleep_watchdog() {
     local -a watch_pairs=("$@")
     [ "${#watch_pairs[@]}" -eq 0 ] && return 0
@@ -1266,13 +1494,17 @@ QDRANT_MAINT_EOF
     echo "   Maintain: $QDRANT_DATA_DIR/qdrant_maintain.sh"
 }
 
-echo "--- Clean start: killing all vLLM processes and removing old logs ---"
-docker stop open-webui searxng qdrant 2>/dev/null || true
-docker rm   open-webui searxng qdrant 2>/dev/null || true
-_kill_vllm_processes
-sleep 3
-rm -f "$VLLM_LOGS"/vllm-*.log
-echo "✅ Old vLLM processes killed and logs cleared"
+# Headless mode is additive: it must not kill models/containers another run (or
+# another cron entry) already started, so the clean start only runs interactively.
+if [ "$HEADLESS" -eq 0 ]; then
+    echo "--- Clean start: killing all vLLM processes and removing old logs ---"
+    docker stop open-webui searxng qdrant 2>/dev/null || true
+    docker rm   open-webui searxng qdrant 2>/dev/null || true
+    _kill_vllm_processes
+    sleep 3
+    rm -f "$VLLM_LOGS"/vllm-*.log
+    echo "✅ Old vLLM processes killed and logs cleared"
+fi
 
 export TORCH_FLOAT32_MATMUL_PRECISION=high
 
@@ -1289,10 +1521,6 @@ else
     echo "  ─────────────────────────────────────────────────────────────────"
 fi
 
-# NOTE: is_run_selected checks the actual catalog index stored in RUN_SELECTED.
-# Catalog indices are assigned by _add() in order of appearance above — they
-# must match here exactly, or the wrong model serve block will fire.
-
 # ─────────────────────────────────────────────────────────────────────────────
 # --gpu-memory-utilization on unified memory (DGX Spark / GB10, ~121 GB shared):
 # vLLM's KV-cache profiler measures TOTAL system GPU memory in use as the
@@ -1306,269 +1534,311 @@ fi
 #   Rough guide on a 121 GB box:  0.40 ≈ 48 GB,  0.50 ≈ 61 GB,  0.75 ≈ 91 GB.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── catalog idx 0: Qwen3.6-35B-A3B-FP8  (port 8005) ──────────────────────────
-if is_run_selected 0; then
-    _vllm_launch 0 \
-        --served-model-name "Qwen3.6-35B-A3B" \
-        --dtype auto \
-        --gpu-memory-utilization 0.40 \
-        --max-model-len 32768 \
-        --enable-prefix-caching \
-        --trust-remote-code \
-        --enable-auto-tool-choice \
-        --tool-call-parser hermes
-fi
-
-# ── catalog idx 1: NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4  (port 8006) ─────────
-if is_run_selected 1; then
-    _vllm_launch 1 \
-        --served-model-name "Nemotron-3-Nano-30B-NVFP4" \
-        --dtype auto \
-        --quantization modelopt_fp4 \
-        --gpu-memory-utilization 0.20 \
-        --max-model-len 32768 \
-        --max-num-seqs 178 \
-        --enable-prefix-caching \
-        --trust-remote-code \
-        --enable-auto-tool-choice \
-        --tool-call-parser hermes
-fi
-
-# ── catalog idx 2: Qwen3-Coder-30B-A3B-Instruct  (port 8001) ─────────────────
-if is_run_selected 2; then
-    _vllm_launch 2 \
-        --served-model-name "Qwen3-Coder-30B" \
-        --dtype auto \
-        --gpu-memory-utilization 0.62 \
-        --max-model-len 32768 \
-        --enable-prefix-caching \
-        --trust-remote-code
-fi
-
-# ── catalog idx 3: DeepSeek-R1-Distill-Qwen-32B  (port 8002) ─────────────────
-if is_run_selected 3; then
-    _vllm_launch 3 \
-        --served-model-name "DeepSeek-R1-Distill-Qwen-32B" \
-        --dtype auto \
-        --gpu-memory-utilization 0.65 \
-        --max-model-len 32768 \
-        --enable-prefix-caching \
-        --trust-remote-code
-fi
-
-# ── catalog idx 4: gemma-4-31B-it  (port 8009) ────────────────────────────────
-if is_run_selected 4; then
-    _vllm_launch 4 \
-        --served-model-name "gemma-4-31B" \
-        --dtype auto \
-        --gpu-memory-utilization 0.60 \
-        --max-model-len 32768 \
-        --enable-prefix-caching \
-        --trust-remote-code \
-        --enable-auto-tool-choice \
-        --tool-call-parser hermes
-fi
-
-# ── catalog idx 5: gemma-4-26B-A4B-it  (port 8007) ───────────────────────────
-if is_run_selected 5; then
-    _vllm_launch 5 \
-        --served-model-name "gemma-4-26B-A4B" \
-        --dtype auto \
-        --gpu-memory-utilization 0.55 \
-        --max-model-len 16384 \
-        --max-num-batched-tokens 4096 \
-        --enable-prefix-caching \
-        --trust-remote-code \
-        --enable-auto-tool-choice \
-        --tool-call-parser hermes
-fi
-
-# ── catalog idx 6: Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16  (port 8008) ───
-if is_run_selected 6; then
-    _vllm_launch 6 \
-        --served-model-name "Nemotron-3-Nano-Omni-30B-A3B" \
-        --dtype bfloat16 \
-        --gpu-memory-utilization 0.62 \
-        --max-model-len 32768 \
-        --enable-prefix-caching \
-        --trust-remote-code
-fi
-
-# ── catalog idx 7: BAAI/bge-m3  (port 8011) ───────────────────────────────────
-# gpu-memory-utilization is intentionally high (0.45): on unified memory vLLM's
-# KV-cache profiler includes ALL running processes' GPU footprint in the baseline,
-# so the 35B model's ~38 GB shows up here. Budget must exceed (38 + model) GB.
-if is_run_selected 7; then
-    _vllm_launch 7 \
-        --served-model-name "bge-m3" \
-        --dtype auto \
-        --gpu-memory-utilization 0.45 \
-        --max-model-len 8192 \
-        --trust-remote-code
-fi
-
-# ── catalog idx 8: Qwen3-Embedding-4B  (port 8010) ────────────────────────────
-# max-model-len capped at 8192 — model default is 40960 (enormous KV footprint).
-if is_run_selected 8; then
-    _vllm_launch 8 \
-        --served-model-name "Qwen3-Embedding-4B" \
-        --dtype auto \
-        --gpu-memory-utilization 0.60 \
-        --max-model-len 8192 \
-        --trust-remote-code
-fi
-
-# ── catalog idx 9: bge-reranker-v2-m3  (port 8020) ────────────────────────────
-if is_run_selected 9; then
-    _vllm_launch 9 \
-        --served-model-name "bge-reranker-v2-m3" \
-        --dtype auto \
-        --gpu-memory-utilization 0.45 \
-        --max-model-len 8192 \
-        --trust-remote-code
-fi
-
-# ── catalog idx 10: Qwen3-Reranker-4B  (port 8021) ★ Default ─────────────────
-# Generative yes/no reranker — clients score via logprobs on "yes"/"no" tokens.
-# Usage: POST /v1/completions with logprobs=1; compare P("yes") vs P("no").
-if is_run_selected 10; then
-    _vllm_launch 10 \
-        --served-model-name "Qwen3-Reranker-4B" \
-        --dtype auto \
-        --gpu-memory-utilization 0.55 \
-        --max-model-len 10000 \
-        --enable-prefix-caching \
-        --max-logprobs 20 \
-        --trust-remote-code
-fi
-
-# ── catalog idx 11, 12 & 19: ASR / NeMo — download only, not served via vLLM ──
-# (idx 19 = nemotron-3.5-asr-streaming-0.6b, appended at the end of the catalog)
-# To use: python3 -c "
-#   import nemo.collections.asr as nemo_asr
-#   model = nemo_asr.models.EncDecRNNTBPEModel.restore_from('$MODELS_DIR/parakeet-tdt-0.6b-v3/model.nemo')
-#   print(model.transcribe(['your_audio.wav']))"
-
 # ─────────────────────────────────────────────────────────────────────────────
-# SUPER LARGE MODELS (120B+ parameters)
-# Info: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard
-# ⚠️  These require nearly the entire GPU. Do NOT run alongside other large models.
+# PER-MODEL SERVE ARGS — _serve_model dispatches on the HF REPO ID, not the
+# catalog index, so inserting/reordering _add lines can never mis-map a model
+# to the wrong serve block (the v0.1.5 index-mismatch bug class is gone).
+# A servable model with no dedicated entry falls through to safe generic
+# defaults in the * arm. ASR/NeMo download-only models (PORT=0) are skipped.
+#   NeMo ASR usage: python3 -c "
+#     import nemo.collections.asr as nemo_asr
+#     model = nemo_asr.models.EncDecRNNTBPEModel.restore_from('$MODELS_DIR/parakeet-tdt-0.6b-v3/model.nemo')
+#     print(model.transcribe(['your_audio.wav']))"
 # ─────────────────────────────────────────────────────────────────────────────
+_serve_model() {
+    local idx="$1"
+    [ "${MDL_PORT[$idx]}" = "0" ] && return 0
 
-# ── catalog idx 13: Nemotron-3-Super-120B-A12B  (port 8030) ───────────────────
-if is_run_selected 13; then
-    echo "   ℹ️  Model info: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard"
-    echo "   ⚠️  SUPER LARGE — needs ~115 GB VRAM. Ensure no other large models are running."
-    _vllm_launch 13 \
-        --served-model-name "Nemotron-3-Super-120B-A12B" \
-        --dtype auto \
-        --gpu-memory-utilization 0.93 \
-        --max-model-len 8192 \
-        --enable-prefix-caching \
-        --trust-remote-code \
-        --enable-auto-tool-choice \
-        --tool-call-parser hermes
-fi
+    case "${MDL_HF[$idx]}" in
 
-# ── catalog idx 14: Qwen3.5-122B-A10B  (port 8031) ────────────────────────────
-if is_run_selected 14; then
-    echo "   ⚠️  SUPER LARGE — needs ~120 GB VRAM. Ensure no other large models are running."
-    _vllm_launch 14 \
-        --served-model-name "Qwen3.5-122B-A10B" \
-        --dtype auto \
-        --gpu-memory-utilization 0.93 \
-        --max-model-len 8192 \
-        --enable-prefix-caching \
-        --trust-remote-code \
-        --enable-auto-tool-choice \
-        --tool-call-parser hermes
-fi
+    "Qwen/Qwen3.6-35B-A3B-FP8")
+        _vllm_launch "$idx" \
+            --served-model-name "Qwen3.6-35B-A3B" \
+            --dtype auto \
+            --gpu-memory-utilization 0.40 \
+            --max-model-len 32768 \
+            --enable-prefix-caching \
+            --trust-remote-code \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes
+        ;;
 
-# ── catalog idx 15: Qwen3.5-122B-A10B-FP8  (port 8033) ★ Recommended ──────────
-# FP8 uses ~62 GB VRAM vs ~120 GB for BF16 — fits easily, allows longer context
-if is_run_selected 15; then
-    echo "   ★  FP8 version: ~62 GB VRAM, faster inference, longer context than BF16"
-    _vllm_launch 15 \
-        --served-model-name "Qwen3.5-122B-A10B-FP8" \
-        --dtype auto \
-        --gpu-memory-utilization 0.75 \
-        --max-model-len 32768 \
-        --enable-prefix-caching \
-        --trust-remote-code \
-        --enable-auto-tool-choice \
-        --tool-call-parser hermes
-fi
+    # NVFP4 (~4-bit): ~20 GB weights vs ~35 GB FP8 — 0.30 × 121 ≈ 36 GB budget
+    # leaves ~14 GB KV headroom when served alone. vLLM auto-detects modelopt
+    # NVFP4 from the checkpoint config; the explicit flag matches the Nemotron
+    # NVFP4 entry below — drop it if your vLLM build errors on it.
+    "nvidia/Qwen3.6-35B-A3B-NVFP4")
+        _vllm_launch "$idx" \
+            --served-model-name "Qwen3.6-35B-A3B-NVFP4" \
+            --dtype auto \
+            --quantization modelopt_fp4 \
+            --gpu-memory-utilization 0.30 \
+            --max-model-len 32768 \
+            --enable-prefix-caching \
+            --trust-remote-code \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes
+        ;;
 
-# ── catalog idx 16: GPT-OSS-120B  (port 8032) ─────────────────────────────────
-if is_run_selected 16; then
-    echo "   ⚠️  SUPER LARGE — needs ~115 GB VRAM. Ensure no other large models are running."
-    _vllm_launch 16 \
-        --served-model-name "GPT-OSS-120B" \
-        --dtype auto \
-        --gpu-memory-utilization 0.93 \
-        --max-model-len 8192 \
-        --enable-prefix-caching \
-        --trust-remote-code
-fi
+    # Unsloth's "Fast" repack of the same NVFP4 checkpoint — same footprint.
+    "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast")
+        _vllm_launch "$idx" \
+            --served-model-name "Qwen3.6-35B-A3B-NVFP4-Fast" \
+            --dtype auto \
+            --quantization modelopt_fp4 \
+            --gpu-memory-utilization 0.30 \
+            --max-model-len 32768 \
+            --enable-prefix-caching \
+            --trust-remote-code \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes
+        ;;
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SMALL MODELS WITH 1-HOUR IDLE-SLEEP  (catalog SLEEP_MIN=60)
-# Same serve path as the standard models; the longer sleep timeout is handled
-# entirely by the watchdog via each model's MDL_SLEEP entry (see catalog above).
-# ─────────────────────────────────────────────────────────────────────────────
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4")
+        _vllm_launch "$idx" \
+            --served-model-name "Nemotron-3-Nano-30B-NVFP4" \
+            --dtype auto \
+            --quantization modelopt_fp4 \
+            --gpu-memory-utilization 0.20 \
+            --max-model-len 32768 \
+            --max-num-seqs 178 \
+            --enable-prefix-caching \
+            --trust-remote-code \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes
+        ;;
 
-# ── catalog idx 17: Qwen3.5-4B  (port 8012)  [1h idle-sleep] ─────────────────
-if is_run_selected 17; then
-    _vllm_launch 17 \
-        --served-model-name "Qwen3.5-4B" \
-        --dtype auto \
-        --gpu-memory-utilization 0.50 \
-        --max-model-len 32768 \
-        --enable-prefix-caching \
-        --trust-remote-code \
-        --enable-auto-tool-choice \
-        --tool-call-parser hermes
-fi
+    "Qwen/Qwen3-Coder-30B-A3B-Instruct")
+        _vllm_launch "$idx" \
+            --served-model-name "Qwen3-Coder-30B" \
+            --dtype auto \
+            --gpu-memory-utilization 0.62 \
+            --max-model-len 32768 \
+            --enable-prefix-caching \
+            --trust-remote-code
+        ;;
 
-# ── catalog idx 18: Qwen3.5-2B  (port 8013)  [1h idle-sleep] ─────────────────
-if is_run_selected 18; then
-    _vllm_launch 18 \
-        --served-model-name "Qwen3.5-2B" \
-        --dtype auto \
-        --gpu-memory-utilization 0.45 \
-        --max-model-len 32768 \
-        --enable-prefix-caching \
-        --trust-remote-code \
-        --enable-auto-tool-choice \
-        --tool-call-parser hermes
-fi
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B")
+        _vllm_launch "$idx" \
+            --served-model-name "DeepSeek-R1-Distill-Qwen-32B" \
+            --dtype auto \
+            --gpu-memory-utilization 0.65 \
+            --max-model-len 32768 \
+            --enable-prefix-caching \
+            --trust-remote-code
+        ;;
 
-# ── catalog idx 21: Qwen3.5-9B  (port 8015)  [1h idle-sleep] ─────────────────
-# gpu-memory-utilization 0.75: when Nemotron-3-Nano-Omni-30B (~62 GB) is the
-# co-resident model, 0.75×121=90.75 GB budget leaves ~10 GB for KV after weights.
-if is_run_selected 21; then
-    _vllm_launch 21 \
-        --served-model-name "Qwen3.5-9B" \
-        --dtype auto \
-        --gpu-memory-utilization 0.75 \
-        --max-model-len 16384 \
-        --enable-prefix-caching \
-        --trust-remote-code \
-        --enable-auto-tool-choice \
-        --tool-call-parser hermes
-fi
+    "google/gemma-4-31B-it")
+        _vllm_launch "$idx" \
+            --served-model-name "gemma-4-31B" \
+            --dtype auto \
+            --gpu-memory-utilization 0.60 \
+            --max-model-len 32768 \
+            --enable-prefix-caching \
+            --trust-remote-code \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes
+        ;;
 
-# ── catalog idx 20: Qwen3-ASR-1.7B  (port 8014)  [served as transcription] ────
-# Served via vLLM's transcription task — exposes POST /v1/audio/transcriptions.
-# NOTE: this is an audio/STT endpoint, not chat, so it is intentionally skipped
-# in the OpenWebUI chat auto-registration below. To use it in OpenWebUI, set it
-# under Admin Settings → Audio → STT (OpenAI-compatible URL http://localhost:8014/v1).
-if is_run_selected 20; then
-    _vllm_launch 20 \
-        --served-model-name "Qwen3-ASR-1.7B" \
-        --dtype auto \
-        --gpu-memory-utilization 0.07 \
-        --trust-remote-code
+    "google/gemma-4-26B-A4B-it")
+        _vllm_launch "$idx" \
+            --served-model-name "gemma-4-26B-A4B" \
+            --dtype auto \
+            --gpu-memory-utilization 0.55 \
+            --max-model-len 16384 \
+            --max-num-batched-tokens 4096 \
+            --enable-prefix-caching \
+            --trust-remote-code \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes
+        ;;
+
+    "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16")
+        _vllm_launch "$idx" \
+            --served-model-name "Nemotron-3-Nano-Omni-30B-A3B" \
+            --dtype bfloat16 \
+            --gpu-memory-utilization 0.62 \
+            --max-model-len 32768 \
+            --enable-prefix-caching \
+            --trust-remote-code
+        ;;
+
+    # gpu-memory-utilization is intentionally high (0.45) for the tiny embed/
+    # rerank models: on unified memory vLLM's KV-cache profiler includes ALL
+    # running processes' GPU footprint in the baseline, so a loaded 35B's ~38 GB
+    # shows up here. Budget must exceed (38 + model) GB.
+    # max-model-len capped at 8192 — embedding models default to 40960 (huge KV).
+    "BAAI/bge-m3")
+        _vllm_launch "$idx" \
+            --served-model-name "bge-m3" \
+            --dtype auto \
+            --gpu-memory-utilization 0.45 \
+            --max-model-len 8192 \
+            --trust-remote-code
+        ;;
+
+    "Qwen/Qwen3-Embedding-4B")
+        _vllm_launch "$idx" \
+            --served-model-name "Qwen3-Embedding-4B" \
+            --dtype auto \
+            --gpu-memory-utilization 0.60 \
+            --max-model-len 8192 \
+            --trust-remote-code
+        ;;
+
+    "BAAI/bge-reranker-v2-m3")
+        _vllm_launch "$idx" \
+            --served-model-name "bge-reranker-v2-m3" \
+            --dtype auto \
+            --gpu-memory-utilization 0.45 \
+            --max-model-len 8192 \
+            --trust-remote-code
+        ;;
+
+    # Generative yes/no reranker — clients score via logprobs on "yes"/"no"
+    # tokens: POST /v1/completions with logprobs=1; compare P("yes") vs P("no").
+    "Qwen/Qwen3-Reranker-4B")
+        _vllm_launch "$idx" \
+            --served-model-name "Qwen3-Reranker-4B" \
+            --dtype auto \
+            --gpu-memory-utilization 0.55 \
+            --max-model-len 10000 \
+            --enable-prefix-caching \
+            --max-logprobs 20 \
+            --trust-remote-code
+        ;;
+
+    # ── SUPER LARGE (120B+): need nearly the whole GPU — don't co-run others ──
+    "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16")
+        echo "   ℹ️  Model info: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard"
+        echo "   ⚠️  SUPER LARGE — needs ~115 GB VRAM. Ensure no other large models are running."
+        _vllm_launch "$idx" \
+            --served-model-name "Nemotron-3-Super-120B-A12B" \
+            --dtype auto \
+            --gpu-memory-utilization 0.93 \
+            --max-model-len 8192 \
+            --enable-prefix-caching \
+            --trust-remote-code \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes
+        ;;
+
+    "Qwen/Qwen3.5-122B-A10B")
+        echo "   ⚠️  SUPER LARGE — needs ~120 GB VRAM. Ensure no other large models are running."
+        _vllm_launch "$idx" \
+            --served-model-name "Qwen3.5-122B-A10B" \
+            --dtype auto \
+            --gpu-memory-utilization 0.93 \
+            --max-model-len 8192 \
+            --enable-prefix-caching \
+            --trust-remote-code \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes
+        ;;
+
+    # FP8 uses ~62 GB VRAM vs ~120 GB for BF16 — fits easily, longer context.
+    "Qwen/Qwen3.5-122B-A10B-FP8")
+        echo "   ★  FP8 version: ~62 GB VRAM, faster inference, longer context than BF16"
+        _vllm_launch "$idx" \
+            --served-model-name "Qwen3.5-122B-A10B-FP8" \
+            --dtype auto \
+            --gpu-memory-utilization 0.75 \
+            --max-model-len 32768 \
+            --enable-prefix-caching \
+            --trust-remote-code \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes
+        ;;
+
+    "openai/gpt-oss-120b")
+        echo "   ⚠️  SUPER LARGE — needs ~115 GB VRAM. Ensure no other large models are running."
+        _vllm_launch "$idx" \
+            --served-model-name "GPT-OSS-120B" \
+            --dtype auto \
+            --gpu-memory-utilization 0.93 \
+            --max-model-len 8192 \
+            --enable-prefix-caching \
+            --trust-remote-code
+        ;;
+
+    # ── Small models (1-hour idle-sleep via catalog SLEEP_MIN=60) ─────────────
+    "Qwen/Qwen3.5-4B")
+        _vllm_launch "$idx" \
+            --served-model-name "Qwen3.5-4B" \
+            --dtype auto \
+            --gpu-memory-utilization 0.50 \
+            --max-model-len 32768 \
+            --enable-prefix-caching \
+            --trust-remote-code \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes
+        ;;
+
+    "Qwen/Qwen3.5-2B")
+        _vllm_launch "$idx" \
+            --served-model-name "Qwen3.5-2B" \
+            --dtype auto \
+            --gpu-memory-utilization 0.45 \
+            --max-model-len 32768 \
+            --enable-prefix-caching \
+            --trust-remote-code \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes
+        ;;
+
+    # gpu-memory-utilization 0.75: when Nemotron-3-Nano-Omni-30B (~62 GB) is the
+    # co-resident model, 0.75×121=90.75 GB budget leaves ~10 GB KV after weights.
+    "Qwen/Qwen3.5-9B")
+        _vllm_launch "$idx" \
+            --served-model-name "Qwen3.5-9B" \
+            --dtype auto \
+            --gpu-memory-utilization 0.75 \
+            --max-model-len 16384 \
+            --enable-prefix-caching \
+            --trust-remote-code \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes
+        ;;
+
+    # Served via vLLM's transcription task — POST /v1/audio/transcriptions.
+    # STT endpoint, not chat: skipped in OpenWebUI chat auto-registration; wire
+    # it in under Admin Settings → Audio → STT (URL http://localhost:8014/v1).
+    "Qwen/Qwen3-ASR-1.7B")
+        _vllm_launch "$idx" \
+            --served-model-name "Qwen3-ASR-1.7B" \
+            --dtype auto \
+            --gpu-memory-utilization 0.07 \
+            --trust-remote-code
+        ;;
+
+    *)  # No dedicated serve entry — conservative generic defaults.
+        echo "   ℹ️  ${MDL_HF[$idx]} has no dedicated serve entry — using generic defaults."
+        _vllm_launch "$idx" \
+            --served-model-name "${MDL_DIR[$idx]}" \
+            --dtype auto \
+            --gpu-memory-utilization 0.50 \
+            --max-model-len 16384 \
+            --trust-remote-code
+        ;;
+    esac
+}
+
+# ── Launch every selected servable model, one at a time ───────────────────────
+for idx in "${RUN_SELECTED[@]}"; do
+    _serve_model "$idx"
+done
+
+# ── Headless mode ends here: start the watchdog, show status, and exit ────────
+# (containers, OpenWebUI registration, and memory setup are interactive-run-only)
+if [ "$HEADLESS" -eq 1 ]; then
+    _build_watch_pairs
+    if [ "${#_WATCH_PAIRS[@]}" -gt 0 ]; then
+        echo "--- Starting vLLM sleep watchdog ---"
+        _start_sleep_watchdog "${_WATCH_PAIRS[@]}"
+    fi
+    _show_vllm_status "FINAL"
+    echo "✅ Headless start complete."
+    exit 0
 fi
 
 #---------------------------------------------------------------------------------------------------------------
@@ -1751,15 +2021,7 @@ fi
 # timeout of 0 (or empty global) is skipped, so per-model timeouts still apply
 # even if the global default is disabled.
 if [ "${#RUN_SELECTED[@]}" -gt 0 ]; then
-    _WATCH_PAIRS=()
-    for _idx in "${RUN_SELECTED[@]}"; do
-        _p="${MDL_PORT[$_idx]}"
-        [ "$_p" = "0" ] && continue
-        _mins="${MDL_SLEEP[$_idx]:-}"
-        [ -z "$_mins" ] && _mins="$IDLE_SLEEP_MINUTES"
-        [ "$_mins" -gt 0 ] 2>/dev/null || continue
-        _WATCH_PAIRS+=("${_p}:$((_mins * 60))")
-    done
+    _build_watch_pairs
     if [ "${#_WATCH_PAIRS[@]}" -gt 0 ]; then
         echo "--- Starting vLLM sleep watchdog ---"
         _start_sleep_watchdog "${_WATCH_PAIRS[@]}"
