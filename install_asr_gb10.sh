@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #    By: Christopher Gray
-#    Version: 0.1.3
+#    Version: 0.1.4
 #    Updated: 7/11/2026
 #
 #    This script installs the ASR sidecar on an NVIDIA DGX Spark / GB10 (arm64 + Blackwell).
@@ -10,6 +10,11 @@
 #   Installer:
 #     ./install_asr_gb10.sh        (from a synced checkout — preferred)
 #
+#   0.1.4: nemotron-3.5-asr-streaming needs EncDecRNNTBPEModelWithPrompt,
+#          which no NeMo pypi release ships yet — install NeMo from git main
+#          (the model card's documented install; override with
+#          ASR_NEMO_COMMAND). Streaming engine also self-heals to rolling
+#          re-decode if the cache-aware step API mismatches at runtime.
 #   0.1.3: fix arm64 build failure — NeMo's `sox` dep imports numpy in its
 #          legacy setup.py, which always fails in pip's isolated build env;
 #          the Dockerfile now preinstalls numpy/Cython/pybind11 and installs
@@ -60,6 +65,11 @@ BASE_IMAGE="${ASR_BASE_IMAGE:-nvidia/cuda:12.8.0-runtime-ubuntu22.04}"
 
 # Blackwell-capable torch. cu128 is proven on this box by the A1111 install.
 TORCH_COMMAND="${ASR_TORCH_COMMAND:-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128}"
+
+# NeMo install. Default: git main — the nemotron-3.5 streaming model needs
+# EncDecRNNTBPEModelWithPrompt, which no pypi release includes yet. Re-pin
+# here (e.g. "pip install nemo_toolkit[asr]==2.x") once a release has it.
+NEMO_COMMAND="${ASR_NEMO_COMMAND:-pip install nemo_toolkit[asr]@git+https://github.com/NVIDIA/NeMo.git@main}"
 
 # all | batch | stream — build/run only one engine per container if the NeMo
 # and qwen-asr dependency stacks ever conflict (see asr_sidecar/Dockerfile).
@@ -161,12 +171,17 @@ RUN ${TORCH_COMMAND}
 RUN pip install numpy Cython pybind11 packaging setuptools wheel && \
     pip install --no-build-isolation sox
 
+# NeMo from git main: nemotron-3.5-asr-streaming needs
+# EncDecRNNTBPEModelWithPrompt (rnnt_bpe_models_prompt), which no pypi
+# release ships yet — the model card's documented install is @main.
+# Re-pin to a release via --build-arg NEMO_COMMAND once one includes it.
+ARG NEMO_COMMAND="pip install nemo_toolkit[asr]@git+https://github.com/NVIDIA/NeMo.git@main"
 # Order matters: NeMo pins its stack first, qwen-asr layers on top. `pip
 # check` + the import smoke test below turn any transformers/lightning
 # conflict into a BUILD failure instead of a runtime one. If they ever
 # conflict for real, build two images with ASR_VARIANT=batch / stream
 # (the app only needs the live WS URL pointed at the second container).
-RUN pip install "nemo_toolkit[asr]>=2.2,<3" && \
+RUN ${NEMO_COMMAND} && \
     pip install qwen-asr && \
     pip install "fastapi>=0.115" "uvicorn[standard]" websockets python-multipart \
                 silero-vad soundfile numpy huggingface_hub && \
@@ -437,7 +452,7 @@ ASR_STREAM_CHUNK_MS = int(os.environ.get("ASR_STREAM_CHUNK_MS", "160"))
 ASR_VARIANT = os.environ.get("ASR_VARIANT", "all").strip().lower()
 
 SAMPLE_RATE = 16000
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 __ASR_EOF__
   cat > "${dest}/app/main.py" <<'__ASR_EOF__'
 """ASR sidecar FastAPI app.
@@ -714,7 +729,16 @@ class NemotronStreamEngine:
 
         with self._lock:
             if self._cache_aware:
-                text = self._step_cache_aware(session, chunk)
+                try:
+                    text = self._step_cache_aware(session, chunk)
+                except Exception as exc:
+                    # Self-heal: the prompt-based model's step API may differ
+                    # from the classic cache-aware surface. Downgrade once to
+                    # rolling re-decode instead of killing live sessions.
+                    log.warning("cache-aware step failed (%s); switching to "
+                                "rolling re-decode mode.", exc)
+                    self._cache_aware = False
+                    text = self._redecode_utterance(session)
             else:
                 text = self._redecode_utterance(session)
         if text is not None and text != session.hypothesis:
@@ -785,7 +809,11 @@ class NemotronStreamEngine:
         if len(session.utterance) < config.SAMPLE_RATE // 4:
             return None
         audio = np.array(session.utterance, dtype=np.float32) / 32768.0
-        out = self._model.transcribe([audio], verbose=False)
+        try:
+            # The prompt-based nemotron models take a language prompt.
+            out = self._model.transcribe([audio], verbose=False, target_lang="auto")
+        except TypeError:
+            out = self._model.transcribe([audio], verbose=False)
         if not out:
             return None
         hyp = out[0]
@@ -979,11 +1007,13 @@ fi
 cd "${BUILD_DIR}"
 log "base image:  ${BASE_IMAGE}"
 log "torch:       ${TORCH_COMMAND}"
+log "nemo:        ${NEMO_COMMAND}"
 log "variant:     ${VARIANT}"
 ${SUDO} docker build --pull \
   -f Dockerfile \
   --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
   --build-arg "TORCH_COMMAND=${TORCH_COMMAND}" \
+  --build-arg "NEMO_COMMAND=${NEMO_COMMAND}" \
   -t "${IMAGE}" . \
   || die "Image build failed — scroll up for the first real error.
     • A dependency failed building from source (arm64 has no wheel for it,
