@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #    By: Christopher Gray
-#    Version: 0.1.6
+#    Version: 0.1.7
 #    Updated: 7/11/2026
 #
 #    This script installs the ASR sidecar on an NVIDIA DGX Spark / GB10 (arm64 + Blackwell).
@@ -10,6 +10,8 @@
 #   Installer:
 #     ./install_asr_gb10.sh        (from a synced checkout — preferred)
 #
+#   0.1.7: print the installer version at start (verifies you're running
+#          the latest copy, not a stale raw.githubusercontent cache).
 #   0.1.6: the Dockerfile now runs NEMO_COMMAND through `eval` — plain
 #          ${VAR} expansion never re-parses the quotes inside the value, so
 #          0.1.5's quoted requirement reached pip with a literal ' attached.
@@ -59,6 +61,11 @@
 #
 # Everything below is overridable via environment variables (see the block).
 set -euo pipefail
+
+# KEEP IN SYNC with the Version/Updated header lines above (printed at start
+# so a curl|bash run can tell a fresh script from a stale CDN-cached copy).
+INSTALLER_VERSION="0.1.7"
+INSTALLER_UPDATED="7/11/2026"
 
 # ─────────────────────────────── configuration ───────────────────────────────
 IMAGE_NAME="${ASR_IMAGE_NAME:-asr-gb10}"
@@ -928,6 +935,10 @@ def plan_chunks(wav_path: str, total_dur: float,
 __ASR_EOF__
 }
 # __EMBEDDED_ASR_SIDECAR_END__
+
+# ─────────────────────────────── banner ──────────────────────────────────────
+printf '%s\n' "${c_b}install_asr_gb10.sh v${INSTALLER_VERSION} (${INSTALLER_UPDATED})${c_0}"
+log "image=${IMAGE}  container=${CONTAINER_NAME}  port=${PORT}  variant=${VARIANT}"
 
 # ─────────────────────────────── 1. preflight ────────────────────────────────
 step "1/9  Preflight"
