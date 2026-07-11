@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.3.1  |  Update: 7/11/2026
+# Christopher Gray  |  Version: 0.3.2  |  Update: 7/11/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
 #   curl -fsSL -o 'install_ai_spark_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark_vllm.sh' && chmod u+x install_ai_spark_vllm.sh
-#   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4:9000,Qwen3-Reranker-4B"
+#   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4:8011,Qwen3-Reranker-4B:8010"
 #
 # Move to DGX Spark / GB10:
 #   scp install_ai_spark_vllm.sh root@<dgx-ip>:/home/user/install_ai_spark_vllm.sh
@@ -19,16 +19,47 @@
 #   Headless / boot-time serving (no prompts — safe for cron):
 #   ./install_ai_spark_vllm.sh --start <spec>        — start 1+ models non-interactively
 #       <spec> = model[:port][,model[:port]...]      — model = local dir name, HF repo id,
-#                                                      or catalog index; port overrides the
-#                                                      catalog default. --start is repeatable.
+#                                                      or catalog index. --start is repeatable.
 #       e.g.  --start Qwen3.6-35B-A3B-NVFP4
-#             --start "Qwen3.6-35B-A3B-NVFP4:9000,Qwen3-Reranker-4B"
+#             --start "Qwen3.6-35B-A3B-NVFP4,Qwen3-Reranker-4B"
 #   ./install_ai_spark_vllm.sh --install-cron <spec> — install an @reboot crontab entry that
 #                                                      runs --start <spec> at every boot
 #   ./install_ai_spark_vllm.sh --remove-cron         — remove that @reboot entry
 #   ./install_ai_spark_vllm.sh --list-models         — print the servable-model catalog and exit
+#   ./install_ai_spark_vllm.sh --health              — report which served models are up, and exit
+#
+#   Ports: served models get SEQUENTIAL ports in launch order starting at
+#   BASE_PORT (default 8010) — 1st model → 8010, 2nd → 8011, and so on — so the
+#   same launch order always yields the same ports. Pin a specific model with
+#   "model:PORT" (e.g. --start "Qwen3-Reranker-4B:8021"); pinned ports are kept
+#   and skipped over by the sequential counter. Before binding, the script checks
+#   whether a port is already in use, shows what holds it, and offers to kill it
+#   (interactive) or reclaims it only from a prior vLLM process (headless).
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.3.2  7/11/2026
+#   - Predictable ports: served models are now assigned SEQUENTIAL ports in
+#     launch order from BASE_PORT (default 8010) — 1st→8010, 2nd→8011, … — so the
+#     same selection always maps to the same ports (was: fixed per-model catalog
+#     ports). Pin one with "model:PORT"; pinned ports are kept and skipped over.
+#     A port map is printed before serving.
+#   - Port-in-use guard: before a model binds its port, the script detects any
+#     existing listener (lsof/ss/fuser), prints what it is, and — interactively —
+#     asks whether to kill it; headless mode reclaims the port only if a prior
+#     vLLM process holds it, else skips that model (never kills other services).
+#   - Health check: after serving, an explicit UP / NOT-READY line per model with
+#     its /v1/models test command and log path. New `--health` flag re-runs the
+#     check standalone (probes catalog + BASE_PORT block); good for cron/monitoring.
+#   - Auto-download (AUTO_DOWNLOAD=true): if a selected model is missing on disk
+#     when it's time to serve it, the script downloads it first (HF CLI + HF_TOKEN)
+#     instead of skipping — works in --serve-only and headless --start too.
+#   - Failure diagnostics: on a model that dies during load, _show_log_tail now
+#     prints a longer tail AND greps the whole log for the earliest error, since
+#     vLLM's "Engine core initialization failed. See root cause above" hides the
+#     real cause far above the shown traceback.
+#   - Self-update line switched from `curl | bash` to `curl -o … && chmod` so it
+#     replaces the saved local copy instead of executing the download.
 #
 # v0.3.0  7/11/2026
 #   - Added nvidia/Qwen3.6-35B-A3B-NVFP4  (catalog idx 22, port 8016, ~22 GB)
@@ -101,6 +132,7 @@ set -uo pipefail
 SERVE_ONLY=0
 HEADLESS=0        # set by --start: non-interactive serve of START_SPECS, then exit
 LIST_MODELS=0
+HEALTH_CHECK=0    # set by --health: probe every servable catalog port, then exit
 START_SPECS=""    # comma-separated model[:port] specs collected from --start
 CRON_ACTION=""    # install | remove
 CRON_SPEC=""
@@ -118,6 +150,7 @@ while [ "$#" -gt 0 ]; do
         --install-cron=*) CRON_ACTION="install"; CRON_SPEC="${1#--install-cron=}" ;;
         --remove-cron)   CRON_ACTION="remove" ;;
         --list-models)   LIST_MODELS=1 ;;
+        --health)        HEALTH_CHECK=1 ;;
         -h|--help)
             # Print the Usage block from the header (stop at the first Changelog line).
             sed -n '/^# Usage:/,$p' "$0" | sed -n '1,/^# ── Changelog/p' | sed '$d' | sed 's/^# \{0,1\}//'
@@ -148,7 +181,7 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.3.1
+Version:  0.3.2
 Last Updated:  7/11/2026
 
 Update Yourself:
@@ -171,6 +204,23 @@ BASE_DIR="/opt/models"       # All paths derive from here — change this one li
 MODELS_DIR="$BASE_DIR/vllm"           # Where all models will be downloaded
 VLLM_VENV="$BASE_DIR/vllm-install/.vllm"  # venv created by the vLLM install script
 NEMO_VENV="$BASE_DIR/nemo-venv"       # separate venv for NeMo ASR (avoids conflicts with vLLM)
+
+# =============================================
+# PREDICTABLE SERVE PORTS
+# =============================================
+# Served models are assigned sequential ports in launch order starting here:
+# the 1st served model gets BASE_PORT, the 2nd BASE_PORT+1, and so on. This
+# overrides each model's catalog port so the same launch order always yields the
+# same ports. A per-model port pinned with `--start model:PORT` is respected and
+# skipped over. Before binding, the script checks whether the port is already in
+# use, shows what holds it, and (interactively) offers to kill it.
+BASE_PORT=8010
+
+# If a selected model isn't present on disk when it's time to serve it, download
+# it automatically first (uses the HF CLI + HF_TOKEN). Applies to every mode,
+# including --serve-only and headless --start. Set false to keep the old behavior
+# of skipping a missing model instead.
+AUTO_DOWNLOAD=true
 
 # =============================================
 # OPTIONAL FEATURES — toggle on/off
@@ -263,6 +313,8 @@ MDL_VRAM=()
 MDL_PORT=()
 MDL_CAT=()
 MDL_SLEEP=()
+MDL_PORT_EXPLICIT=()   # [idx]=1 when a --start "model:PORT" pinned this model's port
+                       # (pinned models are exempt from sequential re-assignment)
 
 _add() {
     local i=${#MDL_HF[@]}
@@ -404,11 +456,31 @@ _resolve_start_specs() {
         if [ -n "$p" ]; then
             [[ "$p" =~ ^[0-9]+$ ]] || { echo "❌ Invalid port '$p' for model '$m'"; exit 1; }
             MDL_PORT[$idx]="$p"
+            MDL_PORT_EXPLICIT[$idx]=1   # pinned — exempt from sequential re-assignment
         fi
         RUN_SELECTED+=("$idx")
-        echo "  ✅ --start: ${MDL_NAME[$idx]}  →  port ${MDL_PORT[$idx]}"
     done
     [ "${#RUN_SELECTED[@]}" -eq 0 ] && { echo "❌ --start: no models resolved from '$spec'"; exit 1; }
+}
+
+# Reassign servable models to sequential ports (BASE_PORT, +1, +2, …) in launch
+# order, so the same selection always maps to the same ports. Models pinned via
+# --start "model:PORT" keep their port and are skipped over (their port is also
+# avoided so sequential assignment never collides with a pin). Download-only
+# models (PORT=0) are left untouched.
+_assign_sequential_ports() {
+    local idx next="$BASE_PORT" pinned=" "
+    # Collect pinned ports first so sequential assignment can skip past them.
+    for idx in "${RUN_SELECTED[@]}"; do
+        [ "${MDL_PORT_EXPLICIT[$idx]:-0}" = "1" ] && pinned="${pinned}${MDL_PORT[$idx]} "
+    done
+    for idx in "${RUN_SELECTED[@]}"; do
+        [ "${MDL_PORT[$idx]}" = "0" ] && continue                 # download-only
+        [ "${MDL_PORT_EXPLICIT[$idx]:-0}" = "1" ] && continue      # user-pinned
+        while [[ "$pinned" == *" $next "* ]]; do next=$((next + 1)); done
+        MDL_PORT[$idx]="$next"
+        next=$((next + 1))
+    done
 }
 
 # Install/replace the @reboot crontab entry that re-launches models at boot.
@@ -456,9 +528,24 @@ elif [ "$CRON_ACTION" = "remove" ]; then
     _remove_boot_cron; exit 0
 fi
 
+# Ports worth probing for a live model: every catalog port PLUS the sequential
+# BASE_PORT block (served ports are assigned BASE_PORT, +1, …). Deduped/sorted.
+# Covers both catalog-port and sequential runs, and works in a standalone
+# invocation where MDL_PORT still holds catalog defaults.
+_serve_probe_ports() {
+    local i out="" n=0
+    for i in $(seq 0 $((MODEL_TOTAL - 1))); do
+        [ "${MDL_PORT[$i]}" = "0" ] && continue
+        out="$out ${MDL_PORT[$i]}"
+        n=$((n + 1))
+    done
+    for i in $(seq 0 $((n + 3))); do out="$out $((BASE_PORT + i))"; done
+    printf '%s\n' $out | sort -un
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STATUS SNAPSHOT — memory utilization + models currently live in vLLM
-# Probes every non-zero catalog port's /v1/models endpoint. Called once at
+# Probes catalog ports and the sequential BASE_PORT block. Called once at
 # startup (shows what a previous run left running) and once at the end.
 # Arg: $1 = label for the section header (e.g. "STARTUP", "FINAL").
 # ─────────────────────────────────────────────────────────────────────────────
@@ -494,14 +581,10 @@ _show_vllm_status() {
         echo "  GPU     : nvidia-smi not available"
     fi
 
-    # ---- Models currently live in vLLM (probe known catalog ports) ----
+    # ---- Models currently live in vLLM (probe catalog + sequential ports) ----
     echo "  Models live in vLLM:"
-    local found=0 seen=""
-    for _i in $(seq 0 $((MODEL_TOTAL - 1))); do
-        local p="${MDL_PORT[$_i]}"
-        [ "$p" = "0" ] && continue
-        case " $seen " in *" $p "*) continue ;; esac
-        seen="$seen $p"
+    local found=0 p
+    for p in $(_serve_probe_ports); do
         local resp
         resp=$(curl -sf --max-time 2 "http://localhost:${p}/v1/models" 2>/dev/null) || continue
         local ids
@@ -518,6 +601,92 @@ _show_vllm_status() {
     [ "$found" = "0" ] && echo "    (none responding)"
     echo "  ════════════════════════════════════════════════════════════════"
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODEL HEALTH CHECK — confirm each served model actually answers on its port.
+# For every model in RUN_SELECTED it curls /health (is the engine up?) and
+# /v1/models (which model id is registered?), printing UP or NOT READY plus the
+# exact commands to re-test and to tail that model's log. Returns 0 only if all
+# selected servable models are up, so callers can branch on the result.
+# ─────────────────────────────────────────────────────────────────────────────
+_verify_served_models() {
+    local all_up=1 any=0 idx port name log_file resp served_id
+    echo ""
+    echo "  ══ MODEL HEALTH CHECK ═══════════════════════════════════════════"
+    for idx in "${RUN_SELECTED[@]}"; do
+        port="${MDL_PORT[$idx]}"
+        [ "$port" = "0" ] && continue
+        any=1
+        name="${MDL_NAME[$idx]}"
+        log_file="$VLLM_LOGS/vllm-${port}.log"
+        if curl -sf --max-time 5 "http://localhost:${port}/health" > /dev/null 2>&1; then
+            resp=$(curl -sf --max-time 5 "http://localhost:${port}/v1/models" 2>/dev/null)
+            if command -v jq &>/dev/null; then
+                served_id=$(echo "$resp" | jq -r '.data[0].id // empty' 2>/dev/null)
+            else
+                served_id=$(echo "$resp" | grep -o '"id"[[:space:]]*:[[:space:]]*"[^"]*"' \
+                            | head -1 | sed -E 's/.*"([^"]*)"$/\1/')
+            fi
+            printf "  ✅ UP         %-42s (port %s)\n" "$name" "$port"
+            [ -n "$served_id" ] && printf "                served id : %s\n" "$served_id"
+            printf "                test      : curl -s http://localhost:%s/v1/models | jq .\n" "$port"
+        else
+            all_up=0
+            printf "  ⏳ NOT READY  %-42s (port %s)\n" "$name" "$port"
+            printf "                still loading or failed to start — watch the log:\n"
+            printf "                tail -f %s\n" "$log_file"
+            printf "                re-check  : curl -s http://localhost:%s/health\n" "$port"
+        fi
+    done
+    [ "$any" = "0" ] && echo "  (no servable models were selected)"
+    echo "  ═════════════════════════════════════════════════════════════════"
+    if [ "$any" = "1" ]; then
+        if [ "$all_up" = "1" ]; then
+            echo "  ✅ All selected models are UP and answering."
+        else
+            echo "  ⏳ Some models are not answering yet. vLLM takes ~5-10 min to load a"
+            echo "     large model; re-run this health check any time with:"
+            echo "         $0 --health"
+        fi
+    fi
+    [ "$all_up" = "1" ] && return 0 || return 1
+}
+
+# ── One-shot: --health probes the live ports and reports what's up ───────────
+# Standalone re-check (e.g. minutes after launch, or from cron/monitoring). A
+# fresh invocation can't know the launch order, so it probes the catalog ports
+# and the sequential BASE_PORT block and lists only the ports that answer,
+# reading each served model id straight from /v1/models.
+if [ "$HEALTH_CHECK" -eq 1 ]; then
+    VLLM_LOGS="$BASE_DIR/logs"
+    echo ""
+    echo "  ══ MODEL HEALTH CHECK ═══════════════════════════════════════════"
+    _hc_found=0
+    for _p in $(_serve_probe_ports); do
+        curl -sf --max-time 2 "http://localhost:${_p}/health" > /dev/null 2>&1 || continue
+        _hc_found=1
+        _resp=$(curl -sf --max-time 3 "http://localhost:${_p}/v1/models" 2>/dev/null)
+        if command -v jq &>/dev/null; then
+            _id=$(echo "$_resp" | jq -r '.data[0].id // empty' 2>/dev/null)
+        else
+            _id=$(echo "$_resp" | grep -o '"id"[[:space:]]*:[[:space:]]*"[^"]*"' \
+                  | head -1 | sed -E 's/.*"([^"]*)"$/\1/')
+        fi
+        printf "  ✅ UP    port %-6s  %s\n" "$_p" "${_id:-(model id unknown)}"
+        printf "           test : curl -s http://localhost:%s/v1/models | jq .\n" "$_p"
+        [ -f "$VLLM_LOGS/vllm-${_p}.log" ] && \
+            printf "           log  : tail -f %s/vllm-%s.log\n" "$VLLM_LOGS" "$_p"
+    done
+    echo "  ═════════════════════════════════════════════════════════════════"
+    if [ "$_hc_found" = "0" ]; then
+        echo "  ⚠️  No vLLM models are currently answering (checked catalog ports and"
+        echo "     the ${BASE_PORT}+ sequential block)."
+        echo "     If you just started one, give it ~5-10 min and re-run: $0 --health"
+        echo "     Startup logs: $VLLM_LOGS/vllm-<port>.log"
+        exit 1
+    fi
+    exit 0
+fi
 
 # Startup snapshot — what a previous run left running, before the clean-start kill.
 _show_vllm_status "STARTUP"
@@ -704,6 +873,67 @@ _kill_vllm_processes() {
     pkill -f "sleep_watchdog.sh"    2>/dev/null || true
 }
 
+# Echo the PID(s) of whatever is LISTENING on a TCP port (space-separated, empty
+# if the port is free). Tries lsof, then ss, then fuser — whichever exists.
+_port_listener_pids() {
+    local port="$1" pids=""
+    if command -v lsof >/dev/null 2>&1; then
+        pids=$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null)
+    elif command -v ss >/dev/null 2>&1; then
+        pids=$(ss -ltnpH "( sport = :$port )" 2>/dev/null \
+               | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+    elif command -v fuser >/dev/null 2>&1; then
+        pids=$(fuser "${port}/tcp" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$')
+    fi
+    echo $pids   # unquoted: normalize newlines/space to single spaces
+}
+
+# Make sure PORT is free before a model binds it. If something is already
+# listening, show what it is and:
+#   • interactive → ask whether to kill it (default No; No/failed-kill = skip model)
+#   • headless    → reclaim only if it looks like a prior vLLM process (never kill
+#                   unrelated services); otherwise skip this model.
+# Returns 0 if the port is free (or was freed), 1 if the caller should skip.
+_ensure_port_available() {
+    local port="$1" name="$2" pids pid line
+    pids=$(_port_listener_pids "$port")
+    [ -z "$pids" ] && return 0
+
+    echo ""
+    echo "  ⚠️  Port $port (needed for $name) is already in use by:"
+    for pid in $pids; do
+        line=$(ps -p "$pid" -o pid=,comm=,args= 2>/dev/null)
+        [ -n "$line" ] && echo "        $line" || echo "        pid $pid (details unavailable)"
+    done
+
+    if [ "$HEADLESS" -eq 1 ]; then
+        if ps -p "${pids// /,}" -o args= 2>/dev/null | grep -qiE 'vllm|api_server'; then
+            echo "  → Headless: looks like a previous vLLM instance — reclaiming port (kill $pids)."
+            kill -9 $pids 2>/dev/null || true
+            sleep 2
+            [ -z "$(_port_listener_pids "$port")" ] && { echo "  ✅ Port $port freed."; return 0; }
+            echo "  ⚠️  Port $port still busy after kill — skipping $name."; return 1
+        fi
+        echo "  → Headless (no prompt): not a vLLM process — leaving it and SKIPPING $name."
+        return 1
+    fi
+
+    printf "  Kill the process(es) on port %s and continue? [y/N]: " "$port"
+    read -r _ans
+    if [[ "$_ans" =~ ^[Yy]$ ]]; then
+        kill -9 $pids 2>/dev/null || true
+        sleep 2
+        if [ -z "$(_port_listener_pids "$port")" ]; then
+            echo "  ✅ Port $port freed."
+            return 0
+        fi
+        echo "  ⚠️  Port $port still in use after kill — skipping $name."
+        return 1
+    fi
+    echo "  → Leaving it; SKIPPING $name (port busy)."
+    return 1
+}
+
 # Ask whether to shut down a previous run's still-loaded models before the memory
 # check, so "Available now" reflects a clean slate instead of stale reservations.
 # Only prompts when vLLM processes are actually detected.
@@ -829,9 +1059,22 @@ else
     _check_vram
 fi
 
+# Assign predictable sequential ports (BASE_PORT, +1, …) in launch order.
+_assign_sequential_ports
+
 echo ""
 [ "$SERVE_ONLY" -eq 0 ] && echo "  Download : ${#DL_SELECTED[@]} model(s) selected"
 echo "  Serve    : ${#RUN_SELECTED[@]} model(s) selected"
+if [ "${#RUN_SELECTED[@]}" -gt 0 ]; then
+    echo "  Port map (launch order, base ${BASE_PORT}):"
+    _seq_n=1
+    for _idx in "${RUN_SELECTED[@]}"; do
+        [ "${MDL_PORT[$_idx]}" = "0" ] && continue
+        _pin=""; [ "${MDL_PORT_EXPLICIT[$_idx]:-0}" = "1" ] && _pin="  (pinned)"
+        printf "    %d. %-46s port %s%s\n" "$_seq_n" "${MDL_NAME[$_idx]}" "${MDL_PORT[$_idx]}" "$_pin"
+        _seq_n=$((_seq_n + 1))
+    done
+fi
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1043,6 +1286,83 @@ vllm_serve() {
     fi
 }
 
+# Print a failed model's log tail AND try to surface the real root cause.
+# vLLM wraps startup errors as "Engine core initialization failed. See root
+# cause above." — the actual exception is dozens of lines higher, so tail alone
+# hides it. This shows the last N lines and greps the whole log for the earliest
+# error/exception lines (usually the true cause).
+_show_log_tail() {
+    local log_file="$1" n="${2:-60}"
+    tail -"$n" "$log_file" 2>/dev/null | sed 's/^/   | /'
+    local rc
+    rc=$(grep -niE 'error|exception|traceback|out of memory|no such|not supported|unsupported|assert|no available memory|KeyError|ValueError|RuntimeError|OSError|CUDA' \
+         "$log_file" 2>/dev/null | grep -viE 'stack trace|during handling|self\.|return ' | head -6)
+    if [ -n "$rc" ]; then
+        echo "   ── likely root cause (earliest error lines in the full log) ──"
+        printf '%s\n' "$rc" | sed 's/^/   » /'
+    fi
+    echo "   → Full log: cat $log_file"
+}
+
+# Echo a usable HuggingFace CLI path (venv first, then PATH), or empty if none.
+# Works in every mode: full-install sets HF_CLI, but --serve-only/headless skip
+# that block, so we re-resolve here.
+_find_hf_cli() {
+    local c
+    for c in "$VENV_DIR/bin/hf" "$VENV_DIR/bin/huggingface-cli" \
+             "$HOME/vllm-install/.vllm/bin/hf" "$HOME/vllm-install/.vllm/bin/huggingface-cli" \
+             "/home/cgray/vllm-install/.vllm/bin/hf" "/home/cgray/vllm-install/.vllm/bin/huggingface-cli"; do
+        [ -x "$c" ] && { echo "$c"; return 0; }
+    done
+    command -v hf              >/dev/null 2>&1 && { command -v hf; return 0; }
+    command -v huggingface-cli >/dev/null 2>&1 && { command -v huggingface-cli; return 0; }
+    return 1
+}
+
+# Ensure catalog model <idx> is present on disk, downloading it if missing and
+# AUTO_DOWNLOAD is on. Returns 0 if the model is (now) present, 1 otherwise.
+# 'hf download' and 'huggingface-cli download' share the same subcommand/flags.
+_ensure_model_downloaded() {
+    local idx="$1"
+    local name="${MDL_NAME[$idx]}" repo="${MDL_HF[$idx]}" dir="${MDL_DIR[$idx]}"
+    local model_path="$MODELS_DIR/$dir"
+    [ -f "$model_path/config.json" ] && return 0    # already downloaded
+
+    if [ "${AUTO_DOWNLOAD:-true}" != "true" ]; then
+        echo "  ℹ️  $name not on disk and AUTO_DOWNLOAD=false — not downloading."
+        return 1
+    fi
+
+    local hf_cli
+    hf_cli=$(_find_hf_cli) || {
+        echo "  ❌ $name is missing and no HuggingFace CLI was found to download it."
+        echo "     Install it:  $VENV_DIR/bin/pip install -U 'huggingface_hub[cli]'"
+        return 1
+    }
+
+    echo ""
+    echo "  ⬇️  $name not found locally — auto-downloading before serving:"
+    echo "       repo : $repo"
+    echo "       dest : $model_path"
+    [ "${MDL_CAT[$idx]}" = "Super Large" ] && \
+        echo "       ⚠️  SUPER LARGE (~${MDL_DISK[$idx]} GB) — this can take a long time."
+    [ -z "$HF_TOKEN" ] && echo "       ⚠️  HF_TOKEN not set — this will fail if the repo is gated."
+
+    local auth=""
+    [ -n "$HF_TOKEN" ] && auth="--token $HF_TOKEN"
+    mkdir -p "$MODELS_DIR"
+    if "$hf_cli" download $auth "$repo" --local-dir "$model_path"; then
+        if [ -f "$model_path/config.json" ]; then
+            echo "  ✅ $name downloaded."
+            return 0
+        fi
+        echo "  ⚠️  Download finished but no config.json under $model_path — check the repo id."
+        return 1
+    fi
+    echo "  ❌ Auto-download failed for $repo (gated repo without HF_TOKEN, wrong id, or network)."
+    return 1
+}
+
 # Helper: launch one model, echo command, wait 2s, confirm process is alive
 # Usage: _vllm_launch <catalog_idx> [extra vllm args...]
 _vllm_launch() {
@@ -1054,8 +1374,17 @@ _vllm_launch() {
     local log_file="$VLLM_LOGS/vllm-${port}.log"
 
     if [ ! -f "$model_path/config.json" ]; then
-        echo "⚠️  [idx $idx] $name — model not found at $model_path"
-        echo "     Was it downloaded? Re-run and select this model in Step 1."
+        # Not on disk yet — try to fetch it before giving up (AUTO_DOWNLOAD).
+        if ! _ensure_model_downloaded "$idx"; then
+            echo "⚠️  [idx $idx] $name — model not available at $model_path and could not be"
+            echo "     downloaded. Set HF_TOKEN / AUTO_DOWNLOAD, or pre-download it, then retry."
+            return 1
+        fi
+    fi
+
+    # Predictable-port guard: make sure nothing else already holds this port.
+    if ! _ensure_port_available "$port" "$name"; then
+        echo "⚠️  [idx $idx] $name — port $port unavailable; not starting this model."
         return 1
     fi
 
@@ -1076,9 +1405,8 @@ _vllm_launch() {
     local launch_pid=$!
     sleep 2
     if ! kill -0 "$launch_pid" 2>/dev/null; then
-        echo "⚠️  $name (pid $launch_pid) exited immediately — last 30 lines of log:"
-        tail -30 "$log_file" 2>/dev/null | sed 's/^/   | /'
-        echo "   → Full log: cat $log_file"
+        echo "⚠️  $name (pid $launch_pid) exited immediately — log tail + root cause:"
+        _show_log_tail "$log_file"
         return 1
     fi
 
@@ -1092,8 +1420,8 @@ _vllm_launch() {
     local elapsed=0 timeout=720 poll=5  # 12-minute max (large models take ~5-10 min)
     while true; do
         if ! kill -0 "$launch_pid" 2>/dev/null; then
-            echo "   ❌ $name process died during loading — last 30 lines:"
-            tail -30 "$log_file" 2>/dev/null | sed 's/^/   | /'
+            echo "   ❌ $name process died during loading — log tail + root cause:"
+            _show_log_tail "$log_file"
             return 1
         fi
         if curl -sf --max-time 5 "http://localhost:${port}/health" > /dev/null 2>&1 || \
@@ -1677,6 +2005,7 @@ if [ "$HEADLESS" -eq 1 ]; then
         _start_sleep_watchdog "${_WATCH_PAIRS[@]}"
     fi
     _show_vllm_status "FINAL"
+    _verify_served_models
     echo "✅ Headless start complete."
     exit 0
 fi
@@ -1893,6 +2222,9 @@ echo ""
 
 # Final snapshot — memory + which models have come up so far.
 _show_vllm_status "FINAL"
-echo "  ℹ️  vLLM models take ~5-10 min to finish loading; any not listed above are"
-echo "     likely still starting. Re-check later with: curl -s http://localhost:<port>/v1/models | jq ."
+
+# Explicit per-model UP / NOT-READY check with test + log commands.
+_verify_served_models
+echo "  ℹ️  vLLM models take ~5-10 min to finish loading; any 'NOT READY' above are"
+echo "     likely still starting. Re-run the health check any time with: $0 --health"
 echo ""
