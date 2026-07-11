@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.3.0  |  Update: 7/11/2026
+# Christopher Gray  |  Version: 0.3.1  |  Update: 7/11/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
-#   wget --no-cache -O 'install_ai_spark_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark_vllm.sh' && chmod u+x install_ai_spark_vllm.sh
+#   curl -fsSL -o 'install_ai_spark_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark_vllm.sh' && chmod u+x install_ai_spark_vllm.sh
+#   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4:9000,Qwen3-Reranker-4B"
 #
 # Move to DGX Spark / GB10:
 #   scp install_ai_spark_vllm.sh root@<dgx-ip>:/home/user/install_ai_spark_vllm.sh
 #   
-#   scp install_ai_spark_vllm.sh cgray@10.11.1.20:/home/cgray/install_ai_spark_vllm.sh
+#   scp install_ai_spark_vllm.sh user@10.11.1.10:/home/user/install_ai_spark_vllm.sh
 #
 # Usage:
 #   ./install_ai_spark_vllm.sh              — full install: packages, docker, venv, download, serve
@@ -88,166 +89,6 @@
 #   - Added Qwen/Qwen3.5-9B (catalog idx 21, port 8015, ~18 GB VRAM)
 #     with SLEEP_MIN=60 (same idle-sleep pattern as the 2B/4B small models).
 #
-# v0.2.5  6/25/2026
-#   - Bumped Qwen3-Embedding-4B gpu-memory-utilization 0.50 → 0.60. The embedding
-#     model starts right after the 35B and the 35B's in-flight + residual memory
-#     (old killed process + new loading) pushed the baseline over the 60.5 GB
-#     budget at 0.50. The reranker worked because by the time it starts the
-#     embedding has already exited and freed its slot.
-#   - Bumped Qwen3.5-4B-Instruct 0.12 → 0.50 and Qwen3.5-2B-Instruct 0.07 → 0.45
-#     for the same reason (same launch-order problem when 35B is pre-loaded).
-#   - Fixed sleep watchdog endpoint: tries POST /v1/sleep first (vLLM ≥0.20.x),
-#     falls back to POST /sleep. The reranker log showed 404 on /sleep because
-#     vLLM 0.20.x uses the /v1/ prefix for this endpoint.
-#
-# v0.2.4  6/25/2026
-#   - Raised --gpu-memory-utilization for embedding/reranker models (0.05-0.12 →
-#     0.45-0.50). Root cause: vLLM v0.20.2's KV-cache profiler measures ALL
-#     running processes' GPU footprint as the baseline on unified memory, so a
-#     35B model already loaded (~38 GB) pushes the available KV-cache budget
-#     negative at the old 0.12 fraction (14.5 GB budget < 46 GB baseline).
-#     New values give each small model a budget > (38 GB + its weights) GB.
-#   - Added --max-model-len 8192 to bge-m3, Qwen3-Embedding-4B, bge-reranker-v2-m3.
-#     Embedding models default to 40960-token context which requires a huge KV
-#     cache; 8192 is more than enough for typical document embedding workloads.
-#
-# v0.2.3  6/25/2026
-#   - Removed --chat-template-kwargs from Qwen3.6-35B-A3B serve block (requires
-#     vLLM ≥0.6.x). Without the flag the model runs in thinking mode by default.
-#   - Removed --task (embedding/classify/transcription) from all serve blocks;
-#     the flag requires vLLM ≥0.6.x — older builds auto-infer task from model
-#     config. Affected: bge-m3, Qwen3-Embedding-4B, bge-reranker-v2-m3,
-#     Qwen3-ASR-1.7B. Upgrade vLLM with `pip install -U vllm` to restore both.
-#
-# v0.2.2  6/25/2026
-#   - Before the memory budget check, the script now detects a previous run's
-#     still-loaded vLLM models and asks whether to shut them down first (default
-#     yes). Killing them frees their reserved memory so "Available now" reflects
-#     a clean slate instead of stale reservations. The vLLM kill logic is now a
-#     shared _kill_vllm_processes() helper used by both this prompt and the later
-#     clean-start step.
-#
-# v0.2.1  6/25/2026
-#   - Selection menus now display models sorted by type → size → name (cosmetic).
-#     Sorting is applied to the menu view only; catalog indices are untouched so
-#     serve blocks / DEFAULT_*_INDICES / STANDARD_INDICES keep working.
-#   - Retuned --gpu-memory-utilization for every servable model to match the DGX
-#     Spark / GB10 UNIFIED memory pool (~121 GB). vLLM reserves fraction × pool
-#     up front, so the old discrete-GPU fractions over-reserved system RAM (e.g.
-#     the 4B reranker at 0.80 grabbed ~97 GB). New values target each model's
-#     real footprint + KV headroom (rerankers/embeddings 0.05-0.12, small Qwen
-#     0.07-0.12, mid dense 0.40-0.65), so multiple models can coexist. The 120B+
-#     Super Large models stay near 0.93 (they need the whole pool); FP8 122B
-#     lowered 0.93 → 0.75. See the calibration note above the serve blocks.
-#   - Added _show_vllm_status(): prints RAM (and GPU, best-effort) utilization
-#     plus the models currently live in vLLM (probes each catalog port's
-#     /v1/models). Shown at startup (what a previous run left running) and again
-#     at the end (what has come up so far).
-#   - VRAM check: on unified-memory systems (DGX Spark / GB10) nvidia-smi reports
-#     memory.total as "[N/A]", which crashed the arithmetic. Now detected and
-#     handled — instead of a discrete-VRAM budget, _check_system_ram_budget()
-#     budgets against /proc/meminfo (total + MemAvailable), warns on memory
-#     pressure (>85% of total, or more than is free right now), and the same
-#     fallback is used when nvidia-smi is missing entirely.
-#
-# v0.2.0  6/25/2026
-#   - Per-model sleep timeout: the catalog _add() helper now takes an optional
-#     8th field SLEEP_MIN (idle minutes). When set, it overrides the global
-#     IDLE_SLEEP_MINUTES for that model only. The sleep watchdog was refactored
-#     from a single global IDLE_SECS to a per-port map (IDLE_SECS_BY_PORT), so
-#     different models can sleep on different schedules. Models with a SLEEP_MIN
-#     override sleep even if IDLE_SLEEP_MINUTES is 0 (global default disabled).
-#   - Added Qwen/Qwen3.5-4B-Instruct  (catalog idx 17, port 8012, ~10 GB VRAM)
-#     and Qwen/Qwen3.5-2B-Instruct    (catalog idx 18, port 8013, ~5 GB VRAM),
-#     both with SLEEP_MIN=60 (offload to CPU after 1 hour idle). Appended at the
-#     end of the catalog so existing indices and serve blocks are not shifted.
-#   - Added nvidia/nemotron-3.5-asr-streaming-0.6b (catalog idx 19) as a
-#     download-only ASR/NeMo model (VRAM=0, PORT=0) — not served via vLLM.
-#   - Added Qwen/Qwen3-ASR-1.7B (catalog idx 20, port 8014, ~5 GB VRAM) served
-#     via vLLM's --task transcription (POST /v1/audio/transcriptions). ASR-class
-#     served models are skipped in the OpenWebUI chat auto-registration (they are
-#     STT endpoints, not chat) — wire them in under Admin → Audio → STT instead.
-#   - Standard models now share a single idle-sleep timeout (STANDARD_SLEEP_MINUTES,
-#     default 15). Before serving, the script prompts for the value (Enter = keep
-#     default, 0 = never sleep) and applies it to every Standard model. The chosen
-#     value flows through the existing per-port watchdog map.
-#
-# v0.1.9  6/25/2026
-#   - Model sleep: vLLM servers now launch with --enable-sleep-mode; a watchdog
-#     process monitors idle time and offloads model weights to CPU after
-#     IDLE_SLEEP_MINUTES (default 15) of inactivity.  Models auto-wake on the
-#     next inference request.  Watchdog log: $BASE_DIR/logs/sleep_watchdog.log
-#   - Added Qwen/Qwen3-Reranker-4B (catalog idx 10, port 8021, ~9 GB VRAM)
-#     Pre-selected by default (download + serve).  Generative yes/no reranker;
-#     clients score via logprobs on the "yes"/"no" tokens.  Uses max-model-len
-#     10000 and --max-logprobs 20 as recommended by HF model card.
-#   - Added SQLite structured memory ($BASE_DIR/memory/structured_memory.db)
-#     Schema: facts (key/value/category) + conversations tables.
-#     Retention: 60 days OR 100 MB — daily cleanup cron at 3am.
-#   - Added Qdrant vector DB container (port 6333 HTTP, 6334 gRPC)
-#     Long-term semantic memory for facts, notes, docs, and past conversations.
-#     Retention: 60 days OR 1 GB storage — daily cleanup cron at 4am.
-#     Dashboard: http://localhost:6333/dashboard
-#
-# v0.1.8  5/26/2026
-#   - Added Qwen/Qwen3.5-122B-A10B-FP8 (catalog idx 14, port 8033, ~62 GB VRAM)
-#     FP8 cuts VRAM roughly in half vs BF16, allowing max-model-len 32768 and
-#     much faster inference on the GB10 GPU.
-#
-# v0.1.7  5/26/2026
-#   - Lowered --gpu-memory-utilization for SUPER LARGE models from 0.96 → 0.93
-#     Root cause: GPU driver already occupies ~6 GiB at startup, so
-#     0.96 × 121.69 GiB = 116.82 GiB > 115.48 GiB free → vLLM ValueError.
-#     0.93 × 121.69 GiB = 113.17 GiB < 115.48 GiB free → passes pre-check.
-#
-# v0.1.6  5/26/2026
-#   - Added --serve-only / -s flag: skips apt, docker, venv, NeMo, HF, and
-#     download steps — jumps straight to model selection and vLLM serve.
-#     Use this when models are already downloaded and you just want to (re)start.
-#
-# v0.1.5  5/26/2026
-#   - Fixed index mismatch: gemma-4-31B-it was inserted at catalog pos 4 but
-#     all serve blocks still used the pre-insertion indices, so every model from
-#     pos 4 onward mapped to the wrong serve block and never launched
-#   - Replaced hardcoded serve blocks with _vllm_launch helper that:
-#       * echoes the exact command before running it
-#       * waits 2s and checks if the process survived (tails log on fast exit)
-#   - Added pre-serve summary listing each model, catalog index, and port
-#   - Added VLLM_BIN null-check with fallback PATH search before attempting serve
-#   - Added explicit log-dir creation with confirmation echo
-#
-# v0.1.4  5/26/2026
-#   - Fixed OOM on SUPER LARGE models (120B+): reduced --max-model-len 32768→8192
-#     and raised --gpu-memory-utilization 0.93→0.96 to leave room for KV cache
-#     (128GB GPU with ~117GB of FP8 weights leaves only ~2GB for KV cache at
-#      32768 context — 8192 is the safe max for single-GPU 120B+ models)
-#
-# v0.1.3  5/25/2026
-#   - Added google/gemma-4-31B-it (idx 14, port 8009, ~62 GB BF16)
-#
-# v0.1.2  5/25/2026
-#   - Fixed correct HuggingFace repo IDs for all three SUPER LARGE models:
-#       nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
-#       Qwen/Qwen3.5-122B-A10B
-#       openai/gpt-oss-120b
-#
-# v0.1.1  5/25/2026
-#   - Fixed script exiting immediately after banner: dropped -e from set -euo pipefail
-#     ([ cond ] && action patterns return exit code 1 when condition is false, which
-#      triggered immediate exit under strict -e mode)
-#
-# v0.1.0  5/25/2026
-#   - Switched shebang from #!/bin/sh to #!/usr/bin/env bash (required for arrays)
-#   - Interactive checkbox model selection: choose which models to download and serve
-#   - VRAM pre-flight check — calculates total VRAM needed before launching anything
-#   - Model catalog with disk size and VRAM estimates for every model
-#   - SUPER LARGE section (120B+ params): Nemotron-3-Super, Qwen3.5-122B, GPT-OSS-120B
-#   - Fixed log-redirection bug in all vllm_serve background calls (missing \ continuation)
-#   - Replaced ENABLE_* booleans with runtime interactive selection
-#   - OpenWebUI registration now loops dynamically over selected models
-#
-# v0.0.57  5/24/2026  (baseline before rewrite)
-#   - Original static ENABLE_QWEN35 / ENABLE_NEMOTRON / ENABLE_GEMMA4 flags
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ─── strict mode ──────────────────────────────────────────────────────────────
@@ -307,12 +148,11 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.3.0
+Version:  0.3.1
 Last Updated:  7/11/2026
 
 Update Yourself:
-    wget --no-cache -O 'install_ai_spark_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark_vllm.sh' && chmod u+x install_ai_spark_vllm.sh
-
+    curl -fsSL -o 'install_ai_spark_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark_vllm.sh' && chmod u+x install_ai_spark_vllm.sh
 
   YOU MUST HAVE A HUGGINGFACE ACCOUNT AND TOKEN TO DOWNLOAD MODELS!
     *** Update 'HF_TOKEN' on line 35 before running this script! ***
