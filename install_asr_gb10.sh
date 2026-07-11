@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #    By: Christopher Gray
-#    Version: 0.1.4
+#    Version: 0.1.5
 #    Updated: 7/11/2026
 #
 #    This script installs the ASR sidecar on an NVIDIA DGX Spark / GB10 (arm64 + Blackwell).
@@ -10,6 +10,10 @@
 #   Installer:
 #     ./install_asr_gb10.sh        (from a synced checkout — preferred)
 #
+#   0.1.5: NeMo-from-git installed WITHOUT its [asr] extras (no hydra) —
+#          Ubuntu 22.04's apt pip (22.0) silently drops extras on direct-URL
+#          requirements. The Dockerfile now upgrades pip first and uses the
+#          canonical 'nemo_toolkit[asr] @ git+...' form.
 #   0.1.4: nemotron-3.5-asr-streaming needs EncDecRNNTBPEModelWithPrompt,
 #          which no NeMo pypi release ships yet — install NeMo from git main
 #          (the model card's documented install; override with
@@ -69,7 +73,7 @@ TORCH_COMMAND="${ASR_TORCH_COMMAND:-pip install torch torchaudio --index-url htt
 # NeMo install. Default: git main — the nemotron-3.5 streaming model needs
 # EncDecRNNTBPEModelWithPrompt, which no pypi release includes yet. Re-pin
 # here (e.g. "pip install nemo_toolkit[asr]==2.x") once a release has it.
-NEMO_COMMAND="${ASR_NEMO_COMMAND:-pip install nemo_toolkit[asr]@git+https://github.com/NVIDIA/NeMo.git@main}"
+NEMO_COMMAND="${ASR_NEMO_COMMAND:-pip install 'nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@main'}"
 
 # all | batch | stream — build/run only one engine per container if the NeMo
 # and qwen-asr dependency stacks ever conflict (see asr_sidecar/Dockerfile).
@@ -164,18 +168,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG TORCH_COMMAND="pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128"
 RUN ${TORCH_COMMAND}
 
-# arm64 source-build shim: NeMo's `sox` dep (pysox) has a legacy setup.py
-# that imports numpy at metadata-generation time, which always fails inside
-# pip's isolated build env. Preinstall the build helpers and install sox
-# WITHOUT isolation (so its setup.py sees numpy) before NeMo resolves it.
-RUN pip install numpy Cython pybind11 packaging setuptools wheel && \
+# Ubuntu 22.04's apt pip is 22.0 — old enough to silently DROP the [asr]
+# extras on a direct-URL requirement like 'nemo_toolkit[asr] @ git+...'
+# (observed: NeMo installed without hydra/lightning). Upgrade pip first.
+RUN pip install -U pip setuptools wheel
+
+# arm64 source-build shim: NeMo's `sox` dep (pysox, used by NeMo releases;
+# dropped on main) has a legacy setup.py that imports numpy at
+# metadata-generation time, which always fails inside pip's isolated build
+# env. Preinstall the build helpers and install sox WITHOUT isolation (so
+# its setup.py sees numpy) before NeMo resolves it.
+RUN pip install numpy Cython pybind11 packaging && \
     pip install --no-build-isolation sox
 
 # NeMo from git main: nemotron-3.5-asr-streaming needs
 # EncDecRNNTBPEModelWithPrompt (rnnt_bpe_models_prompt), which no pypi
 # release ships yet — the model card's documented install is @main.
 # Re-pin to a release via --build-arg NEMO_COMMAND once one includes it.
-ARG NEMO_COMMAND="pip install nemo_toolkit[asr]@git+https://github.com/NVIDIA/NeMo.git@main"
+ARG NEMO_COMMAND="pip install 'nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@main'"
 # Order matters: NeMo pins its stack first, qwen-asr layers on top. `pip
 # check` + the import smoke test below turn any transformers/lightning
 # conflict into a BUILD failure instead of a runtime one. If they ever
