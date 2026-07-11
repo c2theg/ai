@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #    By: Christopher Gray
-#    Version: 0.1.5
+#    Version: 0.1.6
 #    Updated: 7/11/2026
 #
 #    This script installs the ASR sidecar on an NVIDIA DGX Spark / GB10 (arm64 + Blackwell).
@@ -10,6 +10,9 @@
 #   Installer:
 #     ./install_asr_gb10.sh        (from a synced checkout — preferred)
 #
+#   0.1.6: the Dockerfile now runs NEMO_COMMAND through `eval` — plain
+#          ${VAR} expansion never re-parses the quotes inside the value, so
+#          0.1.5's quoted requirement reached pip with a literal ' attached.
 #   0.1.5: NeMo-from-git installed WITHOUT its [asr] extras (no hydra) —
 #          Ubuntu 22.04's apt pip (22.0) silently drops extras on direct-URL
 #          requirements. The Dockerfile now upgrades pip first and uses the
@@ -191,7 +194,9 @@ ARG NEMO_COMMAND="pip install 'nemo_toolkit[asr] @ git+https://github.com/NVIDIA
 # conflict into a BUILD failure instead of a runtime one. If they ever
 # conflict for real, build two images with ASR_VARIANT=batch / stream
 # (the app only needs the live WS URL pointed at the second container).
-RUN ${NEMO_COMMAND} && \
+# eval, not plain expansion: the shell never re-parses quotes coming out of
+# a variable, and the requirement's quoted '[asr] @ url' form needs them.
+RUN eval "${NEMO_COMMAND}" && \
     pip install qwen-asr && \
     pip install "fastapi>=0.115" "uvicorn[standard]" websockets python-multipart \
                 silero-vad soundfile numpy huggingface_hub && \
