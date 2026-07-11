@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #   By: Christopher Gray
 #
-#   Updated: 6/18/2026
-#   Version: 0.0.5
+#   Updated: 7/11/2026
+#   Version: 0.0.6
 #   wget --no-cache -O 'find_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/find_vllm.sh' && chmod u+x find_vllm.sh
 #
 # find_vllm.sh — Discover all vLLM instances on an Ubuntu 24.04+ host.
@@ -23,6 +23,10 @@
 #   ./find_vllm.sh                       # human-readable report
 #   ./find_vllm.sh --json                # machine-readable JSON array
 #   ./find_vllm.sh --host 1.2.3.4        # also probe a remote host's API
+#   ./find_vllm.sh --all-gpu             # ALSO list every GPU compute process
+#                                        #   (not just vLLM): PID, VRAM, user,
+#                                        #   uptime and full command line, so
+#                                        #   nothing hiding on the GPU is a mystery
 #
 #   # Send a live test prompt to every detected/reachable instance and print
 #   # the model's reply (verifies the server actually generates, not just /health):
@@ -36,12 +40,20 @@
 
 set -uo pipefail
 
+# Requires bash 4+ for associative arrays (GPU_BY_PID etc.). Ubuntu 24.04 ships
+# bash 5; macOS ships 3.2 — fail with a clear hint instead of `declare -A` spew.
+if [[ -z "${BASH_VERSINFO:-}" || "${BASH_VERSINFO[0]}" -lt 4 ]]; then
+  echo "find_vllm.sh requires bash 4+ (found ${BASH_VERSION:-unknown}). On macOS: brew install bash." >&2
+  exit 1
+fi
+
 # ----------------------------------------------------------------------------
 # Options
 # ----------------------------------------------------------------------------
 JSON=0
 REMOTE_HOST=""
 CURL_TIMEOUT=3
+ALLGPU=0
 TEST=0
 TEST_PROMPT="Reply with a single short sentence confirming you are online and name the model you are."
 MAX_TOKENS=64
@@ -50,6 +62,7 @@ GEN_TIMEOUT=60
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --json) JSON=1; shift ;;
+    --all-gpu|--all) ALLGPU=1; shift ;;
     --host) REMOTE_HOST="${2:-}"; shift 2 ;;
     --timeout) CURL_TIMEOUT="${2:-3}"; shift 2 ;;
     --test) TEST=1; shift ;;
@@ -57,7 +70,7 @@ while [[ $# -gt 0 ]]; do
     --max-tokens) MAX_TOKENS="${2:-64}"; shift 2 ;;
     --gen-timeout) GEN_TIMEOUT="${2:-60}"; shift 2 ;;
     -h|--help)
-      sed -n '2,38p' "$0"; exit 0 ;;
+      sed -n '2,42p' "$0"; exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -94,9 +107,14 @@ HAVE_DOCKER=0; have docker    && docker info >/dev/null 2>&1 && HAVE_DOCKER=1
 #   - api_server / vllm.entrypoints in the command line
 find_vllm_pids() {
   # -f matches against full command line; -a prints the command too, then we cut.
-  pgrep -af 'vllm|vllm\.entrypoints|api_server' 2>/dev/null \
+  # Anchor on "vllm" (covers `vllm serve` and vllm.entrypoints.openai.api_server)
+  # or the openai api_server module path. A bare "api_server" is deliberately NOT
+  # matched — it false-positives on unrelated servers (e.g. --api_server_url ...).
+  pgrep -af 'vllm|openai\.api_server' 2>/dev/null \
     | grep -Ev 'find_vllm\.sh|grep|pgrep' \
-    | awk '{print $1}' | sort -u
+    | awk '{print $1}' \
+    | grep -Ev "^($$|$PPID)\$" \
+    | sort -u
 }
 
 # Extract a flag value from a command line. Handles "--flag value" and
@@ -241,7 +259,9 @@ send_test_prompt() {
 # ----------------------------------------------------------------------------
 # GPU snapshot (once)
 # ----------------------------------------------------------------------------
-declare -A GPU_BY_PID  # pid -> "gpuidx:memMiB; ..."
+declare -A GPU_BY_PID   # pid -> "gpuidx:memMiB; ..."
+declare -A ALLGPU_MEM   # pid -> total VRAM in MiB (summed across GPUs)
+declare -A ALLGPU_GPUS  # pid -> "gpu0,gpu1,"
 if [[ $HAVE_NVSMI -eq 1 ]]; then
   # query compute apps: pid, used mem, gpu uuid -> map uuid to index
   declare -A UUID_IDX
@@ -255,19 +275,84 @@ if [[ $HAVE_NVSMI -eq 1 ]]; then
     [[ -z "$pid" || "$pid" == "[N/A]" ]] && continue
     idx="${UUID_IDX[$uuid]:-?}"
     GPU_BY_PID["$pid"]="${GPU_BY_PID[$pid]:-}gpu${idx}:${mem}; "
+    # Aggregate for the --all-gpu report. On unified-memory parts (e.g. GB10)
+    # used_memory may be [N/A]; treat non-numeric as 0 for summing/sorting.
+    memnum="$mem"; [[ "$memnum" =~ ^[0-9]+$ ]] || memnum=0
+    ALLGPU_MEM["$pid"]=$(( ${ALLGPU_MEM["$pid"]:-0} + memnum ))
+    ALLGPU_GPUS["$pid"]="${ALLGPU_GPUS[$pid]:-}gpu${idx},"
   done < <(nvidia-smi --query-compute-apps=pid,used_memory,gpu_uuid \
             --format=csv,noheader,nounits 2>/dev/null)
 fi
 
-# Find the GPU usage for a process tree (parent pid + children).
-gpu_for_pid() {
-  local pid="$1" acc=""
-  acc="${GPU_BY_PID[$pid]:-}"
-  # include child PIDs (vLLM spawns workers)
+# Print every descendant PID of $1 (children, grandchildren, ...), depth-first.
+# vLLM v1 spawns its EngineCore/workers more than one level down, so a single
+# pgrep -P is not enough to attribute their VRAM to the server process.
+descendants() {
+  local pid="$1" child
   for child in $(pgrep -P "$pid" 2>/dev/null); do
+    echo "$child"
+    descendants "$child"
+  done
+}
+
+# Find the GPU usage for a process tree (parent pid + all descendants).
+gpu_for_pid() {
+  local pid="$1" acc="" child
+  acc="${GPU_BY_PID[$pid]:-}"
+  for child in $(descendants "$pid"); do
     acc="${acc}${GPU_BY_PID[$child]:-}"
   done
   printf '%s' "${acc%%; }"
+}
+
+# --all-gpu: human-readable table of EVERY GPU compute process, biggest first.
+print_all_gpu() {
+  if [[ $HAVE_NVSMI -eq 0 ]]; then
+    echo "${C_WARN}--all-gpu: nvidia-smi not found — cannot list GPU processes${C_RST}"
+    return
+  fi
+  echo "${C_HDR}=== All GPU compute processes (largest VRAM first) ===${C_RST}"
+  if [[ ${#ALLGPU_MEM[@]} -eq 0 ]]; then
+    echo "  ${C_DIM}(none reported by nvidia-smi — run with sudo to see other users' processes)${C_RST}"
+    echo
+    return
+  fi
+  printf "  ${C_KEY}%-8s %-11s %-10s %-9s %-14s %s${C_RST}\n" \
+    "PID" "VRAM(MiB)" "GPU(s)" "USER" "UPTIME" "COMMAND"
+  local pid mem gpus user etime cmd tag
+  # Sort PIDs by aggregated VRAM, descending.
+  for pid in $(for p in "${!ALLGPU_MEM[@]}"; do echo "${ALLGPU_MEM[$p]} $p"; done \
+               | sort -rn | awk '{print $2}'); do
+    mem="${ALLGPU_MEM[$pid]}"
+    gpus="${ALLGPU_GPUS[$pid]%,}"
+    user=$(ps -o user=  -p "$pid" 2>/dev/null | xargs)
+    etime=$(ps -o etime= -p "$pid" 2>/dev/null | xargs)
+    cmd=$(ps -o args=  -p "$pid" 2>/dev/null)
+    [[ -z "$cmd" ]] && cmd="(process not visible — try sudo)"
+    tag=""; grep -qiE 'vllm|openai\.api_server' <<<"$cmd" && tag=" ${C_OK}[vllm]${C_RST}"
+    printf "  %-8s %-11s %-10s %-9s %-14s %s%s\n" \
+      "$pid" "$mem" "${gpus:-?}" "${user:-?}" "${etime:-?}" "${cmd:0:90}" "$tag"
+  done
+  echo
+}
+
+# --all-gpu in JSON mode: array of {pid,vram_mib,gpus,user,uptime,is_vllm,cmdline}.
+allgpu_json() {
+  local arr="[]" pid mem gpus user etime cmd isv obj
+  for pid in "${!ALLGPU_MEM[@]}"; do
+    mem="${ALLGPU_MEM[$pid]}"
+    gpus="${ALLGPU_GPUS[$pid]%,}"
+    user=$(ps -o user=  -p "$pid" 2>/dev/null | xargs)
+    etime=$(ps -o etime= -p "$pid" 2>/dev/null | xargs)
+    cmd=$(ps -o args=  -p "$pid" 2>/dev/null)
+    isv=false; grep -qiE 'vllm|openai\.api_server' <<<"$cmd" && isv=true
+    obj=$(jq -n --arg pid "$pid" --argjson mem "${mem:-0}" --arg gpus "$gpus" \
+      --arg user "$user" --arg etime "$etime" --arg cmd "$cmd" --argjson isv "$isv" \
+      '{pid:$pid,vram_mib:$mem,gpus:($gpus|split(",")|map(select(length>0))),
+        user:$user,uptime:$etime,is_vllm:$isv,cmdline:$cmd}')
+    arr=$(jq -c ". + [${obj}]" <<<"$arr")
+  done
+  jq 'sort_by(-.vram_mib)' <<<"$arr"
 }
 
 # ----------------------------------------------------------------------------
@@ -294,9 +379,12 @@ emit_json_obj() {
 print_instance() {
   local pid="$1"
   local user etime cmd
+  cmd=$(ps -o args= -p "$pid" 2>/dev/null)
+  # PID may have exited between discovery and now (or briefly matched our own
+  # invocation) — skip ghosts with no command line rather than print blanks.
+  [[ -z "${cmd// }" ]] && return
   user=$(ps -o user= -p "$pid" 2>/dev/null | xargs)
   etime=$(ps -o etime= -p "$pid" 2>/dev/null | xargs)
-  cmd=$(ps -o args= -p "$pid" 2>/dev/null)
 
   local ports; ports=$(ports_for_pid "$pid" | tr '\n' ' ' | xargs)
   # vLLM default port is 8000 if none parsed from ss/lsof
@@ -403,6 +491,13 @@ else
 fi
 
 # ----------------------------------------------------------------------------
+# All GPU compute processes (--all-gpu) — not just vLLM
+# ----------------------------------------------------------------------------
+if [[ $ALLGPU -eq 1 && $JSON -eq 0 ]]; then
+  print_all_gpu
+fi
+
+# ----------------------------------------------------------------------------
 # Docker containers running vLLM (bonus)
 # ----------------------------------------------------------------------------
 if [[ $HAVE_DOCKER -eq 1 && $JSON -eq 0 ]]; then
@@ -437,5 +532,11 @@ if [[ -n "$REMOTE_HOST" && $HAVE_CURL -eq 1 ]]; then
 fi
 
 if [[ $JSON -eq 1 ]]; then
-  echo "$RESULTS_JSON" | { [[ $HAVE_JQ -eq 1 ]] && jq . || cat; }
+  if [[ $ALLGPU -eq 1 && $HAVE_JQ -eq 1 ]]; then
+    # Combine: preserve the vLLM array under "vllm", add "all_gpu".
+    jq -n --argjson v "$RESULTS_JSON" --argjson g "$(allgpu_json)" \
+      '{vllm:$v, all_gpu:$g}'
+  else
+    echo "$RESULTS_JSON" | { [[ $HAVE_JQ -eq 1 ]] && jq . || cat; }
+  fi
 fi
