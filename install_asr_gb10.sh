@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #    By: Christopher Gray
-#    Version: 0.1.7
+#    Version: 0.1.8
 #    Updated: 7/11/2026
 #
 #    This script installs the ASR sidecar on an NVIDIA DGX Spark / GB10 (arm64 + Blackwell).
@@ -10,6 +10,10 @@
 #   Installer:
 #     ./install_asr_gb10.sh        (from a synced checkout — preferred)
 #
+#   0.1.8: `pip check` gate no longer fails the build on aarch64 platform
+#          notes (torch cu128 pulls nvidia cu12 sub-wheels like cusparselt
+#          whose tags don't match arm64) — it now fails only on real
+#          "X requires Y" dependency conflicts.
 #   0.1.7: print the installer version at start (verifies you're running
 #          the latest copy, not a stale raw.githubusercontent cache).
 #   0.1.6: the Dockerfile now runs NEMO_COMMAND through `eval` — plain
@@ -64,7 +68,7 @@ set -euo pipefail
 
 # KEEP IN SYNC with the Version/Updated header lines above (printed at start
 # so a curl|bash run can tell a fresh script from a stale CDN-cached copy).
-INSTALLER_VERSION="0.1.7"
+INSTALLER_VERSION="0.1.8"
 INSTALLER_UPDATED="7/11/2026"
 
 # ─────────────────────────────── configuration ───────────────────────────────
@@ -206,8 +210,15 @@ ARG NEMO_COMMAND="pip install 'nemo_toolkit[asr] @ git+https://github.com/NVIDIA
 RUN eval "${NEMO_COMMAND}" && \
     pip install qwen-asr && \
     pip install "fastapi>=0.115" "uvicorn[standard]" websockets python-multipart \
-                silero-vad soundfile numpy huggingface_hub && \
-    pip check
+                silero-vad soundfile numpy huggingface_hub
+
+# Dependency gate: fail only on real conflicts ("X requires Y ..."). pip 25's
+# `pip check` also emits platform-support notes on aarch64 (torch cu128 pulls
+# nvidia cu12 sub-wheels like cusparselt whose tags don't match arm64) —
+# print those but don't fail; torch runs fine on this box regardless.
+RUN pip check > /tmp/pipcheck 2>&1 || true; \
+    cat /tmp/pipcheck; \
+    ! grep -Eq ' requires | has requirement ' /tmp/pipcheck
 
 RUN python3 -c "import nemo.collections.asr, qwen_asr, silero_vad, fastapi, multipart"
 
