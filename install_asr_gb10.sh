@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #    By: Christopher Gray
-#    Version: 0.1.2
+#    Version: 0.1.3
 #    Updated: 7/11/2026
 #
 #    This script installs the ASR sidecar on an NVIDIA DGX Spark / GB10 (arm64 + Blackwell).
@@ -10,6 +10,10 @@
 #   Installer:
 #     ./install_asr_gb10.sh        (from a synced checkout — preferred)
 #
+#   0.1.3: fix arm64 build failure — NeMo's `sox` dep imports numpy in its
+#          legacy setup.py, which always fails in pip's isolated build env;
+#          the Dockerfile now preinstalls numpy/Cython/pybind11 and installs
+#          sox with --no-build-isolation before NeMo.
 #   0.1.2: fully self-contained — embeds the Dockerfile AND the sidecar app
 #          sources (generated block; regenerate with
 #          scripts/embed_asr_sidecar.py), so a detached `curl | bash` run
@@ -149,6 +153,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # index via --build-arg TORCH_COMMAND (see install_asr_gb10.sh trailer).
 ARG TORCH_COMMAND="pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128"
 RUN ${TORCH_COMMAND}
+
+# arm64 source-build shim: NeMo's `sox` dep (pysox) has a legacy setup.py
+# that imports numpy at metadata-generation time, which always fails inside
+# pip's isolated build env. Preinstall the build helpers and install sox
+# WITHOUT isolation (so its setup.py sees numpy) before NeMo resolves it.
+RUN pip install numpy Cython pybind11 packaging setuptools wheel && \
+    pip install --no-build-isolation sox
 
 # Order matters: NeMo pins its stack first, qwen-asr layers on top. `pip
 # check` + the import smoke test below turn any transformers/lightning
@@ -974,13 +985,16 @@ ${SUDO} docker build --pull \
   --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
   --build-arg "TORCH_COMMAND=${TORCH_COMMAND}" \
   -t "${IMAGE}" . \
-  || die "Image build failed. If 'pip check' or the import smoke test failed, the
-    NeMo × qwen-asr stacks conflict on this base — build two single-engine
-    containers instead:
+  || die "Image build failed — scroll up for the first real error.
+    • A dependency failed building from source (arm64 has no wheel for it,
+      e.g. 'ModuleNotFoundError' during metadata generation)? Add it to the
+      no-build-isolation shim in the Dockerfile — or sidestep every NeMo
+      build issue at once with NVIDIA's prebuilt NeMo base image:
+      ASR_BASE_IMAGE=nvcr.io/nvidia/nemo:25.04 ASR_TORCH_COMMAND=true ./install_asr_gb10.sh
+    • 'pip check' / the import smoke test failed (NeMo × qwen-asr version
+      conflict)? Build two single-engine containers instead:
       ASR_VARIANT=batch  ASR_CONTAINER_NAME=asr-gb10-batch  ./install_asr_gb10.sh
-      ASR_VARIANT=stream ASR_CONTAINER_NAME=asr-gb10-stream ASR_PORT=8791 ./install_asr_gb10.sh
-    NeMo wheel pain on aarch64 (numba/llvmlite)? Try the NeMo base image:
-      ASR_BASE_IMAGE=nvcr.io/nvidia/nemo:25.04 ASR_TORCH_COMMAND=true ./install_asr_gb10.sh"
+      ASR_VARIANT=stream ASR_CONTAINER_NAME=asr-gb10-stream ASR_PORT=8791 ./install_asr_gb10.sh"
 log "Built ${IMAGE}."
 
 # ─────────────────────────── 7. pre-fetch models ─────────────────────────────
