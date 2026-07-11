@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.3.4  |  Update: 7/11/2026
+# Christopher Gray  |  Version: 0.3.5  |  Update: 7/11/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
@@ -37,6 +37,16 @@
 #   (interactive) or reclaims it only from a prior vLLM process (headless).
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.3.5  7/11/2026
+#   - NVFP4 kernel-compile fix. On Blackwell (GB10, sm_121) FlashInfer JIT-compiles
+#     ~29 CUTLASS GEMM kernels on first NVFP4/FP8 launch; ninja defaults to one
+#     compile per core (~20) and each nvcc needs several GB, so the compiler was
+#     OOM-killed ("Killed") and the engine died. Now: export MAX_JOBS (default 4)
+#     + NVCC_THREADS=1 to cap parallelism; detect and export CUDA_HOME/PATH so
+#     nvcc is found (and warn if it isn't); raise the readiness wait to
+#     VLLM_READY_TIMEOUT (default 1800s) since the one-time compile can take
+#     10-30 min (cached under /root/.cache/flashinfer afterward).
 #
 # v0.3.4  7/11/2026
 #   - Auto-update vLLM (AUTO_UPDATE_VLLM=true): before serving, the script checks
@@ -214,7 +224,7 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.3.4
+Version:  0.3.5
 Last Updated:  7/11/2026
 
 Update Yourself:
@@ -263,6 +273,19 @@ AUTO_DOWNLOAD=true
 # upstream release could regress a working stack — set false to pin the installed
 # version once you have one that works (e.g. after NVFP4 support lands).
 AUTO_UPDATE_VLLM=true
+
+# Quantized models (NVFP4/FP8 on Blackwell sm_120/121) make FlashInfer JIT-compile
+# ~29 CUTLASS GEMM kernels on first launch. ninja defaults to one compile per CPU
+# core (~20), and each nvcc uses several GB — that OOM-kills the compiler
+# ("Killed") and the engine dies. MAX_JOBS caps how many compile in parallel.
+# Lower it (2, then 1) if you still see "Killed"; the compiled kernels are cached
+# under /root/.cache/flashinfer, so this cost is paid only on the first launch.
+MAX_JOBS=4
+
+# How long _vllm_launch waits for a model to report ready before moving on. The
+# first NVFP4/FP8 launch includes the one-time kernel compile above, which can
+# take 10-30 min, so this is generous. Later launches (cache warm) are quick.
+VLLM_READY_TIMEOUT=1800
 
 # =============================================
 # OPTIONAL FEATURES — toggle on/off
@@ -1584,7 +1607,9 @@ _vllm_launch() {
     # Poll every 5s (was 15s) so small models are detected ready up to ~14s
     # sooner; print progress only every 30s so the log stays as quiet as before.
     # /health is cheaper than /v1/models and returns 200 once the engine is up.
-    local elapsed=0 timeout=720 poll=5  # 12-minute max (large models take ~5-10 min)
+    # First NVFP4/FP8 launch includes a one-time CUTLASS kernel compile, so the
+    # timeout is configurable (VLLM_READY_TIMEOUT, default 1800s / 30 min).
+    local elapsed=0 timeout="${VLLM_READY_TIMEOUT:-1800}" poll=5
     while true; do
         if ! kill -0 "$launch_pid" 2>/dev/null; then
             echo "   ❌ $name process died during loading — log tail + root cause:"
@@ -1842,6 +1867,28 @@ if [ "$HEADLESS" -eq 0 ]; then
 fi
 
 export TORCH_FLOAT32_MATMUL_PRECISION=high
+
+# ── CUDA toolchain + JIT-compile parallelism (for NVFP4/FP8 kernel builds) ────
+# FlashInfer compiles CUTLASS kernels with nvcc on first launch. Make sure nvcc
+# is discoverable and cap the parallel compile jobs so the build doesn't OOM.
+if [ -z "${CUDA_HOME:-}" ]; then
+    for _cuda in /usr/local/cuda /usr/local/cuda-* /opt/cuda; do
+        [ -x "$_cuda/bin/nvcc" ] && { export CUDA_HOME="$_cuda"; break; }
+    done
+fi
+if [ -n "${CUDA_HOME:-}" ]; then
+    case ":$PATH:" in *":$CUDA_HOME/bin:"*) : ;; *) export PATH="$CUDA_HOME/bin:$PATH" ;; esac
+    echo "✅ CUDA toolchain: CUDA_HOME=$CUDA_HOME  ($("$CUDA_HOME/bin/nvcc" --version 2>/dev/null | sed -n 's/.*release //p'))"
+elif command -v nvcc >/dev/null 2>&1; then
+    echo "✅ nvcc found on PATH: $(command -v nvcc)"
+else
+    echo "⚠️  nvcc not found — NVFP4/FP8 models that JIT-compile CUTLASS kernels may"
+    echo "    fail. Install the CUDA toolkit or set CUDA_HOME to your CUDA install."
+fi
+# Cap FlashInfer/ninja compile parallelism to avoid OOM-killed ('Killed') builds.
+export MAX_JOBS="${MAX_JOBS:-4}"
+export NVCC_THREADS="${NVCC_THREADS:-1}"
+echo "✅ Kernel-compile parallelism: MAX_JOBS=$MAX_JOBS (lower to 2/1 if a build is OOM-killed)"
 
 if [ "${#RUN_SELECTED[@]}" -eq 0 ]; then
     echo "⏭️  No models selected to serve — skipping vLLM startup."
