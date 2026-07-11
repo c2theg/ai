@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.3.2  |  Update: 7/11/2026
+# Christopher Gray  |  Version: 0.3.3  |  Update: 7/11/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
@@ -37,6 +37,26 @@
 #   (interactive) or reclaims it only from a prior vLLM process (headless).
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.3.3  7/11/2026
+#   - Qwen3-Reranker-4B is no longer pre-selected — DEFAULT_DL_INDICES and
+#     DEFAULT_SERVE_INDICES are now empty, so nothing auto-starts; pick models in
+#     the menus or with --start. Dropped the "★Default" label.
+#   - RIGHT-SIZED --gpu-memory-utilization for the small models. The old values
+#     were oversized on a false premise ("raise the fraction to clear the
+#     all-process baseline"): the fraction is how much of the 121.7 GB pool THIS
+#     model reserves and must be free at startup, so a big fraction on a small
+#     model both wastes RAM and fails to start when memory is tight. The 4B
+#     reranker at 0.55 was holding ~68 GB. New values (approx GB on a 121 GB box):
+#       Qwen3-Reranker-4B 0.55→0.12 (~15), Qwen3-Embedding-4B 0.60→0.10 (~12),
+#       bge-m3 0.45→0.06 (~7), bge-reranker-v2-m3 0.45→0.06 (~7),
+#       Qwen3.5-4B 0.50→0.12 (~15), Qwen3.5-2B 0.45→0.08 (~10),
+#       Qwen3.5-9B 0.75→0.20 (~24).
+#   - Pre-flight memory check: before launching, the script compares the model's
+#     reservation (fraction × total) against free RAM and, if it won't fit, prints
+#     an actionable message (free memory or lower the fraction) instead of letting
+#     vLLM crash with the cryptic "Free memory … less than desired" ValueError.
+#     Headless skips a doomed launch; interactive asks before trying.
 #
 # v0.3.2  7/11/2026
 #   - Predictable ports: served models are now assigned SEQUENTIAL ports in
@@ -181,7 +201,7 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.3.2
+Version:  0.3.3
 Last Updated:  7/11/2026
 
 Update Yourself:
@@ -340,7 +360,7 @@ _add "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"        "Nemotron-3-Nan
 _add "BAAI/bge-m3"                                               "bge-m3"                                "BGE-M3 (Embeddings)"                     3    4   8011  "Embeddings"
 _add "Qwen/Qwen3-Embedding-4B"                                   "Qwen3-Embedding-4B"                    "Qwen3-Embedding-4B (Embeddings)"         8   10   8010  "Embeddings"
 _add "BAAI/bge-reranker-v2-m3"                                   "bge-reranker-v2-m3"                    "BGE-Reranker-v2-m3 (Reranking)"          2    3   8020  "Reranking"
-_add "Qwen/Qwen3-Reranker-4B"                                    "Qwen3-Reranker-4B"                     "Qwen3-Reranker-4B (Reranking) ★Default"   8    9   8021  "Reranking"
+_add "Qwen/Qwen3-Reranker-4B"                                    "Qwen3-Reranker-4B"                     "Qwen3-Reranker-4B (Reranking)"            8    9   8021  "Reranking"
 _add "nvidia/parakeet-tdt-0.6b-v3"                               "parakeet-tdt-0.6b-v3"                  "Parakeet-TDT-0.6B v3 (ASR / NeMo)"       1    0      0  "ASR"
 _add "nvidia/nemotron-speech-streaming-en-0.6b"                  "nemotron-speech-streaming-en-0.6b"     "Nemotron-Speech-Streaming-0.6B (ASR)"    1    0      0  "ASR"
 
@@ -391,10 +411,10 @@ _add "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast"    "Qwen3.6-35B-A3B-NVFP4-Fast"   "Qwe
 MODEL_TOTAL=${#MDL_HF[@]}
 
 # ── Default pre-selected models ────────────────────────────────────────────────
-# Qwen3-Reranker-4B (catalog idx 10) is pre-selected for download and serve.
-# Users can deselect it in the interactive menus below.
-DEFAULT_DL_INDICES=(10)
-DEFAULT_SERVE_INDICES=(10)
+# Nothing is pre-selected — the user picks models in the interactive menus (or
+# names them with --start). Add catalog indices here to pre-check them.
+DEFAULT_DL_INDICES=()
+DEFAULT_SERVE_INDICES=()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HEADLESS HELPERS — model resolution, catalog listing, @reboot cron management
@@ -1363,6 +1383,43 @@ _ensure_model_downloaded() {
     return 1
 }
 
+# Pre-flight memory check. vLLM reserves (gpu-memory-utilization × total pool)
+# and requires that much to be FREE at startup, else it dies with
+# "Free memory ... is less than desired GPU memory utilization". This catches
+# that early with an actionable message instead of a cryptic engine-core crash.
+# Uses /proc/meminfo MemAvailable as the free-memory proxy (best-effort: it can
+# be optimistic vs vLLM's CUDA view, so a pass isn't a guarantee — a fail is).
+# Args: $1 = model name, $2 = the gpu-memory-utilization fraction.
+_preflight_memory() {
+    local name="$1" gmu="$2" mt_kb ma_kb
+    mt_kb=$(awk '/^MemTotal:/{print $2}'     /proc/meminfo 2>/dev/null)
+    ma_kb=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)
+    [[ "$mt_kb" =~ ^[0-9]+$ ]] && [[ "$ma_kb" =~ ^[0-9]+$ ]] || return 0  # can't read → don't block
+
+    local total_gb=$(( mt_kb / 1024 / 1024 ))
+    local avail_gb=$(( ma_kb / 1024 / 1024 ))
+    local req_gb
+    req_gb=$(awk -v t="$total_gb" -v f="$gmu" 'BEGIN{printf "%d", (t*f)+0.999}')  # ceil
+    [ "$req_gb" -le "$avail_gb" ] && return 0
+
+    echo ""
+    echo "  ⚠️  Pre-flight: $name wants --gpu-memory-utilization $gmu ≈ ${req_gb} GB,"
+    echo "      but only ${avail_gb} GB of ${total_gb} GB is free right now."
+    echo "      vLLM needs the whole reservation free at startup, so it would fail with"
+    echo "      a 'Free memory … is less than desired' ValueError."
+    echo "      → Free memory (stop other models: pkill -9 -f 'vllm serve') or lower"
+    echo "        this model's --gpu-memory-utilization."
+    if [ "$HEADLESS" -eq 1 ]; then
+        echo "      Headless: skipping $name to avoid a doomed launch."
+        return 1
+    fi
+    printf "  Try to launch it anyway? [y/N]: "
+    read -r _ans
+    [[ "$_ans" =~ ^[Yy]$ ]] && return 0
+    echo "      Skipping $name."
+    return 1
+}
+
 # Helper: launch one model, echo command, wait 2s, confirm process is alive
 # Usage: _vllm_launch <catalog_idx> [extra vllm args...]
 _vllm_launch() {
@@ -1385,6 +1442,17 @@ _vllm_launch() {
     # Predictable-port guard: make sure nothing else already holds this port.
     if ! _ensure_port_available "$port" "$name"; then
         echo "⚠️  [idx $idx] $name — port $port unavailable; not starting this model."
+        return 1
+    fi
+
+    # Pre-flight memory check: pull the gpu-memory-utilization out of the args and
+    # confirm the reservation fits in free RAM before we bother launching.
+    local _a _prev="" _gmu=""
+    for _a in "$@"; do
+        [ "$_prev" = "--gpu-memory-utilization" ] && { _gmu="$_a"; break; }
+        _prev="$_a"
+    done
+    if [ -n "$_gmu" ] && ! _preflight_memory "$name" "$_gmu"; then
         return 1
     fi
 
@@ -1831,45 +1899,48 @@ _serve_model() {
             --trust-remote-code
         ;;
 
-    # gpu-memory-utilization is intentionally high (0.45) for the tiny embed/
-    # rerank models: on unified memory vLLM's KV-cache profiler includes ALL
-    # running processes' GPU footprint in the baseline, so a loaded 35B's ~38 GB
-    # shows up here. Budget must exceed (38 + model) GB.
+    # --gpu-memory-utilization is a FRACTION OF THE WHOLE ~121.7 GB pool that THIS
+    # model reserves for weights + KV, and vLLM requires that much to be FREE at
+    # startup. So size it to the model's real footprint, NOT high: a big fraction
+    # on a tiny model both wastes the pool and fails to start whenever memory is
+    # tight (0.55 on the 4B reranker demanded 67 GB → the ValueError we hit).
+    # Rough guide: 0.05≈6 GB, 0.10≈12 GB, 0.15≈18 GB, 0.20≈24 GB.
     # max-model-len capped at 8192 — embedding models default to 40960 (huge KV).
-    "BAAI/bge-m3")
+    "BAAI/bge-m3")   # ~2 GB weights
         _vllm_launch "$idx" \
             --served-model-name "bge-m3" \
             --dtype auto \
-            --gpu-memory-utilization 0.45 \
+            --gpu-memory-utilization 0.06 \
             --max-model-len 8192 \
             --trust-remote-code
         ;;
 
-    "Qwen/Qwen3-Embedding-4B")
+    "Qwen/Qwen3-Embedding-4B")   # ~8 GB weights
         _vllm_launch "$idx" \
             --served-model-name "Qwen3-Embedding-4B" \
             --dtype auto \
-            --gpu-memory-utilization 0.60 \
+            --gpu-memory-utilization 0.10 \
             --max-model-len 8192 \
             --trust-remote-code
         ;;
 
-    "BAAI/bge-reranker-v2-m3")
+    "BAAI/bge-reranker-v2-m3")   # ~2 GB weights
         _vllm_launch "$idx" \
             --served-model-name "bge-reranker-v2-m3" \
             --dtype auto \
-            --gpu-memory-utilization 0.45 \
+            --gpu-memory-utilization 0.06 \
             --max-model-len 8192 \
             --trust-remote-code
         ;;
 
     # Generative yes/no reranker — clients score via logprobs on "yes"/"no"
     # tokens: POST /v1/completions with logprobs=1; compare P("yes") vs P("no").
+    # ~9 GB weights; 0.12≈15 GB leaves room for KV at max-model-len 10000.
     "Qwen/Qwen3-Reranker-4B")
         _vllm_launch "$idx" \
             --served-model-name "Qwen3-Reranker-4B" \
             --dtype auto \
-            --gpu-memory-utilization 0.55 \
+            --gpu-memory-utilization 0.12 \
             --max-model-len 10000 \
             --enable-prefix-caching \
             --max-logprobs 20 \
@@ -1930,11 +2001,12 @@ _serve_model() {
         ;;
 
     # ── Small models (1-hour idle-sleep via catalog SLEEP_MIN=60) ─────────────
-    "Qwen/Qwen3.5-4B")
+    # Fractions sized to each model's own footprint (weights + KV), not the pool.
+    "Qwen/Qwen3.5-4B")   # ~8 GB weights; 0.12≈15 GB
         _vllm_launch "$idx" \
             --served-model-name "Qwen3.5-4B" \
             --dtype auto \
-            --gpu-memory-utilization 0.50 \
+            --gpu-memory-utilization 0.12 \
             --max-model-len 32768 \
             --enable-prefix-caching \
             --trust-remote-code \
@@ -1942,11 +2014,11 @@ _serve_model() {
             --tool-call-parser hermes
         ;;
 
-    "Qwen/Qwen3.5-2B")
+    "Qwen/Qwen3.5-2B")   # ~4 GB weights; 0.08≈10 GB
         _vllm_launch "$idx" \
             --served-model-name "Qwen3.5-2B" \
             --dtype auto \
-            --gpu-memory-utilization 0.45 \
+            --gpu-memory-utilization 0.08 \
             --max-model-len 32768 \
             --enable-prefix-caching \
             --trust-remote-code \
@@ -1954,13 +2026,12 @@ _serve_model() {
             --tool-call-parser hermes
         ;;
 
-    # gpu-memory-utilization 0.75: when Nemotron-3-Nano-Omni-30B (~62 GB) is the
-    # co-resident model, 0.75×121=90.75 GB budget leaves ~10 GB KV after weights.
+    # ~18 GB weights; 0.20≈24 GB leaves ~6 GB for KV at max-model-len 16384.
     "Qwen/Qwen3.5-9B")
         _vllm_launch "$idx" \
             --served-model-name "Qwen3.5-9B" \
             --dtype auto \
-            --gpu-memory-utilization 0.75 \
+            --gpu-memory-utilization 0.20 \
             --max-model-len 16384 \
             --enable-prefix-caching \
             --trust-remote-code \
