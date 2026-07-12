@@ -5,8 +5,9 @@
 #
 # By: generated for Christopher Gray
 # Usage:
-#   sudo ./install_searxng.sh                 # install + start
-#   sudo ./install_searxng.sh --settings /path/to/searxng_settings.yml
+#   sudo ./install_searxng.sh                 # download config + install + start
+#   sudo ./install_searxng.sh --settings /path/to/searxng_settings.yml  # use local file
+#   sudo ./install_searxng.sh --url <raw-url> # download config from a custom URL
 #   sudo ./install_searxng.sh --port 8080 --host 0.0.0.0
 #   sudo ./install_searxng.sh --uninstall     # stop & remove the stack
 #
@@ -16,7 +17,10 @@ set -euo pipefail
 # Defaults (override via flags)
 # ---------------------------------------------------------------------------
 INSTALL_DIR="/opt/searxng"
-SETTINGS_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/searxng_settings.yml"
+# Where to fetch the config from by default (override with --url).
+SETTINGS_URL="https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/searxng_settings.yml"
+# Local settings file; if set (via --settings) it wins over downloading.
+SETTINGS_SRC=""
 PORT="8080"
 HOST="0.0.0.0"
 IMAGE="searxng/searxng:latest"
@@ -28,13 +32,14 @@ UNINSTALL=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --settings)   SETTINGS_SRC="$2"; shift 2 ;;
+    --url)        SETTINGS_URL="$2"; shift 2 ;;
     --dir)        INSTALL_DIR="$2";  shift 2 ;;
     --port)       PORT="$2";         shift 2 ;;
     --host)       HOST="$2";         shift 2 ;;
     --image)      IMAGE="$2";        shift 2 ;;
     --uninstall)  UNINSTALL=1;       shift   ;;
     -h|--help)
-      grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -n 14
+      grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -n 13
       exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
@@ -67,8 +72,12 @@ fi
 # ---------------------------------------------------------------------------
 # Validate settings source
 # ---------------------------------------------------------------------------
-[[ -f "$SETTINGS_SRC" ]] || die "Settings file not found: $SETTINGS_SRC"
-log "Using settings file: $SETTINGS_SRC"
+if [[ -n "$SETTINGS_SRC" ]]; then
+  [[ -f "$SETTINGS_SRC" ]] || die "Settings file not found: $SETTINGS_SRC"
+  log "Using local settings file: $SETTINGS_SRC"
+else
+  log "Will download settings from: $SETTINGS_URL"
+fi
 
 # ---------------------------------------------------------------------------
 # Install Docker + Compose plugin if missing
@@ -91,8 +100,21 @@ fi
 log "Creating $INSTALL_DIR ..."
 mkdir -p "$INSTALL_DIR"
 
-# Copy settings.yml in place
-install -m 0644 "$SETTINGS_SRC" "$INSTALL_DIR/settings.yml"
+# Put settings.yml in place — either from a local file or downloaded.
+if [[ -n "$SETTINGS_SRC" ]]; then
+  log "Copying local settings into $INSTALL_DIR/settings.yml ..."
+  install -m 0644 "$SETTINGS_SRC" "$INSTALL_DIR/settings.yml"
+else
+  log "Downloading settings from $SETTINGS_URL ..."
+  tmp="$(mktemp)"
+  curl -fsSL "$SETTINGS_URL" -o "$tmp" \
+    || die "Failed to download settings from $SETTINGS_URL"
+  # Sanity-check it actually looks like a SearXNG config before using it.
+  grep -q '^use_default_settings:' "$tmp" \
+    || die "Downloaded file does not look like a SearXNG settings.yml"
+  install -m 0644 "$tmp" "$INSTALL_DIR/settings.yml"
+  rm -f "$tmp"
+fi
 
 # ---------------------------------------------------------------------------
 # Inject a fresh secret_key (never ship the committed placeholder to prod)
