@@ -1,12 +1,20 @@
-# By: Christopher Gray  |  Version: 0.0.22  |  Updated: 5/24/2026
+# By: Christopher Gray  |  Version: 0.0.28  |  Updated: 7/11/2026
 # Change the key to some random string! - Use BitWarden or some other source to generate 40+ chars stings
 # download:  wget https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/searxng_settings.yml && cp searxng_settings.yml /opt/models/searxng/settings.yml
+#
+#---------------------------------------------------------------------------------
+# In OpenWebUI: Admin Settings → Web Search →
+#   Enable Web Search: on
+#   Engine: searxng
+#   Searxng Query URL:
+#     http://<host>:8080/search?q=<query>&format=json
+#   The literal <query> placeholder must be there — OpenWebUI substitutes it.
+#---------------------------------------------------------------------------------
 
 use_default_settings: true
 
 server:
-  secret_key: "LVnu1rn^CZILv40^e7v^YE@AWx@jD*bVBFVSCl9%nQ275"
-  #secret_key: "${SECRET}"
+  secret_key: "${SECRET}"
   limiter: false
   image_proxy: true
   port: 8080
@@ -19,6 +27,20 @@ ui:
   query_in_title: false
   infinite_scroll: false
   center_alignment: false
+  # Custom category tabs (order shown in the UI). Bang-query any of these,
+  # e.g.  !security log4j   |   !ai gpt-5   |   !finance rate cut
+  categories_as_tabs:
+    general:
+    news:
+    tech:
+    ai:
+    security:
+    finance:
+    it:
+    science:
+    videos:
+    sports:
+    weather:
 
 
 search:
@@ -45,72 +67,89 @@ engines:
   - name: google
     engine: google
     shortcut: g
+    categories: [general]
 
   - name: bing
     engine: bing
     shortcut: b
+    categories: [general]
 
   - name: duckduckgo
     engine: duckduckgo
     shortcut: ddg
+    categories: [general]
 
   - name: brave
     engine: brave
     shortcut: brave
+    categories: [general]
 
   - name: google news
     engine: google_news
     shortcut: gn
+    categories: [news]
 
   - name: bing news
     engine: bing_news
     shortcut: bn
+    categories: [news]
 
   - name: reddit
     engine: reddit
     shortcut: re
+    categories: [news]
 
   - name: yahoo finance
     engine: yahoo_finance
     shortcut: yf
+    categories: [finance]
 
   - name: tradingview
     engine: tradingview
     shortcut: tv
+    categories: [finance]
     
   - name: open meteo
     engine: open_meteo
     shortcut: weather
+    categories: [weather]
     
   - name: arxiv
     engine: arxiv
     shortcut: arxiv
+    categories: [science]
 
   - name: github
     engine: github
     shortcut: gh
+    categories: [it]
 
   - name: youtube
     engine: youtube_noapi
     shortcut: yt
+    categories: [videos]
 
   - name: wikipedia
     engine: wikipedia
     shortcut: wp
+    categories: [general]
 
   - name: phind
     engine: phind
     shortcut: ph
+    categories: [it]
 
   - name: espn
     engine: xpath
     shortcut: espn
+    categories: [sports]
     url: https://www.espn.com/search/_/q/{query}
 
 #-----------------------------------------------------------
   - name: my rss feed
     engine: xml_feed
     shortcut: rss
+    categories: [news]
     url: https://feeds.bbci.co.uk/news/rss.xml
 
 #-----------------------------------------------------------
@@ -119,105 +158,510 @@ engines:
   - name: bbc world news
     engine: xml_feed
     shortcut: bbc
+    categories: [news]
     url: https://feeds.bbci.co.uk/news/world/rss.xml
 
   - name: cnn world
     engine: xml_feed
     shortcut: cnn
+    categories: [news]
     url: http://rss.cnn.com/rss/edition_world.rss
 
   - name: reuters world
     engine: xml_feed
     shortcut: reu
+    categories: [news]
     url: https://news.yahoo.com/rss/world
 
   - name: al jazeera
     engine: xml_feed
     shortcut: aj
+    categories: [news]
     url: https://www.aljazeera.com/xml/rss/all.xml
 
   - name: ap news
     engine: xml_feed
     shortcut: ap
+    categories: [news]
     url: https://feeds.npr.org/1001/rss.xml
 
   # 💻 Tech News
   - name: techcrunch
     engine: xml_feed
     shortcut: tc
+    categories: [tech]
     url: https://techcrunch.com/feed/
 
   - name: ars technica
     engine: xml_feed
     shortcut: ars
+    categories: [tech]
     url: https://feeds.arstechnica.com/arstechnica/index
 
   - name: the verge
     engine: xml_feed
     shortcut: verge
+    categories: [tech]
     url: https://www.theverge.com/rss/index.xml
 
   - name: wired
     engine: xml_feed
     shortcut: wired
+    categories: [tech]
     url: https://www.wired.com/feed/rss
 
   - name: hacker news
     engine: xml_feed
     shortcut: hn
+    categories: [tech]
     url: https://news.ycombinator.com/rss
 
   # 💰 Financial News
   - name: bbc business
     engine: xml_feed
     shortcut: bbcbiz
+    categories: [finance]
     url: https://feeds.bbci.co.uk/news/business/rss.xml
 
   - name: cnbc world
     engine: xml_feed
     shortcut: cnbc
+    categories: [finance]
     url: https://www.cnbc.com/id/100003114/device/rss/rss.html
 
   - name: forbes business
     engine: xml_feed
     shortcut: forbes
+    categories: [finance]
     url: https://www.forbes.com/business/feed/
 
   - name: bloomberg technology
     engine: xml_feed
     shortcut: bloombiz
+    categories: [finance]
     url: https://feeds.bloomberg.com/technology/news.rss
 
-  - name: yahoo finance
+  - name: yahoo finance news
     engine: xml_feed
-    shortcut: yf
+    shortcut: yfn
+    categories: [finance]
     url: https://news.yahoo.com/rss/
+
+  - name: wsj markets
+    engine: xml_feed
+    shortcut: wsj
+    categories: [finance]
+    url: https://feeds.a.dj.com/rss/RSSMarketsMain.xml
+
+  - name: marketwatch top stories
+    engine: xml_feed
+    shortcut: mw
+    categories: [finance]
+    url: https://feeds.content.dowjones.io/public/rss/mw_topstories
+
+  - name: financial times
+    engine: xml_feed
+    shortcut: ft
+    categories: [finance]
+    url: https://www.ft.com/rss/home
+
+  - name: seeking alpha
+    engine: xml_feed
+    shortcut: sa
+    categories: [finance]
+    url: https://seekingalpha.com/feed.xml
+
+  - name: investing.com news
+    engine: xml_feed
+    shortcut: inv
+    categories: [finance]
+    url: https://www.investing.com/rss/news.rss
+
+  - name: the economist finance
+    engine: xml_feed
+    shortcut: econ
+    categories: [finance]
+    url: https://www.economist.com/finance-and-economics/rss.xml
+
+  - name: coindesk
+    engine: xml_feed
+    shortcut: cd
+    categories: [finance]
+    url: https://www.coindesk.com/arc/outboundfeeds/rss/
+
+  - name: cointelegraph
+    engine: xml_feed
+    shortcut: ct
+    categories: [finance]
+    url: https://cointelegraph.com/rss
 
   # 🤖 AI News
   - name: mit tech review ai
     engine: xml_feed
     shortcut: mitai
+    categories: [ai]
     url: https://www.technologyreview.com/feed/
 
   - name: venturebeat ai
     engine: xml_feed
     shortcut: vbai
+    categories: [ai]
     url: https://venturebeat.com/feed/
+
+  # 🧠 AI Labs / Vendors
+  - name: openai news
+    engine: xml_feed
+    shortcut: oai
+    categories: [ai]
+    url: https://openai.com/news/rss.xml
+
+  - name: google deepmind blog
+    engine: xml_feed
+    shortcut: dm
+    categories: [ai]
+    url: https://deepmind.google/blog/rss.xml
+
+  - name: google ai blog
+    engine: xml_feed
+    shortcut: gai
+    categories: [ai]
+    url: https://blog.google/technology/ai/rss/
+
+  - name: nvidia blog
+    engine: xml_feed
+    shortcut: nv
+    categories: [ai]
+    url: https://blogs.nvidia.com/feed/
+
+  - name: nvidia developer blog
+    engine: xml_feed
+    shortcut: nvdev
+    categories: [ai]
+    url: https://developer.nvidia.com/blog/feed
+
+  - name: hugging face blog
+    engine: xml_feed
+    shortcut: hf
+    categories: [ai]
+    url: https://huggingface.co/blog/feed.xml
+
+  - name: qwen blog
+    engine: xml_feed
+    shortcut: qwen
+    categories: [ai]
+    url: https://qwenlm.github.io/blog/index.xml
+
+  - name: mistral ai news
+    engine: xml_feed
+    shortcut: mistral
+    categories: [ai]
+    url: https://mistral.ai/rss.xml
+
+  - name: meta newsroom tech
+    engine: xml_feed
+    shortcut: metaai
+    categories: [ai]
+    url: https://about.fb.com/news/category/technology-and-innovation/feed/
+
+  - name: the batch
+    engine: xml_feed
+    shortcut: batch
+    categories: [ai]
+    url: https://www.deeplearning.ai/the-batch/feed/
+
+  - name: import ai
+    engine: xml_feed
+    shortcut: importai
+    categories: [ai]
+    url: https://importai.substack.com/feed
+
+  # 🤖🔒 AI Security
+  - name: simon willison
+    engine: xml_feed
+    shortcut: simonw
+    categories: [ai, security]
+    url: https://simonwillison.net/atom/everything/
+
+  - name: nvidia ai security
+    engine: xml_feed
+    shortcut: nvaisec
+    categories: [ai, security]
+    url: https://developer.nvidia.com/blog/category/cybersecurity/feed/
+
+  - name: microsoft ai red team
+    engine: xml_feed
+    shortcut: msft-airt
+    categories: [ai, security]
+    url: https://www.microsoft.com/en-us/security/blog/topic/ai-and-machine-learning/feed/
+
+  # ─── Note: Anthropic, DeepSeek, Moonshot/Kimi, and Zhipu/GLM publish no
+  #     public RSS. Track them with the google_news engine, e.g.
+  #       !gn anthropic claude   |   !gn deepseek release   |   !gn kimi moonshot
+  # ───────────────────────────────────────────────────────────────────────
+
+  # 🔒 Cybersecurity News
+  - name: the hacker news
+    engine: xml_feed
+    shortcut: thn
+    categories: [security]
+    url: https://feeds.feedburner.com/TheHackersNews
+
+  - name: bleeping computer
+    engine: xml_feed
+    shortcut: bc
+    categories: [security]
+    url: https://www.bleepingcomputer.com/feed/
+
+  - name: krebs on security
+    engine: xml_feed
+    shortcut: krebs
+    categories: [security]
+    url: https://krebsonsecurity.com/feed/
+
+  - name: dark reading
+    engine: xml_feed
+    shortcut: dr
+    categories: [security]
+    url: https://www.darkreading.com/rss.xml
+
+  - name: securityweek
+    engine: xml_feed
+    shortcut: sw
+    categories: [security]
+    url: https://www.securityweek.com/feed/
+
+  - name: the record
+    engine: xml_feed
+    shortcut: rec
+    categories: [security]
+    url: https://therecord.media/feed/
+
+  - name: schneier on security
+    engine: xml_feed
+    shortcut: schneier
+    categories: [security]
+    url: https://www.schneier.com/feed/atom/
+
+  - name: cisa advisories
+    engine: xml_feed
+    shortcut: cisa
+    categories: [security]
+    url: https://www.cisa.gov/cybersecurity-advisories/all.xml
+
+  - name: nvd cve feed
+    engine: xml_feed
+    shortcut: cve
+    categories: [security]
+    url: https://nvd.nist.gov/feeds/xml/cve/misc/nvd-rss.xml
+
+  # 🛡️ Vendor Threat Research / Blogs
+  - name: fortinet threat research
+    engine: xml_feed
+    shortcut: forti
+    categories: [security]
+    url: https://feeds.fortinet.com/fortinet/blog/threat-research
+
+  - name: palo alto unit 42
+    engine: xml_feed
+    shortcut: unit42
+    categories: [security]
+    url: https://unit42.paloaltonetworks.com/feed/
+
+  - name: f5 labs
+    engine: xml_feed
+    shortcut: f5
+    categories: [security]
+    url: https://www.f5.com/labs/rss-feeds/all.xml
+
+  - name: crowdstrike blog
+    engine: xml_feed
+    shortcut: cs
+    categories: [security]
+    url: https://www.crowdstrike.com/en-us/blog/feed/
+
+  - name: google online security blog
+    engine: xml_feed
+    shortcut: gsec
+    categories: [security]
+    url: https://security.googleblog.com/feeds/posts/default
+
+  - name: google mandiant blog
+    engine: xml_feed
+    shortcut: mand
+    categories: [security]
+    url: https://www.mandiant.com/resources/blog/rss.xml
+
+  - name: microsoft msrc blog
+    engine: xml_feed
+    shortcut: msrc
+    categories: [security]
+    url: https://msrc.microsoft.com/blog/feed/
+
+  - name: mitre attack
+    engine: xml_feed
+    shortcut: mitre
+    categories: [security]
+    url: https://medium.com/feed/mitre-attack
+
+  # 🐞 Vulnerabilities / Exploits (CVE sources)
+  - name: nvd cve analyzed
+    engine: xml_feed
+    shortcut: cvea
+    categories: [security]
+    url: https://nvd.nist.gov/feeds/xml/cve/misc/nvd-rss-analyzed.xml
+
+  - name: zero day initiative published
+    engine: xml_feed
+    shortcut: zdi
+    categories: [security]
+    url: https://www.zerodayinitiative.com/rss/published/
+
+  - name: zero day initiative upcoming
+    engine: xml_feed
+    shortcut: zdiu
+    categories: [security]
+    url: https://www.zerodayinitiative.com/rss/upcoming/
+
+  - name: google project zero
+    engine: xml_feed
+    shortcut: p0
+    categories: [security]
+    url: https://googleprojectzero.blogspot.com/feeds/posts/default
+
+  - name: exploit-db
+    engine: xml_feed
+    shortcut: edb
+    categories: [security]
+    url: https://www.exploit-db.com/rss.xml
+
+  # 🎤 Conferences (via YouTube channel feeds)
+  - name: black hat
+    engine: xml_feed
+    shortcut: bh
+    categories: [security]
+    url: https://www.youtube.com/feeds/videos.xml?channel_id=UCJ6q9Ie29ajGqKApbLqfBOg
+
+  - name: def con
+    engine: xml_feed
+    shortcut: dc
+    categories: [security]
+    url: https://www.youtube.com/feeds/videos.xml?channel_id=UC6Om9kAkl32dWlDSNlDS9Iw
+
+  # 🚨 Advisories / PSIRT (patch & vuln disclosures)
+  - name: palo alto advisories
+    engine: xml_feed
+    shortcut: pansa
+    categories: [security]
+    url: https://security.paloaltonetworks.com/rss.xml
+
+  - name: fortiguard psirt
+    engine: xml_feed
+    shortcut: fgpsirt
+    categories: [security]
+    url: https://filestore.fortinet.com/fortiguard/rss/ir.xml
+
+  - name: fortiguard threat signal
+    engine: xml_feed
+    shortcut: fgts
+    categories: [security]
+    url: https://filestore.fortinet.com/fortiguard/rss/threatsignal.xml
+
+  - name: cisco psirt advisories
+    engine: xml_feed
+    shortcut: cisco
+    categories: [security]
+    url: https://sec.cloudapps.cisco.com/security/center/psirtrss20/CiscoSecurityAdvisory.xml
+
+  # 🌐 Threat Intelligence / Research
+  - name: netscout asert
+    engine: xml_feed
+    shortcut: arbor
+    categories: [security]
+    url: https://www.netscout.com/blog/asert/rss.xml
+
+  - name: sans internet storm center
+    engine: xml_feed
+    shortcut: isc
+    categories: [security]
+    url: https://isc.sans.edu/rssfeed.xml
+
+  - name: snort blog
+    engine: xml_feed
+    shortcut: snort
+    categories: [security]
+    url: https://blog.snort.org/feeds/posts/default
+
+  - name: malwarebytes labs
+    engine: xml_feed
+    shortcut: mb
+    categories: [security]
+    url: https://www.malwarebytes.com/blog/feed/index.xml
+
+  - name: eset welivesecurity
+    engine: xml_feed
+    shortcut: eset
+    categories: [security]
+    url: https://www.welivesecurity.com/en/rss/feed/
+
+  - name: check point research
+    engine: xml_feed
+    shortcut: cpr
+    categories: [security]
+    url: https://research.checkpoint.com/feed/
+
+  - name: kaspersky securelist
+    engine: xml_feed
+    shortcut: kas
+    categories: [security]
+    url: https://feeds.feedburner.com/securelist
+
+  - name: rapid7 blog
+    engine: xml_feed
+    shortcut: r7
+    categories: [security]
+    url: https://www.rapid7.com/blog/rss/
+
+  - name: tenable blog
+    engine: xml_feed
+    shortcut: ten
+    categories: [security]
+    url: https://www.tenable.com/blog/feed
+
+  - name: recorded future
+    engine: xml_feed
+    shortcut: rf
+    categories: [security]
+    url: https://www.recordedfuture.com/feed
+
+  # ─── API-only sources (NOT RSS — cannot be xml_feed engines).
+  #     Wire these into Ollama's tool/function layer with an API key instead:
+  #       • AlienVault OTX pulses ...... https://otx.alienvault.com/api  (key)
+  #       • Fortinet FortiGuard API .... https://fortiguard.fortinet.com/api  (key)
+  #       • F5 iHealth / SIRT API ...... https://ihealth-api.f5.com  (key)
+  #       • AbuseIPDB (IP reputation) .. https://api.abuseipdb.com/api/v2  (key)
+  #       • VirusTotal (URL/IP/file) ... https://www.virustotal.com/api/v3  (key)
+  #       • urlscan.io (URL analysis) .. https://urlscan.io/api/v1  (key)
+  #       • Cisco Talos reputation ..... https://talosintelligence.com/reputation_center
+  #       • abuse.ch (URLhaus/ThreatFox) https://threatfox-api.abuse.ch  (IOC blocklists, CSV/JSON)
+  # ───────────────────────────────────────────────────────────────────────
 
   # 🏈 Sports
   - name: bbc sport
     engine: xml_feed
     shortcut: bbcsport
+    categories: [sports]
     url: https://feeds.bbci.co.uk/sport/rss.xml
 
   - name: espn news
     engine: xml_feed
-    shortcut: espn
+    shortcut: espnn
+    categories: [sports]
     url: https://www.espn.com/espn/rss/news
 
   - name: nbc sports
     engine: xml_feed
     shortcut: nbcs
+    categories: [sports]
     url: https://www.nbcsports.com/feed
 
 #-----------------------------------------------------------
