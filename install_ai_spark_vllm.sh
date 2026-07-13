@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.3.5  |  Update: 7/11/2026
+# Christopher Gray  |  Version: 0.3.7  |  Update: 7/11/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
 #   curl -fsSL -o 'install_ai_spark_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark_vllm.sh' && chmod u+x install_ai_spark_vllm.sh
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4:8011,Qwen3-Reranker-4B:8010"
+#   ./install_ai_spark_vllm.sh --start "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16:8006,Qwen3-Reranker-4B:8010"
+#   
+#   ./install_ai_spark_vllm.sh --start "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8:8018,Qwen3-Reranker-4B:8010"
+#   ./install_ai_spark_vllm.sh --start "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4:8019,Qwen3-Reranker-4B:8010"
+
+#   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-FP8:8006,Qwen3-Reranker-4B:8010"
+#   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4:8006,Qwen3-Reranker-4B:8010"
+#   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4:8006"
 #
 # Move to DGX Spark / GB10:
 #   scp install_ai_spark_vllm.sh root@<dgx-ip>:/home/user/install_ai_spark_vllm.sh
@@ -37,6 +45,14 @@
 #   (interactive) or reclaims it only from a prior vLLM process (headless).
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.3.6  7/11/2026
+#   - Added two quantized builds of the Omni reasoning model:
+#     nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8  (port 8018, ~34 GB) and
+#     nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4 (port 8019, ~20 GB).
+#     FP8 serves with --quantization modelopt @ 0.35 util; NVFP4 with
+#     --quantization modelopt_fp4 @ 0.20 util. Both --trust-remote-code like the
+#     BF16 build. Serve via --start with their local dir name or catalog index.
 #
 # v0.3.5  7/11/2026
 #   - NVFP4 kernel-compile fix. On Blackwell (GB10, sm_121) FlashInfer JIT-compiles
@@ -224,7 +240,7 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.3.5
+Version:  0.3.6
 Last Updated:  7/11/2026
 
 Update Yourself:
@@ -452,6 +468,16 @@ _add "Qwen/Qwen3-ASR-1.7B"           "Qwen3-ASR-1.7B"       "Qwen3-ASR-1.7B (ASR
 #        HF Repo                                Local Dir                       Display Name                              Disk VRAM  Port  Category
 _add "nvidia/Qwen3.6-35B-A3B-NVFP4"          "Qwen3.6-35B-A3B-NVFP4"        "Qwen3.6-35B-A3B (NVFP4, nvidia)"         20   22   8016  "General"
 _add "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast"    "Qwen3.6-35B-A3B-NVFP4-Fast"   "Qwen3.6-35B-A3B (NVFP4-Fast, unsloth)"   20   22   8017  "General"
+
+# ── Nemotron-3-Nano-Omni-30B-A3B-Reasoning quantizations (added v0.3.6) ────────
+# Quantized builds of the BF16 Omni reasoning model above (idx served on 8008).
+# FP8 ≈ half the BF16 footprint; NVFP4 (~4-bit) ≈ a quarter. Both are multimodal
+# ("Omni") reasoning models, served with --trust-remote-code like the BF16 build.
+# https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8
+# https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4
+#        HF Repo                                                     Local Dir                                       Display Name                          Disk VRAM  Port  Category
+_add "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8"          "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8"    "Nemotron-3-Nano-Omni-30B (FP8)"      30   34   8018  "Reasoning"
+_add "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4"        "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4"  "Nemotron-3-Nano-Omni-30B (NVFP4)"    18   20   8019  "Reasoning"
 
 MODEL_TOTAL=${#MDL_HF[@]}
 
@@ -2040,6 +2066,34 @@ _serve_model() {
             --served-model-name "Nemotron-3-Nano-Omni-30B-A3B" \
             --dtype bfloat16 \
             --gpu-memory-utilization 0.62 \
+            --max-model-len 32768 \
+            --enable-prefix-caching \
+            --trust-remote-code
+        ;;
+
+    # FP8 (modelopt) build of the Omni reasoning model above — ~half the BF16
+    # footprint. 0.35 × 121 ≈ 42 GB budget leaves headroom for the vision tower
+    # + KV. vLLM auto-detects modelopt FP8 from the checkpoint config; the explicit
+    # flag makes it deterministic — drop it if your vLLM build errors on it.
+    "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8")
+        _vllm_launch "$idx" \
+            --served-model-name "Nemotron-3-Nano-Omni-30B-A3B-FP8" \
+            --dtype auto \
+            --quantization modelopt \
+            --gpu-memory-utilization 0.35 \
+            --max-model-len 32768 \
+            --enable-prefix-caching \
+            --trust-remote-code
+        ;;
+
+    # NVFP4 (~4-bit) build — ~a quarter of the BF16 footprint. 0.20 × 121 ≈ 24 GB
+    # budget. Same modelopt_fp4 path as the other Nemotron/Qwen NVFP4 entries.
+    "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4")
+        _vllm_launch "$idx" \
+            --served-model-name "Nemotron-3-Nano-Omni-30B-A3B-NVFP4" \
+            --dtype auto \
+            --quantization modelopt_fp4 \
+            --gpu-memory-utilization 0.20 \
             --max-model-len 32768 \
             --enable-prefix-caching \
             --trust-remote-code
