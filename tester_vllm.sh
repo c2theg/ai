@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.0.20  |  Update: 7/12/2026
+# Christopher Gray  |  Version: 0.0.21  |  Update: 7/14/2026
 # vLLM smoke test — auto-discovers every running vLLM instance (ports + models)
 #                   and runs the full smoke test against each one.
 # Includes 11 auto-graded model-quality tests (reasoning, math, summarization,
@@ -58,6 +58,25 @@ http_post() {
         "$url" 2>/dev/null
 }
 
+# ── Helper: millisecond wall-clock timestamp (GNU date, with portable fallback)
+now_ms() {
+    local ts
+    ts=$(date +%s%3N 2>/dev/null || true)
+    if [[ "$ts" =~ ^[0-9]+$ ]]; then
+        echo "$ts"
+    elif command -v perl &>/dev/null; then
+        perl -MTime::HiRes=time -e 'printf "%.0f\n", time() * 1000'
+    else
+        echo $(( $(date +%s) * 1000 ))
+    fi
+}
+
+tokens_per_second() {
+    local tokens="$1" elapsed_ms="$2"
+    awk -v tok="$tokens" -v ms="$elapsed_ms" \
+        'BEGIN { if (tok > 0 && ms > 0) printf "%.2f", tok * 1000 / ms; else printf "0.00" }'
+}
+
 # ── Helper: decode base64 from stdin -> binary on stdout (portable) ───────────
 b64decode() {
     if command -v openssl &>/dev/null; then openssl base64 -d -A
@@ -74,6 +93,65 @@ chat_once() {
           messages:[{role:"user", content:$p}]}')
     http_post "${BASE_URL}/v1/chat/completions" "$body" 2>/dev/null \
         | jq -r '.choices[0].message.content // empty' 2>/dev/null
+}
+
+# ── Helper: benchmark generated completion tokens/sec for the active model ────
+#    Uses the caller's FIRST_MODEL and BASE_URL (bash dynamic scope).
+benchmark_chat_tps() {
+    local runs="${1:-2}" maxtok="${2:-192}"
+    local i body resp start_ms end_ms elapsed_ms prompt_tokens completion_tokens total_tokens tps
+    local ok=0 total_completion=0 total_elapsed=0
+
+    for i in $(seq 1 "$runs"); do
+        body=$(jq -n \
+            --arg m "$FIRST_MODEL" \
+            --argjson mt "$maxtok" \
+            '{
+                model: $m,
+                max_tokens: $mt,
+                temperature: 0,
+                messages: [
+                    {role: "user", content: "Write a dense technical paragraph about local AI inference performance, batching, KV cache behavior, and latency. Continue until you naturally reach the token budget."}
+                ]
+            }')
+
+        start_ms=$(now_ms)
+        resp=$(http_post "${BASE_URL}/v1/chat/completions" "$body" || true)
+        end_ms=$(now_ms)
+        elapsed_ms=$((end_ms - start_ms))
+        [ "$elapsed_ms" -le 0 ] && elapsed_ms=1
+
+        if [ -z "$resp" ]; then
+            warn "Throughput run ${i}/${runs}: no response"
+            continue
+        fi
+
+        prompt_tokens=$(printf '%s' "$resp" | jq -r '.usage.prompt_tokens // empty' 2>/dev/null || true)
+        completion_tokens=$(printf '%s' "$resp" | jq -r '.usage.completion_tokens // empty' 2>/dev/null || true)
+        total_tokens=$(printf '%s' "$resp" | jq -r '.usage.total_tokens // empty' 2>/dev/null || true)
+
+        if ! [[ "$completion_tokens" =~ ^[0-9]+$ ]] || [ "$completion_tokens" -eq 0 ]; then
+            warn "Throughput run ${i}/${runs}: response did not include usage.completion_tokens"
+            continue
+        fi
+
+        tps=$(tokens_per_second "$completion_tokens" "$elapsed_ms")
+        printf "  Run %d/%d : %4d completion tokens in %.2fs  =>  %s tok/s" \
+            "$i" "$runs" "$completion_tokens" "$(awk -v ms="$elapsed_ms" 'BEGIN { printf "%.2f", ms / 1000 }')" "$tps"
+        [ -n "$prompt_tokens" ] && printf "  (prompt=%s total=%s)" "$prompt_tokens" "${total_tokens:-?}"
+        printf "\n"
+
+        ok=$((ok + 1))
+        total_completion=$((total_completion + completion_tokens))
+        total_elapsed=$((total_elapsed + elapsed_ms))
+    done
+
+    if [ "$ok" -gt 0 ]; then
+        tps=$(tokens_per_second "$total_completion" "$total_elapsed")
+        pass "Average generation throughput: ${tps} completion tokens/sec (${total_completion} tokens across ${ok} run(s))"
+    else
+        warn "Could not calculate throughput for ${FIRST_MODEL}"
+    fi
 }
 
 # ── Helper: grade a response against a case-insensitive regex ─────────────────
@@ -335,6 +413,16 @@ run_instance_tests() {
                 FAILURES=$((FAILURES + 1))
             fi
         fi
+    fi
+
+    # ── 5b. Generation throughput ─────────────────────────────────────────────
+    header "5b. Generation throughput  (completion tokens/sec)"
+    if [ -z "${FIRST_MODEL:-}" ]; then
+        warn "Skipping — no model discovered"
+    else
+        info "Benchmarking model: ${FIRST_MODEL}"
+        info "Metric: non-streaming completion_tokens / end-to-end request seconds"
+        benchmark_chat_tps 2 192
     fi
 
     # ── 6. OpenAI-compatible text completion ──────────────────────────────────
