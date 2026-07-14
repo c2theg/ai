@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.3.7  |  Update: 7/11/2026
+# Christopher Gray  |  Version: 0.3.8  |  Update: 7/14/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
@@ -13,6 +13,7 @@
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-FP8:8006,Qwen3-Reranker-4B:8010"
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4:8006,Qwen3-Reranker-4B:8010"
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4:8006"
+#   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4:8010,Qwen3.6-27B-NVFP4:8007"
 #
 # Move to DGX Spark / GB10:
 #   scp install_ai_spark_vllm.sh root@<dgx-ip>:/home/user/install_ai_spark_vllm.sh
@@ -45,6 +46,12 @@
 #   (interactive) or reclaims it only from a prior vLLM process (headless).
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.3.7  7/14/2026
+#   - Added nvidia/Qwen3.6-27B-NVFP4 to the download/serve catalog. It serves
+#     with ModelOpt quantization, Qwen3 reasoning/tool parsers, and a 0.25
+#     gpu-memory-utilization profile and fixed port 8007 so it can co-run with
+#     Qwen3.6-35B-A3B-NVFP4 (0.30) on a DGX Spark shared-memory pool.
 #
 # v0.3.6  7/11/2026
 #   - Added two quantized builds of the Omni reasoning model:
@@ -240,8 +247,8 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.3.6
-Last Updated:  7/11/2026
+Version:  0.3.7
+Last Updated:  7/14/2026
 
 Update Yourself:
     curl -fsSL -o 'install_ai_spark_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark_vllm.sh' && chmod u+x install_ai_spark_vllm.sh
@@ -404,6 +411,11 @@ _add() {
     MDL_SLEEP[$i]="${8:-}"
 }
 
+_keeps_catalog_port() {
+    local idx="$1"
+    [ "${MDL_HF[$idx]}" = "nvidia/Qwen3.6-27B-NVFP4" ]
+}
+
 # ── Standard models ────────────────────────────────────────────────────────────
 # Sleep timeout: these all use STANDARD_SLEEP_MINUTES (prompted/overridable at
 # runtime). The catalog leaves SLEEP_MIN blank here; it is filled in for the whole
@@ -461,13 +473,16 @@ _add "nvidia/nemotron-3.5-asr-streaming-0.6b" "nemotron-3.5-asr-streaming-0.6b" 
 # the serve menu and can be selected like any other model.
 _add "Qwen/Qwen3-ASR-1.7B"           "Qwen3-ASR-1.7B"       "Qwen3-ASR-1.7B (ASR, served)"            4    5   8014  "ASR"
 
-# ── Qwen3.6-35B-A3B NVFP4 quantizations (added v0.3.0) ────────────────────────
-# NVFP4 is ~4-bit: ~20 GB weights vs ~35 GB for the FP8 build at idx 0.
+# ── Qwen3.6 NVFP4 quantizations ───────────────────────────────────────────────
+# NVFP4 is ~4-bit. The 35B-A3B MoE and 27B dense checkpoints are sized to co-run
+# on DGX Spark when launched with their dedicated serve profiles below.
 # https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4
 # https://huggingface.co/unsloth/Qwen3.6-35B-A3B-NVFP4-Fast
+# https://huggingface.co/nvidia/Qwen3.6-27B-NVFP4
 #        HF Repo                                Local Dir                       Display Name                              Disk VRAM  Port  Category
 _add "nvidia/Qwen3.6-35B-A3B-NVFP4"          "Qwen3.6-35B-A3B-NVFP4"        "Qwen3.6-35B-A3B (NVFP4, nvidia)"         20   22   8016  "General"
 _add "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast"    "Qwen3.6-35B-A3B-NVFP4-Fast"   "Qwen3.6-35B-A3B (NVFP4-Fast, unsloth)"   20   22   8017  "General"
+_add "nvidia/Qwen3.6-27B-NVFP4"               "Qwen3.6-27B-NVFP4"            "Qwen3.6-27B (NVFP4, nvidia)"             18   24   8007  "General"
 
 # ── Nemotron-3-Nano-Omni-30B-A3B-Reasoning quantizations (added v0.3.6) ────────
 # Quantized builds of the BF16 Omni reasoning model above (idx served on 8008).
@@ -561,13 +576,16 @@ _resolve_start_specs() {
 # models (PORT=0) are left untouched.
 _assign_sequential_ports() {
     local idx next="$BASE_PORT" pinned=" "
-    # Collect pinned ports first so sequential assignment can skip past them.
+    # Collect pinned/fixed ports first so sequential assignment can skip past them.
     for idx in "${RUN_SELECTED[@]}"; do
-        [ "${MDL_PORT_EXPLICIT[$idx]:-0}" = "1" ] && pinned="${pinned}${MDL_PORT[$idx]} "
+        if [ "${MDL_PORT_EXPLICIT[$idx]:-0}" = "1" ] || _keeps_catalog_port "$idx"; then
+            pinned="${pinned}${MDL_PORT[$idx]} "
+        fi
     done
     for idx in "${RUN_SELECTED[@]}"; do
         [ "${MDL_PORT[$idx]}" = "0" ] && continue                 # download-only
         [ "${MDL_PORT_EXPLICIT[$idx]:-0}" = "1" ] && continue      # user-pinned
+        _keeps_catalog_port "$idx" && continue                    # model-fixed
         while [[ "$pinned" == *" $next "* ]]; do next=$((next + 1)); done
         MDL_PORT[$idx]="$next"
         next=$((next + 1))
@@ -1224,7 +1242,9 @@ if [ "${#RUN_SELECTED[@]}" -gt 0 ]; then
     _seq_n=1
     for _idx in "${RUN_SELECTED[@]}"; do
         [ "${MDL_PORT[$_idx]}" = "0" ] && continue
-        _pin=""; [ "${MDL_PORT_EXPLICIT[$_idx]:-0}" = "1" ] && _pin="  (pinned)"
+        _pin=""
+        [ "${MDL_PORT_EXPLICIT[$_idx]:-0}" = "1" ] && _pin="  (pinned)"
+        _keeps_catalog_port "$_idx" && _pin="  (fixed)"
         printf "    %d. %-46s port %s%s\n" "$_seq_n" "${MDL_NAME[$_idx]}" "${MDL_PORT[$_idx]}" "$_pin"
         _seq_n=$((_seq_n + 1))
     done
@@ -1971,10 +1991,11 @@ _serve_model() {
             --tool-call-parser hermes
         ;;
 
-    # NVFP4 (~4-bit): ~20 GB weights vs ~35 GB FP8 — 0.30 × 121 ≈ 36 GB budget
-    # leaves ~14 GB KV headroom when served alone. vLLM auto-detects modelopt
-    # NVFP4 from the checkpoint config; the explicit flag matches the Nemotron
-    # NVFP4 entry below — drop it if your vLLM build errors on it.
+    # NVFP4 (~4-bit): ~20 GB weights vs ~35 GB FP8. Keep this at 0.30 instead
+    # of NVIDIA's solo-model 0.40 DGX Spark profile so the 27B NVFP4 model can
+    # start beside it. vLLM auto-detects modelopt NVFP4 from the checkpoint
+    # config; the explicit flag matches the Nemotron NVFP4 entry below — drop it
+    # if your vLLM build errors on it.
     "nvidia/Qwen3.6-35B-A3B-NVFP4")
         _vllm_launch "$idx" \
             --served-model-name "Qwen3.6-35B-A3B-NVFP4" \
@@ -1982,10 +2003,35 @@ _serve_model() {
             --quantization modelopt_fp4 \
             --gpu-memory-utilization 0.30 \
             --max-model-len 32768 \
+            --kv-cache-dtype fp8 \
+            --max-num-seqs 4 \
+            --max-num-batched-tokens 8192 \
+            --enable-chunked-prefill \
             --enable-prefix-caching \
             --trust-remote-code \
             --enable-auto-tool-choice \
             --tool-call-parser hermes
+        ;;
+
+    # Dense 27B NVFP4 checkpoint. 0.25 × 121 ≈ 30 GB budget; paired with the
+    # 35B-A3B NVFP4 entry above at 0.30, the two vLLM processes reserve ~67 GB
+    # total on DGX Spark, leaving practical headroom for OS/services/KV cache.
+    "nvidia/Qwen3.6-27B-NVFP4")
+        _vllm_launch "$idx" \
+            --served-model-name "Qwen3.6-27B-NVFP4" \
+            --dtype auto \
+            --quantization modelopt \
+            --gpu-memory-utilization 0.25 \
+            --max-model-len 32768 \
+            --kv-cache-dtype fp8 \
+            --max-num-seqs 4 \
+            --max-num-batched-tokens 8192 \
+            --enable-chunked-prefill \
+            --enable-prefix-caching \
+            --trust-remote-code \
+            --reasoning-parser qwen3 \
+            --enable-auto-tool-choice \
+            --tool-call-parser qwen3_xml
         ;;
 
     # Unsloth's "Fast" repack of the same NVFP4 checkpoint — same footprint.
