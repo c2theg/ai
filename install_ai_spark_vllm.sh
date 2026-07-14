@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.3.8  |  Update: 7/14/2026
+# Christopher Gray  |  Version: 0.3.9  |  Update: 7/14/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
@@ -13,7 +13,7 @@
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-FP8:8006,Qwen3-Reranker-4B:8010"
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4:8006,Qwen3-Reranker-4B:8010"
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4:8006"
-#   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4:8006,Qwen3.6-27B-NVFP4:8007"
+#   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4:8010,Qwen3.6-27B-NVFP4:8011"
 #
 # Move to DGX Spark / GB10:
 #   scp install_ai_spark_vllm.sh root@<dgx-ip>:/home/user/install_ai_spark_vllm.sh
@@ -49,9 +49,12 @@
 #
 # v0.3.7  7/14/2026
 #   - Added nvidia/Qwen3.6-27B-NVFP4 to the download/serve catalog. It serves
-#     with ModelOpt quantization, Qwen3 reasoning/tool parsers, and a 0.25
-#     gpu-memory-utilization profile and fixed port 8007 so it can co-run with
-#     Qwen3.6-35B-A3B-NVFP4 (0.30) on a DGX Spark shared-memory pool.
+#     with the current HF ModelOpt profile (modelopt v0.45 / NVFP4 1.0),
+#     Qwen3 reasoning parser support, and a conservative 0.25
+#     gpu-memory-utilization profile so it can co-run with
+#     Qwen3.6-35B-A3B-NVFP4 (0.30) on a DGX Spark shared-memory pool. The HF
+#     model card advertises up to 262144 context; this script defaults lower for
+#     co-residency but exposes QWEN36_27B_MAX_MODEL_LEN to raise it for solo runs.
 #
 # v0.3.6  7/11/2026
 #   - Added two quantized builds of the Omni reasoning model:
@@ -411,11 +414,6 @@ _add() {
     MDL_SLEEP[$i]="${8:-}"
 }
 
-_keeps_catalog_port() {
-    local idx="$1"
-    [ "${MDL_HF[$idx]}" = "nvidia/Qwen3.6-27B-NVFP4" ]
-}
-
 # ── Standard models ────────────────────────────────────────────────────────────
 # Sleep timeout: these all use STANDARD_SLEEP_MINUTES (prompted/overridable at
 # runtime). The catalog leaves SLEEP_MIN blank here; it is filled in for the whole
@@ -482,7 +480,7 @@ _add "Qwen/Qwen3-ASR-1.7B"           "Qwen3-ASR-1.7B"       "Qwen3-ASR-1.7B (ASR
 #        HF Repo                                Local Dir                       Display Name                              Disk VRAM  Port  Category
 _add "nvidia/Qwen3.6-35B-A3B-NVFP4"          "Qwen3.6-35B-A3B-NVFP4"        "Qwen3.6-35B-A3B (NVFP4, nvidia)"         20   22   8016  "General"
 _add "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast"    "Qwen3.6-35B-A3B-NVFP4-Fast"   "Qwen3.6-35B-A3B (NVFP4-Fast, unsloth)"   20   22   8017  "General"
-_add "nvidia/Qwen3.6-27B-NVFP4"               "Qwen3.6-27B-NVFP4"            "Qwen3.6-27B (NVFP4, nvidia)"             18   24   8007  "General"
+_add "nvidia/Qwen3.6-27B-NVFP4"               "Qwen3.6-27B-NVFP4"            "Qwen3.6-27B (NVFP4, nvidia)"             18   24   8022  "General"
 
 # ── Nemotron-3-Nano-Omni-30B-A3B-Reasoning quantizations (added v0.3.6) ────────
 # Quantized builds of the BF16 Omni reasoning model above (idx served on 8008).
@@ -576,16 +574,13 @@ _resolve_start_specs() {
 # models (PORT=0) are left untouched.
 _assign_sequential_ports() {
     local idx next="$BASE_PORT" pinned=" "
-    # Collect pinned/fixed ports first so sequential assignment can skip past them.
+    # Collect pinned ports first so sequential assignment can skip past them.
     for idx in "${RUN_SELECTED[@]}"; do
-        if [ "${MDL_PORT_EXPLICIT[$idx]:-0}" = "1" ] || _keeps_catalog_port "$idx"; then
-            pinned="${pinned}${MDL_PORT[$idx]} "
-        fi
+        [ "${MDL_PORT_EXPLICIT[$idx]:-0}" = "1" ] && pinned="${pinned}${MDL_PORT[$idx]} "
     done
     for idx in "${RUN_SELECTED[@]}"; do
         [ "${MDL_PORT[$idx]}" = "0" ] && continue                 # download-only
         [ "${MDL_PORT_EXPLICIT[$idx]:-0}" = "1" ] && continue      # user-pinned
-        _keeps_catalog_port "$idx" && continue                    # model-fixed
         while [[ "$pinned" == *" $next "* ]]; do next=$((next + 1)); done
         MDL_PORT[$idx]="$next"
         next=$((next + 1))
@@ -1244,7 +1239,6 @@ if [ "${#RUN_SELECTED[@]}" -gt 0 ]; then
         [ "${MDL_PORT[$_idx]}" = "0" ] && continue
         _pin=""
         [ "${MDL_PORT_EXPLICIT[$_idx]:-0}" = "1" ] && _pin="  (pinned)"
-        _keeps_catalog_port "$_idx" && _pin="  (fixed)"
         printf "    %d. %-46s port %s%s\n" "$_seq_n" "${MDL_NAME[$_idx]}" "${MDL_PORT[$_idx]}" "$_pin"
         _seq_n=$((_seq_n + 1))
     done
@@ -2013,25 +2007,26 @@ _serve_model() {
             --tool-call-parser hermes
         ;;
 
-    # Dense 27B NVFP4 checkpoint. 0.25 × 121 ≈ 30 GB budget; paired with the
-    # 35B-A3B NVFP4 entry above at 0.30, the two vLLM processes reserve ~67 GB
-    # total on DGX Spark, leaving practical headroom for OS/services/KV cache.
+    # Current HF card (nvidia-modelopt v0.45.0 / NVFP4 1.0) recommends:
+    #   vllm serve nvidia/Qwen3.6-27B-NVFP4 --quantization modelopt
+    #     --max-model-len 262144 --reasoning-parser qwen3
+    # DGX Spark co-run default keeps max-model-len lower so this can live beside
+    # the 35B-A3B NVFP4 process. For full solo context:
+    #   QWEN36_27B_MAX_MODEL_LEN=262144 ./install_ai_spark_vllm.sh --start Qwen3.6-27B-NVFP4
     "nvidia/Qwen3.6-27B-NVFP4")
         _vllm_launch "$idx" \
             --served-model-name "Qwen3.6-27B-NVFP4" \
             --dtype auto \
             --quantization modelopt \
             --gpu-memory-utilization 0.25 \
-            --max-model-len 32768 \
+            --max-model-len "${QWEN36_27B_MAX_MODEL_LEN:-32768}" \
             --kv-cache-dtype fp8 \
             --max-num-seqs 4 \
             --max-num-batched-tokens 8192 \
             --enable-chunked-prefill \
             --enable-prefix-caching \
             --trust-remote-code \
-            --reasoning-parser qwen3 \
-            --enable-auto-tool-choice \
-            --tool-call-parser qwen3_xml
+            --reasoning-parser qwen3
         ;;
 
     # Unsloth's "Fast" repack of the same NVFP4 checkpoint — same footprint.
