@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.2.2  |  Modified: 7/15/2026
+# Christopher Gray  |  Version: 0.2.4  |  Modified: 7/15/2026
 # AI assistance: OpenAI Codex, GPT-5.5
 # Ollama smoke test - IP/port based tester similar to tester_vllm.sh.
+#
+# Changes in 0.2.4:
+#   - Updated header metadata format to include detailed Codex GPT-5.5 model notation.
+#   - Documented ongoing requirement to update version, modified date, and AI model details per change.
+#
+# Changes in 0.2.3:
+#   - Hardened long multi-model runs so individual command failures do not stop the full test.
+#   - Added progress markers for each model number in the queue.
+#   - Added an error trap that reports the last model/section before an unexpected exit.
 #
 # Changes in 0.2.2:
 #   - Added per-model Quality and Comprehensive scores to model results.
@@ -21,7 +30,7 @@
 #   ./tester_ollama.sh http://10.11.1.10:11435 # full URL with explicit port
 #   ./tester_ollama.sh 10.11.1.10 11434 llama3 # explicit model
 #   If no model is supplied, every local model from /api/tags is tested.
-set -euo pipefail
+set -uo pipefail
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -34,11 +43,35 @@ pass() { echo -e "${GREEN}[PASS]${RESET} $*"; }
 fail() { echo -e "${RED}[FAIL]${RESET} $*"; }
 info() { echo -e "${CYAN}[INFO]${RESET} $*"; }
 warn() { echo -e "${YELLOW}[WARN]${RESET} $*"; }
-header() { echo -e "\n${BOLD}${CYAN}==> $*${RESET}"; }
+header() { CURRENT_SECTION="$*"; echo -e "\n${BOLD}${CYAN}==> $*${RESET}"; }
 
 FAILURES=0
 SUMMARY_ROWS=()
 FAILURE_ROWS=()
+CURRENT_MODEL="startup"
+CURRENT_SECTION="startup"
+
+on_unexpected_error() {
+    local line="$1" status="$2"
+    fail "Unexpected script error at line ${line} while testing '${CURRENT_MODEL}' in '${CURRENT_SECTION}' (exit ${status})"
+}
+
+on_interrupted() {
+    local signal="$1" status="$2"
+    warn "Interrupted by ${signal} while testing '${CURRENT_MODEL}' in '${CURRENT_SECTION}'"
+    if declare -F print_summary_table >/dev/null 2>&1; then
+        print_summary_table
+    fi
+    if declare -F print_failure_details >/dev/null 2>&1; then
+        print_failure_details
+    fi
+    exit "$status"
+}
+
+trap 'on_unexpected_error "$LINENO" "$?"' ERR
+trap 'on_interrupted INT 130' INT
+trap 'on_interrupted TERM 143' TERM
+trap 'on_interrupted HUP 129' HUP
 
 require_cmd() {
     command -v "$1" &>/dev/null || { fail "Required command not found: $1"; exit 1; }
@@ -398,6 +431,7 @@ run_ollama_tests() {
     fi
 
     MODEL_COUNT=$(printf '%s' "$MODELS_JSON" | jq '.models | length' 2>/dev/null || echo 0)
+    [[ "$MODEL_COUNT" =~ ^[0-9]+$ ]] || MODEL_COUNT=0
     if [ "$MODEL_COUNT" -eq 0 ]; then
         fail "Ollama model list is empty"
         echo "  Hint: pull a model first, e.g. ollama pull llama3.1"
@@ -436,9 +470,14 @@ run_ollama_tests() {
         done < <(printf '%s' "$MODELS_JSON" | jq -r '.models[].name')
     fi
 
-    info "Models queued for tests: ${#MODELS_TO_TEST[@]}"
+    local MODEL_QUEUE_TOTAL=${#MODELS_TO_TEST[@]}
+    local MODEL_QUEUE_INDEX=0
+    info "Models queued for tests: ${MODEL_QUEUE_TOTAL}"
 
     for FIRST_MODEL in "${MODELS_TO_TEST[@]}"; do
+        MODEL_QUEUE_INDEX=$((MODEL_QUEUE_INDEX + 1))
+        CURRENT_MODEL="$FIRST_MODEL"
+        CURRENT_SECTION="model setup"
         local QUALITY_PASS=0 QUALITY_TOTAL=0
         local MODEL_PASS=0 MODEL_TOTAL=0
         local -a MODEL_FAILURES=()
@@ -449,7 +488,7 @@ run_ollama_tests() {
 
         echo
         echo -e "${BOLD}${CYAN}-------------------------------------------------------------${RESET}"
-        echo -e "${BOLD}${CYAN}Model under test: ${FIRST_MODEL}${RESET}"
+        echo -e "${BOLD}${CYAN}Model under test ${MODEL_QUEUE_INDEX}/${MODEL_QUEUE_TOTAL}: ${FIRST_MODEL}${RESET}"
         echo -e "${BOLD}${CYAN}-------------------------------------------------------------${RESET}"
 
     header "4. Model details  (POST /api/show)"
