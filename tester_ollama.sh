@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.1.0  |  Update: 7/15/2026
+# Christopher Gray  |  Version: 0.1.1  |  Update: 7/15/2026
 # Ollama smoke test - IP/port based tester similar to tester_vllm.sh.
+#
+# Download: 
+#   curl -sSL https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/tester_ollama.sh -o tester_ollama.sh
 #
 # Usage:
 #   ./tester_ollama.sh                         # prompts; Enter defaults to 127.0.0.1
