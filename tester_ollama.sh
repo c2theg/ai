@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.2.1  |  Update: 7/15/2026
+# Christopher Gray  |  Version: 0.2.2  |  Modified: 7/15/2026
+# AI assistance: OpenAI Codex, GPT-5.5
 # Ollama smoke test - IP/port based tester similar to tester_vllm.sh.
+#
+# Changes in 0.2.2:
+#   - Added per-model Quality and Comprehensive scores to model results.
+#   - Added final scoreboard with model, quantization, scores, and duration.
+#   - Added per-model/server failure details so failed checks are actionable.
+#   - Added total duration for the full test run.
+#   - Fixed duration formatting to stable hh:mm:ss using elapsed shell time.
 #
 # Download: 
 #   curl -sSL https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/tester_ollama.sh -o tester_ollama.sh && chmod +x tester_ollama.sh
@@ -89,11 +97,14 @@ http_post() {
 
 now_ms() {
     local ts
-    ts=$(date +%s%3N 2>/dev/null || true)
-    if [[ "$ts" =~ ^[0-9]+$ ]]; then
-        echo "$ts"
-    elif command -v perl &>/dev/null; then
+    if command -v perl &>/dev/null; then
         perl -MTime::HiRes=time -e 'printf "%.0f\n", time() * 1000'
+        return 0
+    fi
+
+    ts=$(date +%s%3N 2>/dev/null || true)
+    if [[ "$ts" =~ ^[0-9]{13,}$ ]]; then
+        echo "$ts"
     else
         echo $(( $(date +%s) * 1000 ))
     fi
@@ -178,13 +189,16 @@ score_warn() {
 
 duration_label() {
     local ms="$1"
-    awk -v ms="$ms" 'BEGIN {
-        total = int((ms + 999) / 1000);
-        h = int(total / 3600);
-        m = int((total % 3600) / 60);
-        s = total % 60;
-        printf "%02d:%02d:%02d", h, m, s;
-    }'
+    local total h m s
+    if ! [[ "${ms:-}" =~ ^-?[0-9]+$ ]] || [ "$ms" -le 0 ]; then
+        printf "00:00:00"
+        return 0
+    fi
+    total=$(( (ms + 999) / 1000 ))
+    h=$(( total / 3600 ))
+    m=$(( (total % 3600) / 60 ))
+    s=$(( total % 60 ))
+    printf "%02d:%02d:%02d" "$h" "$m" "$s"
 }
 
 summary_add() {
@@ -428,10 +442,10 @@ run_ollama_tests() {
         local QUALITY_PASS=0 QUALITY_TOTAL=0
         local MODEL_PASS=0 MODEL_TOTAL=0
         local -a MODEL_FAILURES=()
-        local MODEL_START_MS MODEL_END_MS MODEL_DURATION_MS MODEL_PCT MODEL_QUANT
+        local MODEL_START_S MODEL_END_S MODEL_DURATION_MS MODEL_PCT MODEL_QUANT
         local QUALITY_PCT=0
         local THROUGHPUT_OK=0
-        MODEL_START_MS=$(now_ms)
+        MODEL_START_S=$SECONDS
 
         echo
         echo -e "${BOLD}${CYAN}-------------------------------------------------------------${RESET}"
@@ -625,8 +639,8 @@ run_ollama_tests() {
         warn "No graded checks were run"
     fi
 
-    MODEL_END_MS=$(now_ms)
-    MODEL_DURATION_MS=$((MODEL_END_MS - MODEL_START_MS))
+    MODEL_END_S=$SECONDS
+    MODEL_DURATION_MS=$(( (MODEL_END_S - MODEL_START_S) * 1000 ))
     if [ "$MODEL_TOTAL" -gt 0 ]; then
         MODEL_PCT=$(( MODEL_PASS * 100 / MODEL_TOTAL ))
     else
@@ -658,13 +672,17 @@ fi
 
 BASE_URL=$(build_base_url "$TARGET_RAW" "$PORT_ARG")
 
+TOTAL_START_S=$SECONDS
 print_system_hardware
 run_ollama_tests "$BASE_URL" "$MODEL_ARG"
+TOTAL_END_S=$SECONDS
+TOTAL_DURATION_MS=$(( (TOTAL_END_S - TOTAL_START_S) * 1000 ))
 print_summary_table
 print_failure_details
 
 header "Summary"
 info "Tested Ollama target: ${BASE_URL}"
+info "Total duration       : $(duration_label "$TOTAL_DURATION_MS")"
 if [ "$FAILURES" -eq 0 ]; then
     pass "All critical checks passed"
 else
