@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.3.9  |  Update: 7/14/2026
+# Christopher Gray  |  Version: 0.3.12  |  Update: 7/15/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
@@ -14,6 +14,7 @@
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4:8006,Qwen3-Reranker-4B:8010"
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4:8006"
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4:8010,Qwen3.6-27B-NVFP4:8011"
+#   ./install_ai_spark_vllm.sh --start "Gemma-4-31B-IT-NVFP4:8007"
 #
 # Move to DGX Spark / GB10:
 #   scp install_ai_spark_vllm.sh root@<dgx-ip>:/home/user/install_ai_spark_vllm.sh
@@ -38,7 +39,7 @@
 #   ./install_ai_spark_vllm.sh --health              — report which served models are up, and exit
 #
 #   Ports: served models get SEQUENTIAL ports in launch order starting at
-#   BASE_PORT (default 8010) — 1st model → 8010, 2nd → 8011, and so on — so the
+#   BASE_PORT (default 8006) — 1st model → 8006, 2nd → 8007, and so on — so the
 #   same launch order always yields the same ports. Pin a specific model with
 #   "model:PORT" (e.g. --start "Qwen3-Reranker-4B:8021"); pinned ports are kept
 #   and skipped over by the sequential counter. Before binding, the script checks
@@ -46,6 +47,19 @@
 #   (interactive) or reclaims it only from a prior vLLM process (headless).
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.3.11  7/15/2026
+#   - Sequential served-model ports now start at 8006 instead of 8010. Headless
+#     --start order already controlled launch order; the interactive serve menu
+#     now also preserves the order models are toggled on, so the first chosen
+#     model gets 8006, the second gets 8007, etc. Pinned model:PORT specs still
+#     keep their explicit port and are skipped by the sequential allocator.
+#
+# v0.3.10  7/15/2026
+#   - Added nvidia/Gemma-4-31B-IT-NVFP4 to the download/serve catalog. It uses
+#     the NVIDIA ModelOpt NVFP4 vLLM profile: --quantization modelopt,
+#     --language-model-only, 65536 context, 0.82 gpu-memory-utilization,
+#     fp8 KV cache with scale calculation, prefix caching, and chunked prefill.
 #
 # v0.3.7  7/14/2026
 #   - Added nvidia/Qwen3.6-27B-NVFP4 to the download/serve catalog. It serves
@@ -109,8 +123,8 @@
 #
 # v0.3.2  7/11/2026
 #   - Predictable ports: served models are now assigned SEQUENTIAL ports in
-#     launch order from BASE_PORT (default 8010) — 1st→8010, 2nd→8011, … — so the
-#     same selection always maps to the same ports (was: fixed per-model catalog
+#     launch order from BASE_PORT — so the same selection always maps to the
+#     same ports (was: fixed per-model catalog
 #     ports). Pin one with "model:PORT"; pinned ports are kept and skipped over.
 #     A port map is printed before serving.
 #   - Port-in-use guard: before a model binds its port, the script detects any
@@ -250,8 +264,8 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.3.7
-Last Updated:  7/14/2026
+Version:  0.3.11
+Last Updated:  7/15/2026
 
 Update Yourself:
     curl -fsSL -o 'install_ai_spark_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark_vllm.sh' && chmod u+x install_ai_spark_vllm.sh
@@ -283,7 +297,7 @@ NEMO_VENV="$BASE_DIR/nemo-venv"       # separate venv for NeMo ASR (avoids confl
 # same ports. A per-model port pinned with `--start model:PORT` is respected and
 # skipped over. Before binding, the script checks whether the port is already in
 # use, shows what holds it, and (interactively) offers to kill it.
-BASE_PORT=8010
+BASE_PORT=8006
 
 # If a selected model isn't present on disk when it's time to serve it, download
 # it automatically first (uses the HF CLI + HF_TOKEN). Applies to every mode,
@@ -491,6 +505,14 @@ _add "nvidia/Qwen3.6-27B-NVFP4"               "Qwen3.6-27B-NVFP4"            "Qw
 #        HF Repo                                                     Local Dir                                       Display Name                          Disk VRAM  Port  Category
 _add "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8"          "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8"    "Nemotron-3-Nano-Omni-30B (FP8)"      30   34   8018  "Reasoning"
 _add "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4"        "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4"  "Nemotron-3-Nano-Omni-30B (NVFP4)"    18   20   8019  "Reasoning"
+
+# ── Gemma 4 31B IT NVFP4 quantization ─────────────────────────────────────────
+# https://huggingface.co/nvidia/Gemma-4-31B-IT-NVFP4
+# vLLM/ModelOpt NVFP4 profile for Blackwell. The 0.82 gpu-memory-utilization
+# launch profile reserves ~100 GB on a DGX Spark shared-memory pool, so treat
+# this as a large solo model unless you explicitly lower context/utilization.
+#        HF Repo                                Local Dir                       Display Name                              Disk VRAM  Port  Category
+_add "nvidia/Gemma-4-31B-IT-NVFP4"            "Gemma-4-31B-IT-NVFP4"         "Gemma 4 31B IT (NVFP4, nvidia)"          24  100   8007  "General"
 
 MODEL_TOTAL=${#MDL_HF[@]}
 
@@ -838,6 +860,7 @@ _checkbox_menu() {
     local count=${#menu_map[@]}
 
     local -a sel=()
+    local -a sel_order=()
     for j in $(seq 0 $((count - 1))); do sel[$j]=0; done
 
     # Pre-select any default catalog indices passed via defaults_var
@@ -845,7 +868,10 @@ _checkbox_menu() {
         local -n _defs_ref="$defaults_var"
         for def_idx in "${_defs_ref[@]+${_defs_ref[@]}}"; do
             for j in $(seq 0 $((count - 1))); do
-                [ "${menu_map[$j]}" = "$def_idx" ] && sel[$j]=1
+                if [ "${menu_map[$j]}" = "$def_idx" ]; then
+                    sel[$j]=1
+                    sel_order+=("$j")
+                fi
             done
         done
     fi
@@ -877,21 +903,48 @@ _checkbox_menu() {
 
         case "$input" in
             d|done|"") break ;;
-            a|all) for j in $(seq 0 $((count - 1))); do sel[$j]=1; done ;;
-            n|none|clear) for j in $(seq 0 $((count - 1))); do sel[$j]=0; done ;;
+            a|all)
+                sel_order=()
+                for j in $(seq 0 $((count - 1))); do
+                    sel[$j]=1
+                    sel_order+=("$j")
+                done ;;
+            n|none|clear)
+                for j in $(seq 0 $((count - 1))); do sel[$j]=0; done
+                sel_order=() ;;
             *)
                 for num in $input; do
                     if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le "$count" ]; then
                         local j=$((num - 1))
-                        [ "${sel[$j]}" = "1" ] && sel[$j]=0 || sel[$j]=1
+                        if [ "${sel[$j]}" = "1" ]; then
+                            sel[$j]=0
+                            local -a _new_order=()
+                            local _oj
+                            for _oj in "${sel_order[@]+${sel_order[@]}}"; do
+                                [ "$_oj" != "$j" ] && _new_order+=("$_oj")
+                            done
+                            sel_order=("${_new_order[@]+${_new_order[@]}}")
+                        else
+                            sel[$j]=1
+                            sel_order+=("$j")
+                        fi
                     fi
                 done ;;
         esac
     done
 
     local -a result=()
+    local seen_order=" "
+    for j in "${sel_order[@]+${sel_order[@]}}"; do
+        if [ "${sel[$j]:-0}" = "1" ]; then
+            result+=("${menu_map[$j]}")
+            seen_order="${seen_order}${j} "
+        fi
+    done
     for j in $(seq 0 $((count - 1))); do
-        [ "${sel[$j]}" = "1" ] && result+=("${menu_map[$j]}")
+        [ "${sel[$j]}" = "1" ] || continue
+        [[ "$seen_order" == *" $j "* ]] && continue
+        result+=("${menu_map[$j]}")
     done
     eval "$result_var=(\"\${result[@]+\"\${result[@]}\"}\") "
 }
@@ -2087,6 +2140,22 @@ _serve_model() {
             --trust-remote-code \
             --enable-auto-tool-choice \
             --tool-call-parser hermes
+        ;;
+
+    "nvidia/Gemma-4-31B-IT-NVFP4")
+        _vllm_launch "$idx" \
+            --served-model-name "gemma4-31b" \
+            --trust-remote-code \
+            --quantization modelopt \
+            --tensor-parallel-size 1 \
+            --language-model-only \
+            --max-model-len 65536 \
+            --gpu-memory-utilization 0.82 \
+            --max-num-seqs 2 \
+            --kv-cache-dtype fp8 \
+            --calculate-kv-scales \
+            --enable-prefix-caching \
+            --enable-chunked-prefill
         ;;
 
     "google/gemma-4-26B-A4B-it")
