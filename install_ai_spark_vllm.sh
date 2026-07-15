@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.3.12  |  Update: 7/15/2026
+# Christopher Gray  |  Version: 0.3.13  |  Update: 7/15/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
@@ -14,7 +14,7 @@
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4:8006,Qwen3-Reranker-4B:8010"
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4:8006"
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4:8010,Qwen3.6-27B-NVFP4:8011"
-#   ./install_ai_spark_vllm.sh --start "Gemma-4-31B-IT-NVFP4:8007"
+#   ./install_ai_spark_vllm.sh --start "Gemma-4-31B-IT-NVFP4:8001"
 #
 # Move to DGX Spark / GB10:
 #   scp install_ai_spark_vllm.sh root@<dgx-ip>:/home/user/install_ai_spark_vllm.sh
@@ -48,6 +48,12 @@
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
 #
+# v0.3.12  7/15/2026
+#   - Lowered the Gemma-4-31B-IT-NVFP4 serve profile for text-only use:
+#     --language-model-only, 32768 context, 0.46 gpu-memory-utilization,
+#     max-num-seqs 1, fp8 KV cache with scale calculation, prefix caching, and
+#     chunked prefill. Pin it with :8001 when you want NVIDIA's example port.
+#
 # v0.3.11  7/15/2026
 #   - Sequential served-model ports now start at 8006 instead of 8010. Headless
 #     --start order already controlled launch order; the interactive serve menu
@@ -57,9 +63,8 @@
 #
 # v0.3.10  7/15/2026
 #   - Added nvidia/Gemma-4-31B-IT-NVFP4 to the download/serve catalog. It uses
-#     the NVIDIA ModelOpt NVFP4 vLLM profile: --quantization modelopt,
-#     --language-model-only, 65536 context, 0.82 gpu-memory-utilization,
-#     fp8 KV cache with scale calculation, prefix caching, and chunked prefill.
+#     the NVIDIA ModelOpt NVFP4 vLLM profile. The later v0.3.12 profile lowers
+#     context/utilization for text-only DGX Spark use.
 #
 # v0.3.7  7/14/2026
 #   - Added nvidia/Qwen3.6-27B-NVFP4 to the download/serve catalog. It serves
@@ -264,7 +269,7 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.3.11
+Version:  0.3.12
 Last Updated:  7/15/2026
 
 Update Yourself:
@@ -508,11 +513,11 @@ _add "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4"        "Nemotron-3-Na
 
 # ── Gemma 4 31B IT NVFP4 quantization ─────────────────────────────────────────
 # https://huggingface.co/nvidia/Gemma-4-31B-IT-NVFP4
-# vLLM/ModelOpt NVFP4 profile for Blackwell. The 0.82 gpu-memory-utilization
-# launch profile reserves ~100 GB on a DGX Spark shared-memory pool, so treat
-# this as a large solo model unless you explicitly lower context/utilization.
+# vLLM/ModelOpt NVFP4 profile for Blackwell. This text-only launch profile uses
+# 0.46 gpu-memory-utilization (~56 GB on DGX Spark) and 32768 context to reduce
+# memory pressure versus the 65536 / 0.82 profile.
 #        HF Repo                                Local Dir                       Display Name                              Disk VRAM  Port  Category
-_add "nvidia/Gemma-4-31B-IT-NVFP4"            "Gemma-4-31B-IT-NVFP4"         "Gemma 4 31B IT (NVFP4, nvidia)"          24  100   8007  "General"
+_add "nvidia/Gemma-4-31B-IT-NVFP4"            "Gemma-4-31B-IT-NVFP4"         "Gemma 4 31B IT (NVFP4, nvidia)"          24   56   8001  "General"
 
 MODEL_TOTAL=${#MDL_HF[@]}
 
@@ -2149,9 +2154,9 @@ _serve_model() {
             --quantization modelopt \
             --tensor-parallel-size 1 \
             --language-model-only \
-            --max-model-len 65536 \
-            --gpu-memory-utilization 0.82 \
-            --max-num-seqs 2 \
+            --gpu-memory-utilization 0.46 \
+            --max-model-len 32768 \
+            --max-num-seqs 1 \
             --kv-cache-dtype fp8 \
             --calculate-kv-scales \
             --enable-prefix-caching \
