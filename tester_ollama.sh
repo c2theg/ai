@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.1.1  |  Update: 7/15/2026
-# Ollama smoke test - IP/port based tester similar to tester_vllm.sh.
+# Christopher Gray  |  Version: 0.2.0  |  Update: 7/15/2026
+# Ollama smoke test - IP/port based tester
 #
 # Download: 
 #   curl -sSL https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/tester_ollama.sh -o tester_ollama.sh
@@ -12,6 +12,7 @@
 #   ./tester_ollama.sh http://10.11.1.10       # full URL, default port 11434
 #   ./tester_ollama.sh http://10.11.1.10:11435 # full URL with explicit port
 #   ./tester_ollama.sh 10.11.1.10 11434 llama3 # explicit model
+#   If no model is supplied, every local model from /api/tags is tested.
 set -euo pipefail
 
 RED='\033[0;31m'
@@ -28,6 +29,7 @@ warn() { echo -e "${YELLOW}[WARN]${RESET} $*"; }
 header() { echo -e "\n${BOLD}${CYAN}==> $*${RESET}"; }
 
 FAILURES=0
+SUMMARY_ROWS=()
 
 require_cmd() {
     command -v "$1" &>/dev/null || { fail "Required command not found: $1"; exit 1; }
@@ -135,9 +137,11 @@ chat_once() {
 grade() {
     local label="$1" resp="$2" pat="$3"
     QUALITY_TOTAL=$((QUALITY_TOTAL + 1))
+    MODEL_TOTAL=$((MODEL_TOTAL + 1))
     if [ -n "$resp" ] && printf '%s' "$resp" | grep -qiE "$pat"; then
         pass "${label}"
         QUALITY_PASS=$((QUALITY_PASS + 1))
+        MODEL_PASS=$((MODEL_PASS + 1))
         return 0
     fi
     warn "${label} - expected /${pat}/"
@@ -145,11 +149,51 @@ grade() {
     return 0
 }
 
+score_pass() {
+    MODEL_TOTAL=$((MODEL_TOTAL + 1))
+    MODEL_PASS=$((MODEL_PASS + 1))
+    pass "$*"
+}
+
+score_warn() {
+    MODEL_TOTAL=$((MODEL_TOTAL + 1))
+    warn "$*"
+}
+
+duration_label() {
+    local ms="$1"
+    awk -v ms="$ms" 'BEGIN {
+        total = int((ms + 999) / 1000);
+        printf "%d:%02d min", int(total / 60), total % 60;
+    }'
+}
+
+summary_add() {
+    local model="$1" quant="$2" pct="$3" duration_ms="$4" pass_count="$5" total_count="$6"
+    local duration
+    duration=$(duration_label "$duration_ms")
+    SUMMARY_ROWS+=("$(printf '%03d|%s|%s|%s|%s|%s/%s' "$pct" "$model" "$quant" "$pct" "$duration" "$pass_count" "$total_count")")
+}
+
+print_summary_table() {
+    [ "${#SUMMARY_ROWS[@]}" -gt 0 ] || return 0
+
+    header "Model Scoreboard"
+    printf "  %-36s  %-12s  %-8s  %-10s  %-10s\n" "Model" "Quant" "Score" "Duration" "Checks"
+    printf "  %-36s  %-12s  %-8s  %-10s  %-10s\n" "-----" "-----" "-----" "--------" "------"
+    printf '%s\n' "${SUMMARY_ROWS[@]}" | sort -t'|' -k1,1nr | \
+        while IFS='|' read -r _ model quant pct duration checks; do
+            printf "  %-36s  %-12s  %3s%%     %-10s  %-10s\n" \
+                "$model" "(${quant})" "$pct" "$duration" "$checks"
+        done
+}
+
 benchmark_chat_tps() {
     local runs="${1:-2}" maxtok="${2:-192}"
     local i body resp start_ms end_ms elapsed_ms
     local eval_count eval_duration total_duration prompt_eval_count eval_tps wall_tps
     local ok=0 total_eval=0 total_eval_ns=0 total_wall_ms=0
+    THROUGHPUT_OK=0
 
     for i in $(seq 1 "$runs"); do
         body=$(jq -n --arg m "$FIRST_MODEL" --argjson mt "$maxtok" \
@@ -202,6 +246,7 @@ benchmark_chat_tps() {
     if [ "$ok" -gt 0 ]; then
         eval_tps=$(ollama_eval_tokens_per_second "$total_eval" "$total_eval_ns")
         wall_tps=$(wall_tokens_per_second "$total_eval" "$total_wall_ms")
+        THROUGHPUT_OK=1
         pass "Average generation throughput: ${eval_tps} eval tokens/sec (${wall_tps} wall tok/s, ${total_eval} tokens across ${ok} run(s))"
     else
         warn "Could not calculate throughput for ${FIRST_MODEL}"
@@ -262,7 +307,6 @@ run_ollama_tests() {
     local BASE_URL="$1"
     local MODEL_ARG="${2:-}"
     local FIRST_MODEL=""
-    local QUALITY_PASS=0 QUALITY_TOTAL=0
 
     echo
     echo -e "${BOLD}${CYAN}#############################################################${RESET}"
@@ -320,25 +364,43 @@ run_ollama_tests() {
             fi
         done
 
+    local -a MODELS_TO_TEST=()
     if [ -n "$MODEL_ARG" ]; then
         if printf '%s' "$MODELS_JSON" | jq -e --arg m "$MODEL_ARG" '.models[] | select(.name == $m)' >/dev/null 2>&1; then
-            FIRST_MODEL="$MODEL_ARG"
+            MODELS_TO_TEST=("$MODEL_ARG")
         else
             fail "Requested model '${MODEL_ARG}' was not found in /api/tags"
             FAILURES=$((FAILURES + 1))
             return
         fi
     else
-        FIRST_MODEL=$(printf '%s' "$MODELS_JSON" | jq -r '.models[0].name')
+        while IFS= read -r _model_name; do
+            [ -n "$_model_name" ] && MODELS_TO_TEST+=("$_model_name")
+        done < <(printf '%s' "$MODELS_JSON" | jq -r '.models[].name')
     fi
-    info "Using model for tests: ${FIRST_MODEL}"
+
+    info "Models queued for tests: ${#MODELS_TO_TEST[@]}"
+
+    for FIRST_MODEL in "${MODELS_TO_TEST[@]}"; do
+        local QUALITY_PASS=0 QUALITY_TOTAL=0
+        local MODEL_PASS=0 MODEL_TOTAL=0
+        local MODEL_START_MS MODEL_END_MS MODEL_DURATION_MS MODEL_PCT MODEL_QUANT
+        local THROUGHPUT_OK=0
+        MODEL_START_MS=$(now_ms)
+
+        echo
+        echo -e "${BOLD}${CYAN}-------------------------------------------------------------${RESET}"
+        echo -e "${BOLD}${CYAN}Model under test: ${FIRST_MODEL}${RESET}"
+        echo -e "${BOLD}${CYAN}-------------------------------------------------------------${RESET}"
 
     header "4. Model details  (POST /api/show)"
     local SHOW_BODY SHOW_RESP
     SHOW_BODY=$(jq -n --arg m "$FIRST_MODEL" '{model:$m}')
     SHOW_RESP=$(http_post "${BASE_URL}/api/show" "$SHOW_BODY" || true)
     if [ -n "$SHOW_RESP" ]; then
-        pass "Model metadata responded"
+        score_pass "Model metadata responded"
+        MODEL_QUANT=$(printf '%s' "$SHOW_RESP" | jq -r '.details.quantization_level // "n/a"' 2>/dev/null || echo "n/a")
+        [ -z "$MODEL_QUANT" ] || [ "$MODEL_QUANT" = "null" ] && MODEL_QUANT="n/a"
         printf '%s' "$SHOW_RESP" | jq -r '
             "  family      : \(.details.family // "n/a")",
             "  parameter   : \(.details.parameter_size // "n/a")",
@@ -346,7 +408,8 @@ run_ollama_tests() {
             "  format      : \(.details.format // "n/a")"
         ' 2>/dev/null || true
     else
-        warn "/api/show returned no response"
+        MODEL_QUANT="n/a"
+        score_warn "/api/show returned no response"
     fi
 
     header "5. Chat completion  (POST /api/chat)"
@@ -364,14 +427,14 @@ run_ollama_tests() {
     CHAT_RESP=$(http_post "${BASE_URL}/api/chat" "$CHAT_BODY" || true)
     CHAT_TEXT=$(printf '%s' "$CHAT_RESP" | jq -r '.message.content // empty' 2>/dev/null || true)
     if [ -n "$CHAT_TEXT" ]; then
-        pass "Chat completion succeeded"
+        score_pass "Chat completion succeeded"
         echo "  Response : ${CHAT_TEXT}"
         printf '%s' "$CHAT_RESP" | jq -r '
             "  Tokens   : prompt_eval=\(.prompt_eval_count // "n/a") eval=\(.eval_count // "n/a")",
             "  Timing   : total=\((.total_duration // 0) / 1000000000)s eval=\((.eval_duration // 0) / 1000000000)s"
         ' 2>/dev/null || true
     else
-        fail "No usable response from /api/chat"
+        score_warn "No usable response from /api/chat"
         [ -n "$CHAT_RESP" ] && echo "  Raw: $(printf '%s' "$CHAT_RESP" | head -c 400)"
         FAILURES=$((FAILURES + 1))
     fi
@@ -379,6 +442,8 @@ run_ollama_tests() {
     header "5b. Generation throughput"
     info "Metric: Ollama eval_count / eval_duration, plus wall-clock tokens/sec"
     benchmark_chat_tps 2 192
+    MODEL_TOTAL=$((MODEL_TOTAL + 1))
+    [ "${THROUGHPUT_OK:-0}" = "1" ] && MODEL_PASS=$((MODEL_PASS + 1))
 
     header "6. Generate endpoint  (POST /api/generate)"
     local GEN_BODY GEN_RESP GEN_TEXT
@@ -387,9 +452,9 @@ run_ollama_tests() {
     GEN_RESP=$(http_post "${BASE_URL}/api/generate" "$GEN_BODY" || true)
     GEN_TEXT=$(printf '%s' "$GEN_RESP" | jq -r '.response // empty' 2>/dev/null || true)
     if [ -n "$GEN_TEXT" ]; then
-        pass "Generate succeeded: \"The capital of France is${GEN_TEXT}\""
+        score_pass "Generate succeeded: \"The capital of France is${GEN_TEXT}\""
     else
-        warn "/api/generate returned no usable text"
+        score_warn "/api/generate returned no usable text"
     fi
 
     header "7. Embeddings"
@@ -398,15 +463,15 @@ run_ollama_tests() {
     EMB_RESP=$(http_post "${BASE_URL}/api/embed" "$EMB_BODY" || true)
     EMB_LEN=$(printf '%s' "$EMB_RESP" | jq '.embeddings[0] | length' 2>/dev/null || echo 0)
     if [ "${EMB_LEN:-0}" -gt 0 ] 2>/dev/null; then
-        pass "/api/embed returned vector length ${EMB_LEN}"
+        score_pass "/api/embed returned vector length ${EMB_LEN}"
     else
         EMB_BODY=$(jq -n --arg m "$FIRST_MODEL" '{model:$m, prompt:"Hello, world!"}')
         EMB_RESP=$(http_post "${BASE_URL}/api/embeddings" "$EMB_BODY" || true)
         EMB_LEN=$(printf '%s' "$EMB_RESP" | jq '.embedding | length' 2>/dev/null || echo 0)
         if [ "${EMB_LEN:-0}" -gt 0 ] 2>/dev/null; then
-            pass "/api/embeddings returned vector length ${EMB_LEN}"
+            score_pass "/api/embeddings returned vector length ${EMB_LEN}"
         else
-            warn "Embeddings not supported by this model or Ollama version"
+            score_warn "Embeddings not supported by this model or Ollama version"
         fi
     fi
 
@@ -420,11 +485,12 @@ run_ollama_tests() {
     for PROMPT in "${PROMPTS[@]}"; do
         R=$(chat_once "$PROMPT" 256 || true)
         if [ -n "$R" ]; then
+            score_pass "Self-description answered: ${PROMPT}"
             echo -e "  ${BOLD}Q:${RESET} ${PROMPT}"
             echo "  A: ${R}"
             echo
         else
-            warn "No response for: ${PROMPT}"
+            score_warn "No response for: ${PROMPT}"
         fi
     done
 
@@ -438,10 +504,10 @@ run_ollama_tests() {
         -d "$STREAM_BODY" \
         "${BASE_URL}/api/chat" 2>/dev/null | head -5 || true)
     if printf '%s' "$STREAM_OUT" | jq -e 'select(.message.content != null or .done != null)' >/dev/null 2>&1; then
-        pass "Streaming response received (first chunks):"
+        score_pass "Streaming response received (first chunks):"
         printf '%s\n' "$STREAM_OUT" | head -3 | sed 's/^/  /'
     else
-        warn "Streaming check inconclusive"
+        score_warn "Streaming check inconclusive"
     fi
 
     local QTOK=1024 CLEAN JSON_ONLY SUM_SRC NEEDLE HAY i PCT
@@ -462,12 +528,14 @@ run_ollama_tests() {
     header "13. Instruction following  (strict JSON)"
     R=$(chat_once "Respond with ONLY minified JSON, no markdown and no code fences, of the exact form {\"city\":\"\",\"country\":\"\"} giving the capital of France." "$QTOK")
     CLEAN=$(printf '%s' "$R" | sed -E 's/```json//g; s/```//g')
-    JSON_ONLY=$(printf '%s' "$CLEAN" | grep -oE '\{[^{}]*\}' | tail -1)
+    JSON_ONLY=$(printf '%s' "$CLEAN" | grep -oE '\{[^{}]*\}' | tail -1 || true)
     QUALITY_TOTAL=$((QUALITY_TOTAL + 1))
+    MODEL_TOTAL=$((MODEL_TOTAL + 1))
     if [ -n "$JSON_ONLY" ] && printf '%s' "$JSON_ONLY" | jq -e '.city' >/dev/null 2>&1 \
          && printf '%s' "$JSON_ONLY" | jq -r '.city' | grep -qi 'paris'; then
         pass "Valid JSON, city=Paris: ${JSON_ONLY}"
         QUALITY_PASS=$((QUALITY_PASS + 1))
+        MODEL_PASS=$((MODEL_PASS + 1))
     else
         warn "Did not return valid JSON with city=Paris"
         [ -n "$R" ] && echo "     got: $(printf '%s' "$R" | tr '\n' ' ' | head -c 160)"
@@ -506,6 +574,19 @@ run_ollama_tests() {
     else
         warn "No graded checks were run"
     fi
+
+        MODEL_END_MS=$(now_ms)
+        MODEL_DURATION_MS=$((MODEL_END_MS - MODEL_START_MS))
+        if [ "$MODEL_TOTAL" -gt 0 ]; then
+            MODEL_PCT=$(( MODEL_PASS * 100 / MODEL_TOTAL ))
+        else
+            MODEL_PCT=0
+        fi
+        info "Comprehensive score : ${MODEL_PASS}/${MODEL_TOTAL} checks passed (${MODEL_PCT}%)"
+        info "Duration            : $(duration_label "$MODEL_DURATION_MS")"
+        info "Quantization        : ${MODEL_QUANT:-n/a}"
+        summary_add "$FIRST_MODEL" "${MODEL_QUANT:-n/a}" "$MODEL_PCT" "$MODEL_DURATION_MS" "$MODEL_PASS" "$MODEL_TOTAL"
+    done
 }
 
 TARGET_RAW=""
@@ -522,6 +603,7 @@ BASE_URL=$(build_base_url "$TARGET_RAW" "$PORT_ARG")
 
 print_system_hardware
 run_ollama_tests "$BASE_URL" "$MODEL_ARG"
+print_summary_table
 
 header "Summary"
 info "Tested Ollama target: ${BASE_URL}"
