@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.2.0  |  Update: 7/15/2026
-# Ollama smoke test - IP/port based tester
+# Christopher Gray  |  Version: 0.2.1  |  Update: 7/15/2026
+# Ollama smoke test - IP/port based tester similar to tester_vllm.sh.
 #
 # Download: 
 #   curl -sSL https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/tester_ollama.sh -o tester_ollama.sh && chmod +x tester_ollama.sh
@@ -30,6 +30,7 @@ header() { echo -e "\n${BOLD}${CYAN}==> $*${RESET}"; }
 
 FAILURES=0
 SUMMARY_ROWS=()
+FAILURE_ROWS=()
 
 require_cmd() {
     command -v "$1" &>/dev/null || { fail "Required command not found: $1"; exit 1; }
@@ -145,8 +146,22 @@ grade() {
         return 0
     fi
     warn "${label} - expected /${pat}/"
+    record_failure "${label} - expected /${pat}/"
     [ -n "$resp" ] && echo "     got: $(printf '%s' "$resp" | tr '\n' ' ' | head -c 160)"
     return 0
+}
+
+record_failure() {
+    local msg="$1"
+    local model="${FIRST_MODEL:-SERVER}"
+    if [ -n "${model:-}" ]; then
+        FAILURE_ROWS+=("${model}|${msg}")
+    else
+        FAILURE_ROWS+=("SERVER|${msg}")
+    fi
+    if declare -p MODEL_FAILURES >/dev/null 2>&1; then
+        MODEL_FAILURES+=("$msg")
+    fi
 }
 
 score_pass() {
@@ -158,34 +173,57 @@ score_pass() {
 score_warn() {
     MODEL_TOTAL=$((MODEL_TOTAL + 1))
     warn "$*"
+    record_failure "$*"
 }
 
 duration_label() {
     local ms="$1"
     awk -v ms="$ms" 'BEGIN {
         total = int((ms + 999) / 1000);
-        printf "%d:%02d min", int(total / 60), total % 60;
+        h = int(total / 3600);
+        m = int((total % 3600) / 60);
+        s = total % 60;
+        printf "%02d:%02d:%02d", h, m, s;
     }'
 }
 
 summary_add() {
-    local model="$1" quant="$2" pct="$3" duration_ms="$4" pass_count="$5" total_count="$6"
+    local model="$1" quant="$2" quality_pct="$3" quality_pass="$4" quality_total="$5"
+    local comp_pct="$6" comp_pass="$7" comp_total="$8" duration_ms="$9"
     local duration
     duration=$(duration_label "$duration_ms")
-    SUMMARY_ROWS+=("$(printf '%03d|%s|%s|%s|%s|%s/%s' "$pct" "$model" "$quant" "$pct" "$duration" "$pass_count" "$total_count")")
+    SUMMARY_ROWS+=("$(printf '%03d|%03d|%s|%s|%s|%s/%s|%s|%s/%s|%s' \
+        "$comp_pct" "$quality_pct" "$model" "$quant" "$quality_pct" "$quality_pass" "$quality_total" \
+        "$comp_pct" "$comp_pass" "$comp_total" "$duration")")
 }
 
 print_summary_table() {
     [ "${#SUMMARY_ROWS[@]}" -gt 0 ] || return 0
 
     header "Model Scoreboard"
-    printf "  %-36s  %-12s  %-8s  %-10s  %-10s\n" "Model" "Quant" "Score" "Duration" "Checks"
-    printf "  %-36s  %-12s  %-8s  %-10s  %-10s\n" "-----" "-----" "-----" "--------" "------"
-    printf '%s\n' "${SUMMARY_ROWS[@]}" | sort -t'|' -k1,1nr | \
-        while IFS='|' read -r _ model quant pct duration checks; do
-            printf "  %-36s  %-12s  %3s%%     %-10s  %-10s\n" \
-                "$model" "(${quant})" "$pct" "$duration" "$checks"
+    printf "  %-36s  %-12s  %-15s  %-19s  %-8s\n" "Model" "Quant" "Quality" "Comprehensive" "Duration"
+    printf "  %-36s  %-12s  %-15s  %-19s  %-8s\n" "-----" "-----" "-------" "-------------" "--------"
+    printf '%s\n' "${SUMMARY_ROWS[@]}" | sort -t'|' -k1,1nr -k2,2nr | \
+        while IFS='|' read -r _ _ model quant quality_pct quality_checks comp_pct comp_checks duration; do
+            printf "  %-36s  %-12s  %3s%% (%-5s)   %3s%% (%-5s)        %-8s\n" \
+                "$model" "(${quant})" "$quality_pct" "$quality_checks" "$comp_pct" "$comp_checks" "$duration"
         done
+    info "Sorted by Comprehensive score. Quality is content grading only; Comprehensive includes API/operational checks plus Quality."
+}
+
+print_failure_details() {
+    [ "${#FAILURE_ROWS[@]}" -gt 0 ] || return 0
+
+    header "Failures By Model"
+    printf '%s\n' "${FAILURE_ROWS[@]}" | awk -F'|' '
+        $1 != current {
+            current = $1;
+            printf "  %s\n", current;
+        }
+        {
+            printf "    - %s\n", $2;
+        }
+    '
 }
 
 benchmark_chat_tps() {
@@ -322,6 +360,7 @@ run_ollama_tests() {
         echo "  Hint: start Ollama, expose the port, or pass the correct target:"
         echo "        $0 <ip-or-host> [port] [model]"
         FAILURES=$((FAILURES + 1))
+        record_failure "Cannot reach Ollama at ${BASE_URL}"
         return
     fi
 
@@ -340,6 +379,7 @@ run_ollama_tests() {
     if [ -z "$MODELS_JSON" ]; then
         fail "No response from /api/tags"
         FAILURES=$((FAILURES + 1))
+        record_failure "No response from /api/tags"
         return
     fi
 
@@ -348,6 +388,7 @@ run_ollama_tests() {
         fail "Ollama model list is empty"
         echo "  Hint: pull a model first, e.g. ollama pull llama3.1"
         FAILURES=$((FAILURES + 1))
+        record_failure "Ollama model list is empty"
         return
     fi
 
@@ -371,6 +412,8 @@ run_ollama_tests() {
         else
             fail "Requested model '${MODEL_ARG}' was not found in /api/tags"
             FAILURES=$((FAILURES + 1))
+            FIRST_MODEL="$MODEL_ARG"
+            record_failure "Requested model was not found in /api/tags"
             return
         fi
     else
@@ -384,7 +427,9 @@ run_ollama_tests() {
     for FIRST_MODEL in "${MODELS_TO_TEST[@]}"; do
         local QUALITY_PASS=0 QUALITY_TOTAL=0
         local MODEL_PASS=0 MODEL_TOTAL=0
+        local -a MODEL_FAILURES=()
         local MODEL_START_MS MODEL_END_MS MODEL_DURATION_MS MODEL_PCT MODEL_QUANT
+        local QUALITY_PCT=0
         local THROUGHPUT_OK=0
         MODEL_START_MS=$(now_ms)
 
@@ -443,7 +488,11 @@ run_ollama_tests() {
     info "Metric: Ollama eval_count / eval_duration, plus wall-clock tokens/sec"
     benchmark_chat_tps 2 192
     MODEL_TOTAL=$((MODEL_TOTAL + 1))
-    [ "${THROUGHPUT_OK:-0}" = "1" ] && MODEL_PASS=$((MODEL_PASS + 1))
+    if [ "${THROUGHPUT_OK:-0}" = "1" ]; then
+        MODEL_PASS=$((MODEL_PASS + 1))
+    else
+        record_failure "Generation throughput benchmark did not produce usable eval_count/eval_duration"
+    fi
 
     header "6. Generate endpoint  (POST /api/generate)"
     local GEN_BODY GEN_RESP GEN_TEXT
@@ -510,7 +559,7 @@ run_ollama_tests() {
         score_warn "Streaming check inconclusive"
     fi
 
-    local QTOK=1024 CLEAN JSON_ONLY SUM_SRC NEEDLE HAY i PCT
+    local QTOK=1024 CLEAN JSON_ONLY SUM_SRC NEEDLE HAY i
 
     header "10. Reasoning  (multi-step logic)"
     R=$(chat_once "Alice is older than Bob. Carol is younger than Bob. Who is the oldest of the three? Reply with only the name." "$QTOK")
@@ -538,6 +587,7 @@ run_ollama_tests() {
         MODEL_PASS=$((MODEL_PASS + 1))
     else
         warn "Did not return valid JSON with city=Paris"
+        record_failure "Strict JSON response did not return valid JSON with city=Paris"
         [ -n "$R" ] && echo "     got: $(printf '%s' "$R" | tr '\n' ' ' | head -c 160)"
     fi
 
@@ -569,23 +619,30 @@ run_ollama_tests() {
     header "Capability Scorecard - ${BASE_URL}"
     info "Model : ${FIRST_MODEL}"
     if [ "$QUALITY_TOTAL" -gt 0 ]; then
-        PCT=$(( QUALITY_PASS * 100 / QUALITY_TOTAL ))
-        info "Quality score : ${QUALITY_PASS}/${QUALITY_TOTAL} graded checks passed (${PCT}%)"
+        QUALITY_PCT=$(( QUALITY_PASS * 100 / QUALITY_TOTAL ))
+        info "Quality score : ${QUALITY_PASS}/${QUALITY_TOTAL} graded checks passed (${QUALITY_PCT}%)"
     else
         warn "No graded checks were run"
     fi
 
-        MODEL_END_MS=$(now_ms)
-        MODEL_DURATION_MS=$((MODEL_END_MS - MODEL_START_MS))
-        if [ "$MODEL_TOTAL" -gt 0 ]; then
-            MODEL_PCT=$(( MODEL_PASS * 100 / MODEL_TOTAL ))
-        else
-            MODEL_PCT=0
-        fi
-        info "Comprehensive score : ${MODEL_PASS}/${MODEL_TOTAL} checks passed (${MODEL_PCT}%)"
-        info "Duration            : $(duration_label "$MODEL_DURATION_MS")"
-        info "Quantization        : ${MODEL_QUANT:-n/a}"
-        summary_add "$FIRST_MODEL" "${MODEL_QUANT:-n/a}" "$MODEL_PCT" "$MODEL_DURATION_MS" "$MODEL_PASS" "$MODEL_TOTAL"
+    MODEL_END_MS=$(now_ms)
+    MODEL_DURATION_MS=$((MODEL_END_MS - MODEL_START_MS))
+    if [ "$MODEL_TOTAL" -gt 0 ]; then
+        MODEL_PCT=$(( MODEL_PASS * 100 / MODEL_TOTAL ))
+    else
+        MODEL_PCT=0
+    fi
+    info "Comprehensive score : ${MODEL_PASS}/${MODEL_TOTAL} checks passed (${MODEL_PCT}%)"
+    info "Duration            : $(duration_label "$MODEL_DURATION_MS")"
+    info "Quantization        : ${MODEL_QUANT:-n/a}"
+    if [ "${#MODEL_FAILURES[@]}" -gt 0 ]; then
+        header "Failures for ${FIRST_MODEL}"
+        for failure in "${MODEL_FAILURES[@]}"; do
+            echo "  - ${failure}"
+        done
+    fi
+    summary_add "$FIRST_MODEL" "${MODEL_QUANT:-n/a}" "$QUALITY_PCT" "$QUALITY_PASS" "$QUALITY_TOTAL" \
+        "$MODEL_PCT" "$MODEL_PASS" "$MODEL_TOTAL" "$MODEL_DURATION_MS"
     done
 }
 
@@ -604,6 +661,7 @@ BASE_URL=$(build_base_url "$TARGET_RAW" "$PORT_ARG")
 print_system_hardware
 run_ollama_tests "$BASE_URL" "$MODEL_ARG"
 print_summary_table
+print_failure_details
 
 header "Summary"
 info "Tested Ollama target: ${BASE_URL}"
@@ -611,6 +669,9 @@ if [ "$FAILURES" -eq 0 ]; then
     pass "All critical checks passed"
 else
     fail "${FAILURES} critical check(s) failed"
+fi
+if [ "${#FAILURE_ROWS[@]}" -gt 0 ]; then
+    warn "${#FAILURE_ROWS[@]} model/server check failure(s) listed above"
 fi
 
 exit "$FAILURES"
