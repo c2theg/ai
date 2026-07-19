@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #    By: Christopher Gray
-#    Version: 0.2.0
+#    Version: 0.2.1
 #    Updated: 7/18/2026
 #
 #    This script installs the ASR sidecar on an NVIDIA DGX Spark / GB10 (arm64 + Blackwell).
@@ -3424,11 +3424,15 @@ fi
 # reports success, silently serving old code with nothing in the install
 # log to explain it (this is exactly what made an earlier run look like it
 # deployed new code when it hadn't).
+# `|| true` at the end: under set -e/pipefail, grep exiting 1 for "no match"
+# (the normal case — nothing else is on this port) would otherwise abort the
+# whole script right here with zero output, which is exactly what happened
+# the first time this line shipped.
 OTHER_ON_PORT="$(${SUDO} docker ps -a --format '{{.ID}}\t{{.Names}}\t{{.Ports}}' \
-  | grep -E "(^|[^0-9])${PORT}->" | awk -F'\t' -v n="${CONTAINER_NAME}" '$2 != n {print $1}')"
+  | grep -E "(^|[^0-9])${PORT}->" | awk -F'\t' -v n="${CONTAINER_NAME}" '$2 != n {print $1}' || true)"
 if [ -n "${OTHER_ON_PORT}" ]; then
   for cid in ${OTHER_ON_PORT}; do
-    cname="$(${SUDO} docker inspect -f '{{.Name}}' "${cid}" 2>/dev/null | sed 's#^/##')"
+    cname="$(${SUDO} docker inspect -f '{{.Name}}' "${cid}" 2>/dev/null | sed 's#^/##' || true)"
     warn "Container '${cname:-$cid}' is already publishing port ${PORT} — stopping and removing it."
     ${SUDO} docker rm -f "${cid}" >/dev/null
   done
@@ -3493,8 +3497,11 @@ if [ "${ok}" -eq 1 ]; then
       # Headers arrive lowercase on the wire; a 2s tone is far too short to be
       # a meaningful RTF sample (fixed model-load overhead dominates) — this
       # only proves the timing plumbing works end-to-end, not real throughput.
-      SMOKE_RTF="$(grep -i '^x-asr-rtf:' "${SMOKE_HEADERS}" | tr -d '\r' | cut -d' ' -f2)"
-      SMOKE_SPEED="$(grep -i '^x-asr-speed-realtime:' "${SMOKE_HEADERS}" | tr -d '\r' | cut -d' ' -f2)"
+      # || true: an older sidecar / a request that never reached the timing
+      # code sends no X-ASR-* headers at all — grep finding nothing here is
+      # expected, not an error, and must not abort the script (set -e/pipefail).
+      SMOKE_RTF="$(grep -i '^x-asr-rtf:' "${SMOKE_HEADERS}" | tr -d '\r' | cut -d' ' -f2 || true)"
+      SMOKE_SPEED="$(grep -i '^x-asr-speed-realtime:' "${SMOKE_HEADERS}" | tr -d '\r' | cut -d' ' -f2 || true)"
       [ -n "${SMOKE_RTF}" ] && log "Smoke-test RTF=${SMOKE_RTF} speed=${SMOKE_SPEED}x realtime (2s tone — not representative; run a real benchmark, see below)."
     else
       warn "Batch endpoint didn't return segments — check: ${SUDO:+sudo }docker logs ${CONTAINER_NAME}"
@@ -3514,10 +3521,13 @@ fi
 
 # ─────────────────────────────── summary ─────────────────────────────────────
 IP="$(lan_ip)"
-BATCH_SIZE_SUMMARY="$(grep '^ASR_BATCH_SIZE=' "${ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2)"
-CHUNK_TARGET_SUMMARY="$(grep '^ASR_CHUNK_TARGET_SECONDS=' "${ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2)"
-BUCKETING_SUMMARY="$(grep '^ASR_DURATION_BUCKETING=' "${ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2)"
-GPU_METRICS_SUMMARY="$(grep '^ASR_GPU_METRICS_ENABLED=' "${ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2)"
+# || true on each: grep finding no matching key in ${ENV_FILE} (e.g. it was
+# written by an older installer version, or is missing/unreadable) is a
+# display-only degradation, not something that should abort the script here.
+BATCH_SIZE_SUMMARY="$(grep '^ASR_BATCH_SIZE=' "${ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2 || true)"
+CHUNK_TARGET_SUMMARY="$(grep '^ASR_CHUNK_TARGET_SECONDS=' "${ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2 || true)"
+BUCKETING_SUMMARY="$(grep '^ASR_DURATION_BUCKETING=' "${ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2 || true)"
+GPU_METRICS_SUMMARY="$(grep '^ASR_GPU_METRICS_ENABLED=' "${ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2 || true)"
 cat <<EOF
 
 ${c_b}Done.${c_0}
