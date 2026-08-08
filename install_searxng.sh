@@ -2,8 +2,9 @@
 #
 # install_searxng.sh — Install & run SearXNG via Docker Compose using a
 #                      local settings.yml.
-#
 # By: generated for Christopher Gray
+# Install: wget https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_searxng.sh && chmod u+x install_searxng.sh
+#
 # Usage:
 #   sudo ./install_searxng.sh                 # download config + install + start
 #   sudo ./install_searxng.sh --settings /path/to/searxng_settings.yml  # use local file
@@ -21,7 +22,7 @@ INSTALL_DIR="/opt/searxng"
 SETTINGS_URL="https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/searxng_settings.yml"
 # Local settings file; if set (via --settings) it wins over downloading.
 SETTINGS_SRC=""
-PORT="8080"
+PORT="8040"
 HOST="0.0.0.0"
 IMAGE="searxng/searxng:latest"
 UNINSTALL=0
