@@ -132,9 +132,9 @@ Qdrant is running.
   Image     : ${QDRANT_IMAGE}:${QDRANT_TAG}
   Data dir  : $QDRANT_DATA_DIR
   Snapshots : $QDRANT_SNAPSHOTS_DIR
-  REST API  : http://localhost:${QDRANT_HTTP_PORT}
-  Dashboard : http://localhost:${QDRANT_HTTP_PORT}/dashboard
-  gRPC      : localhost:${QDRANT_GRPC_PORT}
+  REST API  : http://0.0.0.0:${QDRANT_HTTP_PORT}
+  Dashboard : http://0.0.0.0:${QDRANT_HTTP_PORT}/dashboard
+  gRPC      : 0.0.0.0:${QDRANT_GRPC_PORT}
 
   Logs      : docker logs -f $QDRANT_CONTAINER_NAME
   Stop      : docker stop $QDRANT_CONTAINER_NAME
