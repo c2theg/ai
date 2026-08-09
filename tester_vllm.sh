@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.0.21  |  Update: 7/14/2026
+# Christopher Gray - @c2theg/ai |  Version: 0.1.23  |  Update: 8/9/2026
 # vLLM smoke test — auto-discovers every running vLLM instance (ports + models)
 #                   and runs the full smoke test against each one.
 # Includes 11 auto-graded model-quality tests (reasoning, math, summarization,
@@ -8,13 +8,30 @@
 #
 #
 #Update Yourself:
-#  wget --no-cache -O 'tester_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/tester_vllm.sh' && chmod u+x tester_vllm.sh
+#  curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' -o 'tester_vllm.sh' "https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/tester_vllm.sh?nocache=$(date +%s)" && chmod u+x tester_vllm.sh
 #
 #
 # Usage: ./tester_vllm.sh [HOST] [PORT]
 #   No args     -> auto-discover ALL local vLLM instances and test each.
 #   HOST        -> discover instances on that host (local discovery only).
 #   HOST PORT   -> test only that specific host:port (skips discovery).
+#
+# Requirements:
+#   - bash, curl, jq            (required — the script exits early if missing)
+#   - pdftotext (poppler-utils) (optional — enables the PDF extraction test;
+#                                 that one test skips gracefully if it's absent)
+#
+# Hugging Face setup (only needed if the vLLM instance under test is serving a
+# gated/private model, e.g. Llama or Gemma — public models need no token):
+#   1. Grab a read token from https://huggingface.co/settings/tokens
+#   2. Create a .env file next to wherever you launch `vllm serve`, containing:
+#        HUGGING_FACE_HUB_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
+#   3. Before starting vLLM, load it into the environment:
+#        set -a && source .env && set +a
+#      (or `export $(grep -v '^#' .env | xargs)` if you're not sourcing it)
+#   This token is consumed by vLLM itself when it downloads the model from the
+#   Hub — this tester script only talks HTTP to an already-running instance
+#   and never touches Hugging Face directly, so it has nothing to load here.
 set -euo pipefail
 
 HOST="${1:-localhost}"
@@ -92,7 +109,77 @@ chat_once() {
         '{model:$m, max_tokens:$mt, temperature:0,
           messages:[{role:"user", content:$p}]}')
     http_post "${BASE_URL}/v1/chat/completions" "$body" 2>/dev/null \
-        | jq -r '.choices[0].message.content // empty' 2>/dev/null
+        | jq -r '(.choices[0].message.content // "") as $c
+                  | if ($c|length) > 0 then $c else (.choices[0].message.reasoning_content // .choices[0].message.reasoning // empty) end' \
+              2>/dev/null || true
+}
+
+# ── Helper: generate code, time the generation, then have the SAME model
+#    self-grade its own output's likely correctness as a percentage.
+#    Uses the caller's FIRST_MODEL and BASE_URL (bash dynamic scope) and
+#    updates the caller's QUALITY_PASS / QUALITY_TOTAL scorecard counters.
+code_gen_test() {
+    local test_num="$1" lang_label="$2" gen_prompt="$3" maxtok="${4:-2048}"
+    local start_ms end_ms elapsed_ms elapsed_s code clean_code judge_prompt judge_resp score
+
+    header "${test_num}. Code generation — ${lang_label}"
+
+    start_ms=$(now_ms)
+    code=$(chat_once "$gen_prompt" "$maxtok")
+    end_ms=$(now_ms)
+    elapsed_ms=$((end_ms - start_ms))
+    [ "$elapsed_ms" -le 0 ] && elapsed_ms=1
+    elapsed_s=$(awk -v ms="$elapsed_ms" 'BEGIN{printf "%.2f", ms/1000}')
+
+    info "Generation time: ${elapsed_s}s"
+
+    if [ -z "$code" ]; then
+        warn "No code generated for ${lang_label} (empty response)"
+        return
+    fi
+
+    # Strip markdown code fences so the printed code is clean, readable, and
+    # keeps its original multi-line formatting/indentation.
+    clean_code=$(printf '%s' "$code" | sed -E '/^[[:space:]]*```/d')
+
+    echo -e "  ${BOLD}Generated code (${lang_label}):${RESET}"
+    echo
+    echo "$clean_code" | sed 's/^/    /'
+    echo
+
+    judge_prompt="Given the provided code, what is the likelihood this code is syntactically correct and will work? Provide a percentage of its correctness in a 1-100% format, with just the number and a percent sign, nothing else.
+
+Code:
+${code}"
+    judge_resp=$(chat_once "$judge_prompt" 512)
+
+    score=$(printf '%s' "$judge_resp" | grep -oE '[0-9]{1,3}[[:space:]]*%' | tail -1 | grep -oE '[0-9]{1,3}')
+    [ -z "$score" ] && score=$(printf '%s' "$judge_resp" | grep -oE '[0-9]{1,3}' | tail -1)
+
+    QUALITY_TOTAL=$((QUALITY_TOTAL + 1))
+    if [ -n "$score" ] && [ "$score" -ge 0 ] 2>/dev/null; then
+        [ "$score" -gt 100 ] && score=100
+        if [ "$score" -ge 70 ]; then
+            pass "Self-assessed correctness: ${score}%"
+            QUALITY_PASS=$((QUALITY_PASS + 1))
+        else
+            warn "Self-assessed correctness: ${score}% (below 70% confidence threshold)"
+        fi
+    else
+        warn "Could not parse a correctness percentage from the self-assessment"
+        [ -n "$judge_resp" ] && echo "     judge raw: $(printf '%s' "$judge_resp" | tr '\n' ' ' | head -c 160)"
+    fi
+}
+
+# ── Helper: cosine similarity between two JSON-encoded float arrays ───────────
+cosine_similarity() {
+    local a="$1" b="$2"
+    jq -n --argjson a "$a" --argjson b "$b" '
+        (([range(0; ($a|length))] | map($a[.] * $b[.]) | add) // 0) as $dot
+        | (($a | map(. * .) | add) | sqrt) as $na
+        | (($b | map(. * .) | add) | sqrt) as $nb
+        | if $na == 0 or $nb == 0 then 0 else $dot / ($na * $nb) end
+    ' 2>/dev/null || echo 0
 }
 
 # ── Helper: benchmark generated completion tokens/sec for the active model ────
@@ -174,6 +261,32 @@ grade() {
 OCR_PNG_B64="iVBORw0KGgoAAAANSUhEUgAAAWgAAABaAQAAAAC9W/FqAAACU0lEQVR42u3WQW7bRhjF8d+MBi135tILAyFyjqBiexIfoSeIJ0XXPYNOEtBFDpBeoKABL7wrUxQF0445XcixLEVJkHVFgAAJvvn48b3/N2CovuKITuqT+qQ+qf/v6qQ2iZusBjctblruk3ch4DokPxF5RfTSclBh8ye39xk9qFf5vuaa+20nzZ645pptbDCCxaYYFm8P+s4jFgbZhAkU02wsiNZKu7ekMFZm25OZyTSbj3kyfztOy2pmXUByMXvBxVEHp/PzuaRvCrGwLqbn/DB7XkRdnrsPwuFX6BLnAcHWg96YTd8f1N56M/axzB59Le3F48JjWeZA55cPn9GtMrSI2mHqj6X84+5yaShn+aB2Gn/GwPKkwNQrn6EqkB9Stc3zroWaRM045k8g90+CbOxcsXye2OsGrtF3rz/uJP6xz9cjbhtvKI0oTdefrN4+1JtazO0XZucSmRdzswUy7ruxT2PIjwMWGDtR3F9xvbtbVzehJkJZRYZeZN4Z+PeDyxkbcn4Kfc7H+u6J7eCWfng6gIEoSDueut3Tl3QjS+MdpCUS+fcjBiujSLudy7e8z0o6zLKwXrphSY2KxrMKV+4qDZF8EKCxcLcgbae4kwzmluTp5tMvv9He3TWp/JV2eb7W/t64SWXbyX2IXoUHppv3XRvv22Y7xYX2TeO2nbYU9PsBSnSBlrAc4BWPbru9rHtCYrt180DdZYQcsks9rh5edpk+bKB1XFfCyHdn43JWax3Pap1XdVrX4arOz2oNta7qYFXD6a/3pD6pT+qT+iuO/wARid8UZkrVCQAAAABJRU5ErkJggg=="
 # Short mono MP3 of the spoken phrase "the quick brown fox"  (for the ASR test)
 SPEECH_MP3_B64="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"
+
+# ── Helper: build a minimal self-contained PDF and extract its text once ──────
+#    Used by the "pull info from a PDF" test. Built at runtime (not embedded as
+#    base64) so its Length field is always byte-exact. If pdftotext isn't
+#    installed, PDF_TEXT stays empty and that test skips gracefully.
+PDF_ARTICLE_TEXT="The town council announced Tuesday that the new public library on Elm Street will open on November 3rd, marking the completion of an 18 month, 4.2 million dollar renovation. The project added a childrens reading wing, thirty public computer stations, and a rooftop garden. Library director Elena Vasquez said the goal is to triple foot traffic within the first year. Confirmation code: DOC-9931-B."
+PDF_TEXT=""
+if command -v pdftotext &>/dev/null; then
+    PDF_STREAM_BODY=$(printf 'BT /F1 10 Tf 40 700 Td (%s) Tj ET\n' "$PDF_ARTICLE_TEXT")
+    PDF_STREAM_LEN=$(printf '%s' "$PDF_STREAM_BODY" | wc -c | tr -d ' ')
+    PDF_TMP="${TMPDIR:-/tmp}/vllm_smoketest_$$.pdf"
+    {
+        printf '%%PDF-1.4\n'
+        printf '1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n'
+        printf '2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n'
+        printf '3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n'
+        printf '4 0 obj<</Length %s>>stream\n' "$PDF_STREAM_LEN"
+        printf '%s' "$PDF_STREAM_BODY"
+        printf 'endstream endobj\n'
+        printf '5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n'
+        printf 'trailer<</Size 6/Root 1 0 R>>\n'
+        printf '%%%%EOF\n'
+    } > "$PDF_TMP" 2>/dev/null
+    PDF_TEXT=$(pdftotext "$PDF_TMP" - 2>/dev/null || true)
+    rm -f "$PDF_TMP" 2>/dev/null || true
+fi
 
 # ── Helper: listening TCP ports owned by a PID ────────────────────────────────
 listen_ports_for_pid() {
@@ -318,7 +431,7 @@ run_instance_tests() {
     local PORT="$2"
     local BASE_URL="http://${HOST}:${PORT}"
     local FIRST_MODEL=""
-    local QUALITY_PASS=0 QUALITY_TOTAL=0   # capability scorecard (tests 10-20)
+    local QUALITY_PASS=0 QUALITY_TOTAL=0 PCT   # capability scorecard
 
     echo
     echo -e "${BOLD}${CYAN}#############################################################${RESET}"
@@ -340,12 +453,18 @@ run_instance_tests() {
 
     # ── 2. Health endpoint ────────────────────────────────────────────────────
     header "2. Health check  (GET /health)"
-    local HEALTH
-    HEALTH=$(http_get "${BASE_URL}/health" || true)
-    if [ -n "$HEALTH" ]; then
-        pass "Health endpoint responded: ${HEALTH}"
+    local HEALTH HEALTH_CODE HEALTH_TMP
+    HEALTH_TMP="${TMPDIR:-/tmp}/vllm_health_$$_${PORT}"
+    HEALTH_CODE=$(curl -s -o "$HEALTH_TMP" -w '%{http_code}' --max-time 10 "${BASE_URL}/health" 2>/dev/null || true)
+    HEALTH=$(cat "$HEALTH_TMP" 2>/dev/null || true)
+    rm -f "$HEALTH_TMP" 2>/dev/null || true
+    if [ "$HEALTH_CODE" = "200" ]; then
+        # vLLM's /health intentionally returns 200 with an empty body — that's a pass, not a warning.
+        pass "Health endpoint responded: HTTP 200${HEALTH:+ — ${HEALTH}}"
+    elif [ -n "$HEALTH_CODE" ] && [ "$HEALTH_CODE" != "000" ]; then
+        warn "/health responded with HTTP ${HEALTH_CODE} (may be unsupported on this version)"
     else
-        warn "/health returned empty or no response (may be unsupported on this version)"
+        warn "/health returned no response (may be unsupported on this version)"
     fi
 
     # ── 3. Model list ─────────────────────────────────────────────────────────
@@ -369,6 +488,42 @@ run_instance_tests() {
         fi
     fi
 
+    # ── 3b. Capability detection  (chat vs. embeddings) ───────────────────────
+    #     Any vLLM model on this port is supported — we never assume a name or
+    #     a model type, we ask the server what it can actually do and gate the
+    #     rest of the suite on the answer. Chat-only models skip embeddings-only
+    #     checks (and vice versa) as graceful skips, never as false failures.
+    header "3b. Capability detection"
+    local CAP_CHAT=0 CAP_EMBED=0
+    if [ -n "${FIRST_MODEL:-}" ]; then
+        local PROBE_BODY PROBE_RESP EPROBE_BODY EPROBE_RESP
+        PROBE_BODY=$(jq -n --arg m "$FIRST_MODEL" \
+            '{model:$m, max_tokens:1, messages:[{role:"user", content:"hi"}]}')
+        PROBE_RESP=$(http_post "${BASE_URL}/v1/chat/completions" "$PROBE_BODY" || true)
+        if [ -n "$PROBE_RESP" ] && printf '%s' "$PROBE_RESP" | jq -e '.choices[0]' >/dev/null 2>&1; then
+            CAP_CHAT=1
+        fi
+
+        EPROBE_BODY=$(jq -n --arg m "$FIRST_MODEL" '{model:$m, input:"probe"}')
+        EPROBE_RESP=$(http_post "${BASE_URL}/v1/embeddings" "$EPROBE_BODY" || true)
+        if [ -n "$EPROBE_RESP" ] && printf '%s' "$EPROBE_RESP" | jq -e '.data[0].embedding[0]' >/dev/null 2>&1; then
+            CAP_EMBED=1
+        fi
+
+        if [ "$CAP_CHAT" -eq 1 ] && [ "$CAP_EMBED" -eq 1 ]; then
+            info "Model supports both chat/completions and embeddings"
+        elif [ "$CAP_CHAT" -eq 1 ]; then
+            info "Model supports chat/completions (no embeddings support detected)"
+        elif [ "$CAP_EMBED" -eq 1 ]; then
+            info "Model supports embeddings only (embedding model) — chat-dependent tests will be skipped, not failed"
+        else
+            warn "Could not confirm chat or embeddings support via quick probe — will attempt chat tests anyway"
+            CAP_CHAT=1
+        fi
+    else
+        warn "Skipping — no model discovered"
+    fi
+
     # ── 4. Server info / version ──────────────────────────────────────────────
     header "4. Server info"
     local path RESP
@@ -383,6 +538,8 @@ run_instance_tests() {
     header "5. Chat completion  (POST /v1/chat/completions)"
     if [ -z "${FIRST_MODEL:-}" ]; then
         warn "Skipping — no model discovered"
+    elif [ "$CAP_CHAT" -ne 1 ]; then
+        warn "Skipping — model does not support chat/completions (embedding-only model)"
     else
         local CHAT_BODY CHAT_RESP CHAT_TEXT USAGE
         CHAT_BODY=$(jq -n \
@@ -401,7 +558,10 @@ run_instance_tests() {
             fail "No response from /v1/chat/completions"
             FAILURES=$((FAILURES + 1))
         else
-            CHAT_TEXT=$(echo "$CHAT_RESP" | jq -r '.choices[0].message.content' 2>/dev/null || true)
+            CHAT_TEXT=$(printf '%s' "$CHAT_RESP" | jq -r \
+                '(.choices[0].message.content // "") as $c
+                 | if ($c|length) > 0 then $c else (.choices[0].message.reasoning_content // .choices[0].message.reasoning // empty) end' \
+                2>/dev/null || true)
             USAGE=$(echo "$CHAT_RESP"     | jq -r '"prompt=\(.usage.prompt_tokens) completion=\(.usage.completion_tokens) total=\(.usage.total_tokens)"' 2>/dev/null || true)
             if [ -n "$CHAT_TEXT" ] && [ "$CHAT_TEXT" != "null" ]; then
                 pass "Chat completion succeeded"
@@ -419,6 +579,8 @@ run_instance_tests() {
     header "5b. Generation throughput  (completion tokens/sec)"
     if [ -z "${FIRST_MODEL:-}" ]; then
         warn "Skipping — no model discovered"
+    elif [ "$CAP_CHAT" -ne 1 ]; then
+        warn "Skipping — model does not support chat/completions (embedding-only model)"
     else
         info "Benchmarking model: ${FIRST_MODEL}"
         info "Metric: non-streaming completion_tokens / end-to-end request seconds"
@@ -429,6 +591,8 @@ run_instance_tests() {
     header "6. Text completion  (POST /v1/completions)"
     if [ -z "${FIRST_MODEL:-}" ]; then
         warn "Skipping — no model discovered"
+    elif [ "$CAP_CHAT" -ne 1 ]; then
+        warn "Skipping — model does not support text completions (embedding-only model)"
     else
         local COMP_BODY COMP_RESP COMP_TEXT
         COMP_BODY=$(jq -n \
@@ -456,20 +620,73 @@ run_instance_tests() {
     header "7. Embeddings  (POST /v1/embeddings)"
     if [ -z "${FIRST_MODEL:-}" ]; then
         warn "Skipping — no model discovered"
+    elif [ "$CAP_EMBED" -ne 1 ]; then
+        warn "/v1/embeddings not supported (expected — embeddings require a dedicated embedding model)"
     else
-        local EMB_BODY EMB_RESP EMB_LEN
+        local EMB_BODY EMB_RESP EMB_LEN BATCH_BODY BATCH_RESP BATCH_COUNT
         EMB_BODY=$(jq -n \
             --arg model "$FIRST_MODEL" \
             '{model: $model, input: "Hello, world!"}')
         EMB_RESP=$(http_post "${BASE_URL}/v1/embeddings" "$EMB_BODY" || true)
         if [ -z "$EMB_RESP" ]; then
-            warn "/v1/embeddings not supported (expected — embeddings require a dedicated embedding model)"
+            fail "No response from /v1/embeddings"
+            FAILURES=$((FAILURES + 1))
         else
             EMB_LEN=$(echo "$EMB_RESP" | jq '.data[0].embedding | length' 2>/dev/null || echo 0)
-            if [ "$EMB_LEN" -gt 0 ]; then
+            if [ "$EMB_LEN" -gt 0 ] 2>/dev/null; then
                 pass "Embeddings returned vector of length ${EMB_LEN}"
             else
-                warn "Embeddings endpoint responded but no vector returned"
+                fail "Embeddings endpoint responded but no vector returned"
+                FAILURES=$((FAILURES + 1))
+            fi
+        fi
+
+        BATCH_BODY=$(jq -n --arg model "$FIRST_MODEL" \
+            '{model: $model, input: ["Hello, world!", "Goodbye, world!"]}')
+        BATCH_RESP=$(http_post "${BASE_URL}/v1/embeddings" "$BATCH_BODY" || true)
+        BATCH_COUNT=$(printf '%s' "$BATCH_RESP" | jq '.data | length' 2>/dev/null || echo 0)
+        if [ "$BATCH_COUNT" = "2" ]; then
+            pass "Batch embeddings returned 2 vectors for 2 inputs"
+        else
+            warn "Batch embeddings request did not return 2 vectors (got ${BATCH_COUNT:-0})"
+        fi
+    fi
+
+    # ── 7b. Embedding semantic quality  (similarity sanity check) ─────────────
+    header "7b. Embedding semantic quality"
+    if [ -z "${FIRST_MODEL:-}" ]; then
+        warn "Skipping — no model discovered"
+    elif [ "$CAP_EMBED" -ne 1 ]; then
+        warn "Skipping — embeddings not supported by this model"
+    else
+        local SIM_BODY SIM_RESP VEC_A VEC_B VEC_C SIM_AB SIM_AC
+        SIM_BODY=$(jq -n --arg model "$FIRST_MODEL" \
+            '{model: $model, input: [
+                "The cat sat on the mat.",
+                "A feline rested on the rug.",
+                "Quantum entanglement defies classical intuition."
+            ]}')
+        SIM_RESP=$(http_post "${BASE_URL}/v1/embeddings" "$SIM_BODY" || true)
+        if [ -z "$SIM_RESP" ]; then
+            warn "Could not fetch vectors for similarity check"
+        else
+            VEC_A=$(printf '%s' "$SIM_RESP" | jq -c '.data[0].embedding' 2>/dev/null || true)
+            VEC_B=$(printf '%s' "$SIM_RESP" | jq -c '.data[1].embedding' 2>/dev/null || true)
+            VEC_C=$(printf '%s' "$SIM_RESP" | jq -c '.data[2].embedding' 2>/dev/null || true)
+            if [ -n "$VEC_A" ] && [ -n "$VEC_B" ] && [ -n "$VEC_C" ]; then
+                SIM_AB=$(cosine_similarity "$VEC_A" "$VEC_B")
+                SIM_AC=$(cosine_similarity "$VEC_A" "$VEC_C")
+                info "cos(similar pair)   = ${SIM_AB}"
+                info "cos(unrelated pair) = ${SIM_AC}"
+                QUALITY_TOTAL=$((QUALITY_TOTAL + 1))
+                if awk -v ab="$SIM_AB" -v ac="$SIM_AC" 'BEGIN{exit !(ab>ac)}' 2>/dev/null; then
+                    pass "Similar sentences score higher cosine similarity than an unrelated one"
+                    QUALITY_PASS=$((QUALITY_PASS + 1))
+                else
+                    warn "Similar sentences did NOT score higher cosine similarity than an unrelated one"
+                fi
+            else
+                warn "Could not parse vectors for similarity check"
             fi
         fi
     fi
@@ -478,6 +695,8 @@ run_instance_tests() {
     header "8. Model self-description prompts"
     if [ -z "${FIRST_MODEL:-}" ]; then
         warn "Skipping — no model discovered"
+    elif [ "$CAP_CHAT" -ne 1 ]; then
+        warn "Skipping — model does not support chat/completions (embedding-only model)"
     else
         local PROMPTS PROMPT BODY RESP TEXT
         PROMPTS=(
@@ -491,18 +710,21 @@ run_instance_tests() {
                 --arg prompt "$PROMPT" \
                 '{
                     model: $model,
-                    max_tokens: 512,
+                    max_tokens: 1536,
                     temperature: 0.1,
                     messages: [{role: "user", content: $prompt}]
                 }')
             RESP=$(http_post "${BASE_URL}/v1/chat/completions" "$BODY" || true)
-            TEXT=$(echo "$RESP" | jq -r '.choices[0].message.content' 2>/dev/null || true)
+            TEXT=$(printf '%s' "$RESP" | jq -r \
+                '(.choices[0].message.content // "") as $c
+                 | if ($c|length) > 0 then $c else (.choices[0].message.reasoning_content // .choices[0].message.reasoning // empty) end' \
+                2>/dev/null || true)
             if [ -n "$TEXT" ] && [ "$TEXT" != "null" ]; then
                 echo -e "  ${BOLD}Q:${RESET} ${PROMPT}"
                 echo    "  A: ${TEXT}"
                 echo
             else
-                warn "No response for: ${PROMPT}"
+                warn "No response for: ${PROMPT} (may need a larger max_tokens budget for this reasoning model)"
             fi
         done
     fi
@@ -511,6 +733,8 @@ run_instance_tests() {
     header "9. Streaming  (POST /v1/chat/completions  stream=true)"
     if [ -z "${FIRST_MODEL:-}" ]; then
         warn "Skipping — no model discovered"
+    elif [ "$CAP_CHAT" -ne 1 ]; then
+        warn "Skipping — model does not support chat/completions (embedding-only model)"
     else
         local STREAM_BODY STREAM_OUT
         STREAM_BODY=$(jq -n \
@@ -535,30 +759,32 @@ run_instance_tests() {
     fi
 
     # ══════════════════════════════════════════════════════════════════════════
-    #  MODEL QUALITY & CAPABILITY TESTS (10-20)
+    #  MODEL QUALITY & CAPABILITY TESTS (10-37)
     #  Auto-graded against known answers. Tolerant of "thinking"/reasoning models:
     #  the expected answer is matched ANYWHERE in the output, with a generous
     #  token budget so a chain-of-thought preamble doesn't truncate the answer.
     # ══════════════════════════════════════════════════════════════════════════
     if [ -z "${FIRST_MODEL:-}" ]; then
-        warn "Skipping capability tests 10-20 — no model discovered"
+        warn "Skipping capability tests 10-37 — no model discovered"
+    elif [ "$CAP_CHAT" -ne 1 ]; then
+        warn "Skipping capability tests 10-37 — model does not support chat/completions (embedding-only model)"
     else
         local QTOK=1024
-        local R CLEAN JSON_ONLY SUM_SRC NEEDLE HAY i PCT
+        local R CLEAN JSON_ONLY SUM_SRC NEEDLE HAY i
         local VBODY VRESP VTEXT ATMP AREQ ATEXT
 
         header "10. Reasoning  (multi-step logic)"
         R=$(chat_once "Alice is older than Bob. Carol is younger than Bob. Who is the oldest of the three? Reply with only the name." "$QTOK")
-        grade "Logical ordering -> Alice" "$R" "alice"
+        grade "Logical ordering -> Alice" "$R" "alice" || true
 
         header "11. Math  (word problem)"
         R=$(chat_once "A shirt costs \$40. It is discounted 25%, then 10% sales tax is added to the discounted price. What is the final price in dollars? Reply with only the number." "$QTOK")
-        grade "Arithmetic -> 33" "$R" "(^|[^0-9.])33([^0-9]|\$)"
+        grade "Arithmetic -> 33" "$R" "(^|[^0-9.])33([^0-9]|\$)" || true
 
         header "12. Text summarization"
         SUM_SRC="Photosynthesis is the process by which green plants, algae, and some bacteria convert light energy, usually from the sun, into chemical energy stored in glucose. It takes place in the chloroplasts, uses carbon dioxide and water, and releases oxygen as a byproduct. This process is the foundation of most food chains on Earth."
         R=$(chat_once "Summarize the following text in one short sentence:\n\n${SUM_SRC}" "$QTOK")
-        grade "Summary captures the core topic" "$R" "photosynthes"
+        grade "Summary captures the core topic" "$R" "photosynthes" || true
 
         header "13. Instruction following  (strict JSON)"
         R=$(chat_once "Respond with ONLY minified JSON, no markdown and no code fences, of the exact form {\"city\":\"\",\"country\":\"\"} giving the capital of France." "$QTOK")
@@ -576,11 +802,11 @@ run_instance_tests() {
 
         header "14. Code generation"
         R=$(chat_once "Write a Python function named is_prime(n) that returns True if n is prime. Output only the code." "$QTOK")
-        grade "Defines is_prime()" "$R" "def[[:space:]]+is_prime"
+        grade "Defines is_prime()" "$R" "def[[:space:]]+is_prime" || true
 
         header "15. Factual knowledge"
         R=$(chat_once "What is the chemical symbol for gold? Reply with only the symbol." "$QTOK")
-        grade "Gold -> Au" "$R" "(^|[^A-Za-z])Au([^A-Za-z]|\$)"
+        grade "Gold -> Au" "$R" "(^|[^A-Za-z])Au([^A-Za-z]|\$)" || true
 
         header "16. Long-context needle retrieval"
         NEEDLE="PLUM-4417"
@@ -589,15 +815,15 @@ run_instance_tests() {
         HAY="${HAY}NOTE: the vault access code is ${NEEDLE}. "
         for i in $(seq 61 120); do HAY="${HAY}Log line ${i}: routine status nominal, nothing to report. "; done
         R=$(chat_once "The following is a long log. Find the vault access code buried in it and reply with only the code.\n\n${HAY}" "$QTOK")
-        grade "Recalled needle ${NEEDLE}" "$R" "PLUM[- ]?4417"
+        grade "Recalled needle ${NEEDLE}" "$R" "PLUM[- ]?4417" || true
 
         header "17. Translation  (multilingual)"
         R=$(chat_once "Translate the phrase 'good morning' into French. Reply with only the translation." "$QTOK")
-        grade "EN->FR 'bonjour'" "$R" "bonjour"
+        grade "EN->FR 'bonjour'" "$R" "bonjour" || true
 
         header "18. Sentiment classification"
         R=$(chat_once "Classify the sentiment of this review as POSITIVE or NEGATIVE. Reply with one word.\n\nReview: I absolutely loved this movie, it was fantastic and moving!" "$QTOK")
-        grade "Detected POSITIVE" "$R" "positive"
+        grade "Detected POSITIVE" "$R" "positive" || true
 
         header "19. Vision / OCR  (multimodal image input)"
         VBODY=$(jq -n --arg m "$FIRST_MODEL" --arg url "data:image/png;base64,${OCR_PNG_B64}" \
@@ -606,11 +832,14 @@ run_instance_tests() {
                   {type:"text", text:"What text is written in this image? Reply with only the exact text."},
                   {type:"image_url", image_url:{url:$url}}]}]}')
         VRESP=$(http_post "${BASE_URL}/v1/chat/completions" "$VBODY" || true)
-        VTEXT=$(printf '%s' "$VRESP" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
+        VTEXT=$(printf '%s' "$VRESP" | jq -r \
+            '(.choices[0].message.content // "") as $c
+             | if ($c|length) > 0 then $c else (.choices[0].message.reasoning_content // .choices[0].message.reasoning // empty) end' \
+            2>/dev/null || true)
         if [ -z "$VRESP" ] || [ -z "$VTEXT" ]; then
             warn "Vision not supported by this model (no multimodal image input) — skipped"
         else
-            grade "OCR read 'VLLM-OCR-7392'" "$VTEXT" "VLLM[- ]?OCR[- ]?7392|OCR[- ]?7392"
+            grade "OCR read 'VLLM-OCR-7392'" "$VTEXT" "VLLM[- ]?OCR[- ]?7392|OCR[- ]?7392" || true
         fi
 
         header "20. Audio processing  (speech-to-text)"
@@ -626,11 +855,141 @@ run_instance_tests() {
         else
             ATEXT=$(printf '%s' "$AREQ" | jq -r '.text // empty' 2>/dev/null || true)
             [ -z "$ATEXT" ] && ATEXT="$AREQ"
-            grade "Transcribed 'the quick brown fox'" "$ATEXT" "quick|brown|fox"
+            grade "Transcribed 'the quick brown fox'" "$ATEXT" "quick|brown|fox" || true
         fi
 
-        # ── Capability scorecard ──────────────────────────────────────────────
-        header "Capability Scorecard — ${BASE_URL}"
+        header "21. Summarization accuracy  (multi-fact article)"
+        local ART21 R21A
+        ART21="Meridian County officials confirmed Thursday that engineer Priya Nakamura will lead the replacement of the Route 9 bridge, a project expected to cost 12.6 million dollars and finish by March 2027. The current bridge, built in 1968, has been restricted to vehicles under 10 tons since a 2023 inspection found corrosion in its support beams. Nakamura said the new design adds a dedicated bike lane."
+        R=$(chat_once "Summarize the following article in 2-3 sentences, making sure to include the name of the person leading the project, the total cost, and the expected finish date:\n\n${ART21}" "$QTOK")
+        R21A="$R"
+        QUALITY_TOTAL=$((QUALITY_TOTAL + 1))
+        if printf '%s' "$R21A" | grep -qi "nakamura" \
+           && printf '%s' "$R21A" | grep -qiE "12\.6|12,600,000|\\\$12" \
+           && printf '%s' "$R21A" | grep -qiE "2027"; then
+            pass "Summary accurately includes name, cost, and finish date"
+            QUALITY_PASS=$((QUALITY_PASS + 1))
+        else
+            warn "Summary missing one or more key facts (name=Nakamura, cost=12.6M, date=2027)"
+            [ -n "$R21A" ] && echo "     got: $(printf '%s' "$R21A" | tr '\n' ' ' | head -c 200)"
+        fi
+
+        header "22. Counting  (numbers embedded in text)"
+        R=$(chat_once "Count how many numbers in the following list are greater than 50. Reply with only the count as a digit.\n\nThe readings were: 12, 87, 34, 91, 56, 3, 68, 45, 72, 19, 50, 99." "$QTOK")
+        grade "Correct count of numbers > 50 -> 6" "$R" "(^|[^0-9])6([^0-9]|\$)" || true
+
+        header "23. Pulling info from a PDF  (extract + summarize)"
+        if [ -z "$PDF_TEXT" ]; then
+            warn "Skipped — pdftotext not installed locally (used to extract text from the test PDF before sending it to the model)"
+        else
+            R=$(chat_once "The following text was extracted from a PDF document. Write a one-sentence summary that includes the confirmation code and the opening date mentioned:\n\n${PDF_TEXT}" "$QTOK")
+            QUALITY_TOTAL=$((QUALITY_TOTAL + 1))
+            if printf '%s' "$R" | grep -qiE "DOC[- ]?9931[- ]?B" && printf '%s' "$R" | grep -qiE "november"; then
+                pass "Accurately summarized PDF-extracted text (code + date present): $(printf '%s' "$R" | tr '\n' ' ' | head -c 160)"
+                QUALITY_PASS=$((QUALITY_PASS + 1))
+            else
+                warn "Summary of PDF-extracted text missing the confirmation code or date"
+                [ -n "$R" ] && echo "     got: $(printf '%s' "$R" | tr '\n' ' ' | head -c 200)"
+            fi
+        fi
+
+        header "24. Table lookup  (structured data)"
+        R=$(chat_once "Here is a small table of quarterly revenue in thousands of dollars:\n\n| Quarter | Revenue |\n|---------|---------|\n| Q1 | 120 |\n| Q2 | 145 |\n| Q3 | 98 |\n| Q4 | 210 |\n\nWhich quarter had the highest revenue? Reply with only the quarter, e.g. Q1." "$QTOK")
+        grade "Correctly identifies Q4 as highest" "$R" "q4" || true
+
+        header "25. Multi-turn context retention"
+        local BODY25 RESP25 R25
+        BODY25=$(jq -n --arg m "$FIRST_MODEL" --argjson mt "$QTOK" \
+            '{model:$m, max_tokens:$mt, temperature:0, messages:[
+                {role:"user", content:"My favorite programming language is Rust."},
+                {role:"assistant", content:"Got it, Rust is your favorite programming language."},
+                {role:"user", content:"What did I say my favorite programming language was? Reply with only the name."}
+            ]}')
+        RESP25=$(http_post "${BASE_URL}/v1/chat/completions" "$BODY25" || true)
+        R25=$(printf '%s' "$RESP25" | jq -r \
+            '(.choices[0].message.content // "") as $c
+             | if ($c|length) > 0 then $c else (.choices[0].message.reasoning_content // .choices[0].message.reasoning // empty) end' \
+            2>/dev/null || true)
+        grade "Recalled earlier turn -> Rust" "$R25" "rust" || true
+
+        header "26. Careful reading  (negation)"
+        R=$(chat_once "Of these three cities — Tokyo, Lima, and Oslo — which one is NOT in the Southern Hemisphere and NOT in Asia? Reply with only the city name." "$QTOK")
+        grade "Correctly resolves negation -> Oslo" "$R" "oslo" || true
+
+        header "27. Unit conversion  (numeric tolerance)"
+        R=$(chat_once "Convert 5 miles to kilometers. Reply with only the number, rounded to one decimal place." "$QTOK")
+        QUALITY_TOTAL=$((QUALITY_TOTAL + 1))
+        local UNIT27
+        UNIT27=$(printf '%s' "$R" | grep -oE '[0-9]+\.[0-9]+' | head -1)
+        if [ -n "$UNIT27" ] && awk -v v="$UNIT27" 'BEGIN{exit !(v>7.8 && v<8.2)}' 2>/dev/null; then
+            pass "5 miles converted within tolerance of 8.0 km (got ${UNIT27})"
+            QUALITY_PASS=$((QUALITY_PASS + 1))
+        else
+            warn "Unit conversion outside tolerance or unparseable"
+            [ -n "$R" ] && echo "     got: $(printf '%s' "$R" | tr '\n' ' ' | head -c 160)"
+        fi
+
+        header "28. Date arithmetic"
+        R=$(chat_once "If today is Wednesday, what day of the week will it be in 10 days? Reply with only the day name." "$QTOK")
+        grade "Correct day -> Saturday" "$R" "saturday" || true
+
+        header "29. Structured extraction to JSON"
+        R=$(chat_once "Extract the name, email, and phone number from this text as minified JSON with keys name, email, phone. No markdown, no code fences.\n\nText: \"Reach out to Marcus Webb at marcus.webb@example.com or call 555-201-4488 with any questions.\"" "$QTOK")
+        CLEAN=$(printf '%s' "$R" | sed -E 's/```json//g; s/```//g')
+        JSON_ONLY=$(printf '%s' "$CLEAN" | grep -oE '\{[^{}]*\}' | tail -1)
+        QUALITY_TOTAL=$((QUALITY_TOTAL + 1))
+        if [ -n "$JSON_ONLY" ] \
+           && printf '%s' "$JSON_ONLY" | jq -r '.email // empty' 2>/dev/null | grep -qi 'marcus.webb@example.com' \
+           && printf '%s' "$JSON_ONLY" | jq -r '.phone // empty' 2>/dev/null | grep -q '555-201-4488'; then
+            pass "Valid JSON with correct email and phone: ${JSON_ONLY}"
+            QUALITY_PASS=$((QUALITY_PASS + 1))
+        else
+            warn "Structured extraction missing or incorrect fields"
+            [ -n "$R" ] && echo "     got: $(printf '%s' "$R" | tr '\n' ' ' | head -c 200)"
+        fi
+
+        header "30. Code bug fix"
+        R=$(chat_once "This Python function is supposed to return the sum of a list but has a bug:\n\ndef total(nums):\n    result = 0\n    for n in nums:\n        result = n\n    return result\n\nReply with only the corrected function." "$QTOK")
+        grade "Fixes accumulator bug (result += n or result = result + n)" "$R" "result[[:space:]]*(\+=|=[[:space:]]*result[[:space:]]*\+)" || true
+
+        # ══════════════════════════════════════════════════════════════════════
+        #  CODE GENERATION SUITE (31-37)  —  timed generation + model self-graded
+        #  correctness. Each test prints the readable, fenced-stripped code,
+        #  how long generation took, and a 1-100% self-assessed correctness
+        #  score obtained by sending the code back to the same model.
+        # ══════════════════════════════════════════════════════════════════════
+        code_gen_test "31" "Python3 (basic)" \
+            "Write a basic Python3 function named bubble_sort(nums) that sorts a list of integers in ascending order using the bubble sort algorithm (do not use sorted() or .sort()). Include a short usage example. Provide the code in a single fenced code block with clear, properly indented, multi-line formatting and brief comments. No explanation outside the code block." \
+            2048
+
+        code_gen_test "32" "PHP (basic)" \
+            "Write a basic PHP script that defines a function calculateFactorial(\$n) which returns the factorial of \$n, and then prints the factorial of 5. Include the opening and closing PHP tags. Provide the code in a single fenced code block with clear, properly indented, multi-line formatting and brief comments. No explanation outside the code block." \
+            2048
+
+        code_gen_test "33" "Bash / Shell scripting (basic)" \
+            "Write a basic Bash shell script that loops through the numbers 1 to 20 and prints only the even numbers, one per line, with a comment explaining the logic. Provide the code in a single fenced code block with clear, properly indented, multi-line formatting. No explanation outside the code block." \
+            2048
+
+        code_gen_test "34" "Node.js (basic)" \
+            "Write a basic Node.js script, using only built-in core modules (no npm packages), that asynchronously reads a file named data.txt and prints its contents to the console, with proper error handling for a missing file. Provide the code in a single fenced code block with clear, properly indented, multi-line formatting and brief comments. No explanation outside the code block." \
+            2048
+
+        code_gen_test "35" "MySQL SELECT with JOINs and GROUP BY (advanced)" \
+            "Write an advanced MySQL query that selects each customer's name and their total number of orders, joining a customers table (columns: id, name) with an orders table (columns: id, customer_id, order_date), grouping by customer, including only customers with more than 3 orders, and ordering the results by order count descending. Provide the query in a single fenced sql code block, formatted across multiple readable lines with each clause (SELECT, FROM, JOIN, GROUP BY, HAVING, ORDER BY) on its own line. No explanation outside the code block." \
+            2048
+
+        code_gen_test "36" "MongoDB query (medium)" \
+            "Write a MongoDB query, using mongosh shell syntax, that finds all documents in the products collection where price is greater than 50 and category is 'electronics', sorted by price descending, returning only the name and price fields. Provide the query in a single fenced javascript code block with clear, properly indented, multi-line formatting. No explanation outside the code block." \
+            2048
+
+        code_gen_test "37" "JavaScript (medium)" \
+            "Write a medium-difficulty JavaScript function named groupByProperty(arr, prop) that takes an array of objects and a property name, and returns an object grouping the array elements by the value of that property. Include a short example usage with sample output shown as a comment. Provide the code in a single fenced code block with clear, properly indented, multi-line formatting and brief comments. No explanation outside the code block." \
+            2048
+    fi
+
+    # ── Capability scorecard ────────────────────────────────────────────────
+    header "Capability Scorecard — ${BASE_URL}"
+    if [ -n "${FIRST_MODEL:-}" ]; then
         info "Model : ${FIRST_MODEL}"
         if [ "$QUALITY_TOTAL" -gt 0 ]; then
             PCT=$(( QUALITY_PASS * 100 / QUALITY_TOTAL ))
@@ -638,6 +997,8 @@ run_instance_tests() {
         else
             warn "No graded checks were run"
         fi
+    else
+        warn "No model discovered — nothing to score"
     fi
 }
 
