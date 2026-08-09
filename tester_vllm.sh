@@ -1,25 +1,30 @@
-#!/usr/bin/env bash
-# Christopher Gray - @c2theg/ai |  Version: 0.1.23  |  Update: 8/9/2026
+#!/usr/bin/env python3
+# Christopher Gray - @c2theg/ai  |  Version: 1.0.0  |  Update: 8/9/2026
 # vLLM smoke test — auto-discovers every running vLLM instance (ports + models)
 #                   and runs the full smoke test against each one.
-# Includes 11 auto-graded model-quality tests (reasoning, math, summarization,
-# instruction-following, code, factual, long-context, translation, sentiment,
-# vision/OCR, audio/ASR) with a per-instance capability scorecard.
+# Includes 21 auto-graded model-quality tests (reasoning, math, summarization,
+# counting, PDF extraction, table lookup, multi-turn, negation, unit conversion,
+# date math, JSON extraction, code bug-fixing, instruction-following, code,
+# factual, long-context, translation, sentiment, vision/OCR, audio/ASR) plus a
+# 7-language timed code-generation suite with model self-graded correctness,
+# and a per-instance capability scorecard.
 #
 #
-#Update Yourself:
-#  curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' -o 'tester_vllm.sh' "https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/tester_vllm.sh?nocache=$(date +%s)" && chmod u+x tester_vllm.sh
+# Update Yourself:
+#  curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' -o 'tester_vllm.py' "https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/tester_vllm.py?nocache=$(date +%s)" && chmod u+x tester_vllm.py
 #
 #
-# Usage: ./tester_vllm.sh [HOST] [PORT]
+# Usage: ./tester_llm.py [HOST] [PORT]
 #   No args     -> auto-discover ALL local vLLM instances and test each.
 #   HOST        -> discover instances on that host (local discovery only).
 #   HOST PORT   -> test only that specific host:port (skips discovery).
 #
 # Requirements:
-#   - bash, curl, jq            (required — the script exits early if missing)
-#   - pdftotext (poppler-utils) (optional — enables the PDF extraction test;
-#                                 that one test skips gracefully if it's absent)
+#   - python3 (>=3.8), pip install rich   (required)
+#   - pdftotext (poppler-utils)           (optional — enables the PDF
+#                                           extraction test; skips gracefully
+#                                           if it's absent)
+#   - nvidia-smi / rocm-smi               (optional — enables GPU stats)
 #
 # Hugging Face setup (only needed if the vLLM instance under test is serving a
 # gated/private model, e.g. Llama or Gemma — public models need no token):
@@ -28,994 +33,1378 @@
 #        HUGGING_FACE_HUB_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
 #   3. Before starting vLLM, load it into the environment:
 #        set -a && source .env && set +a
-#      (or `export $(grep -v '^#' .env | xargs)` if you're not sourcing it)
 #   This token is consumed by vLLM itself when it downloads the model from the
 #   Hub — this tester script only talks HTTP to an already-running instance
 #   and never touches Hugging Face directly, so it has nothing to load here.
-set -euo pipefail
 
-HOST="${1:-localhost}"
-PORT_ARG="${2:-}"            # non-empty only if user passed a port argument
+from __future__ import annotations
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-RESET='\033[0m'
+import argparse
+import base64
+import json
+import os
+import random
+import re
+import shutil
+import string
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from typing import Optional
 
-pass() { echo -e "${GREEN}[PASS]${RESET} $*"; }
-fail() { echo -e "${RED}[FAIL]${RESET} $*"; }
-info() { echo -e "${CYAN}[INFO]${RESET} $*"; }
-warn() { echo -e "${YELLOW}[WARN]${RESET} $*"; }
-header() { echo -e "\n${BOLD}${CYAN}==> $*${RESET}"; }
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.progress import (
+        Progress,
+        BarColumn,
+        TextColumn,
+        TimeElapsedColumn,
+        MofNCompleteColumn,
+    )
+    from rich.syntax import Syntax
+    from rich.table import Table
+    from rich.rule import Rule
+    from rich import box
+except ImportError:
+    sys.stderr.write(
+        "This script requires the 'rich' package.\n"
+        "Install it with:\n"
+        "  pip3 install rich\n"
+    )
+    sys.exit(1)
 
-FAILURES=0
+SCRIPT_AUTHOR = "Christopher Gray - @c2theg/ai"
+SCRIPT_VERSION = "1.0.0"
+SCRIPT_UPDATED = "8/9/2026"
 
-require_cmd() {
-    command -v "$1" &>/dev/null || { fail "Required command not found: $1"; exit 1; }
-}
+TOTAL_TEST_STEPS = 40  # 1,2,3,3b,4,5,5b,6,7,7b,8,9 (12) + 10-30 (21) + 31-37 (7)
 
-require_cmd curl
-require_cmd jq
+console = Console(highlight=False)
 
-# ── Helper: HTTP GET with timeout ─────────────────────────────────────────────
-http_get() {
-    local url="$1"
-    curl -sf --max-time 10 "$url" 2>/dev/null
-}
-
-# ── Helper: POST JSON ─────────────────────────────────────────────────────────
-http_post() {
-    local url="$1"
-    local body="$2"
-    curl -sf --max-time 60 \
-        -H "Content-Type: application/json" \
-        -d "$body" \
-        "$url" 2>/dev/null
-}
-
-# ── Helper: millisecond wall-clock timestamp (GNU date, with portable fallback)
-now_ms() {
-    local ts
-    ts=$(date +%s%3N 2>/dev/null || true)
-    if [[ "$ts" =~ ^[0-9]+$ ]]; then
-        echo "$ts"
-    elif command -v perl &>/dev/null; then
-        perl -MTime::HiRes=time -e 'printf "%.0f\n", time() * 1000'
-    else
-        echo $(( $(date +%s) * 1000 ))
-    fi
-}
-
-tokens_per_second() {
-    local tokens="$1" elapsed_ms="$2"
-    awk -v tok="$tokens" -v ms="$elapsed_ms" \
-        'BEGIN { if (tok > 0 && ms > 0) printf "%.2f", tok * 1000 / ms; else printf "0.00" }'
-}
-
-# ── Helper: decode base64 from stdin -> binary on stdout (portable) ───────────
-b64decode() {
-    if command -v openssl &>/dev/null; then openssl base64 -d -A
-    elif base64 --help 2>&1 | grep -q -- '--decode'; then base64 --decode
-    else base64 -D; fi
-}
-
-# ── Helper: single-turn, non-streaming chat; echoes assistant text (deterministic)
-#    Uses the caller's FIRST_MODEL and BASE_URL (bash dynamic scope).
-chat_once() {
-    local prompt="$1" maxtok="${2:-256}" body
-    body=$(jq -n --arg m "$FIRST_MODEL" --arg p "$prompt" --argjson mt "$maxtok" \
-        '{model:$m, max_tokens:$mt, temperature:0,
-          messages:[{role:"user", content:$p}]}')
-    http_post "${BASE_URL}/v1/chat/completions" "$body" 2>/dev/null \
-        | jq -r '(.choices[0].message.content // "") as $c
-                  | if ($c|length) > 0 then $c else (.choices[0].message.reasoning_content // .choices[0].message.reasoning // empty) end' \
-              2>/dev/null || true
-}
-
-# ── Helper: generate code, time the generation, then have the SAME model
-#    self-grade its own output's likely correctness as a percentage.
-#    Uses the caller's FIRST_MODEL and BASE_URL (bash dynamic scope) and
-#    updates the caller's QUALITY_PASS / QUALITY_TOTAL scorecard counters.
-code_gen_test() {
-    local test_num="$1" lang_label="$2" gen_prompt="$3" maxtok="${4:-2048}"
-    local start_ms end_ms elapsed_ms elapsed_s code clean_code judge_prompt judge_resp score
-
-    header "${test_num}. Code generation — ${lang_label}"
-
-    start_ms=$(now_ms)
-    code=$(chat_once "$gen_prompt" "$maxtok")
-    end_ms=$(now_ms)
-    elapsed_ms=$((end_ms - start_ms))
-    [ "$elapsed_ms" -le 0 ] && elapsed_ms=1
-    elapsed_s=$(awk -v ms="$elapsed_ms" 'BEGIN{printf "%.2f", ms/1000}')
-
-    info "Generation time: ${elapsed_s}s"
-
-    if [ -z "$code" ]; then
-        warn "No code generated for ${lang_label} (empty response)"
-        return
-    fi
-
-    # Strip markdown code fences so the printed code is clean, readable, and
-    # keeps its original multi-line formatting/indentation.
-    clean_code=$(printf '%s' "$code" | sed -E '/^[[:space:]]*```/d')
-
-    echo -e "  ${BOLD}Generated code (${lang_label}):${RESET}"
-    echo
-    echo "$clean_code" | sed 's/^/    /'
-    echo
-
-    judge_prompt="Given the provided code, what is the likelihood this code is syntactically correct and will work? Provide a percentage of its correctness in a 1-100% format, with just the number and a percent sign, nothing else.
-
-Code:
-${code}"
-    judge_resp=$(chat_once "$judge_prompt" 512)
-
-    score=$(printf '%s' "$judge_resp" | grep -oE '[0-9]{1,3}[[:space:]]*%' | tail -1 | grep -oE '[0-9]{1,3}')
-    [ -z "$score" ] && score=$(printf '%s' "$judge_resp" | grep -oE '[0-9]{1,3}' | tail -1)
-
-    QUALITY_TOTAL=$((QUALITY_TOTAL + 1))
-    if [ -n "$score" ] && [ "$score" -ge 0 ] 2>/dev/null; then
-        [ "$score" -gt 100 ] && score=100
-        if [ "$score" -ge 70 ]; then
-            pass "Self-assessed correctness: ${score}%"
-            QUALITY_PASS=$((QUALITY_PASS + 1))
-        else
-            warn "Self-assessed correctness: ${score}% (below 70% confidence threshold)"
-        fi
-    else
-        warn "Could not parse a correctness percentage from the self-assessment"
-        [ -n "$judge_resp" ] && echo "     judge raw: $(printf '%s' "$judge_resp" | tr '\n' ' ' | head -c 160)"
-    fi
-}
-
-# ── Helper: cosine similarity between two JSON-encoded float arrays ───────────
-cosine_similarity() {
-    local a="$1" b="$2"
-    jq -n --argjson a "$a" --argjson b "$b" '
-        (([range(0; ($a|length))] | map($a[.] * $b[.]) | add) // 0) as $dot
-        | (($a | map(. * .) | add) | sqrt) as $na
-        | (($b | map(. * .) | add) | sqrt) as $nb
-        | if $na == 0 or $nb == 0 then 0 else $dot / ($na * $nb) end
-    ' 2>/dev/null || echo 0
-}
-
-# ── Helper: benchmark generated completion tokens/sec for the active model ────
-#    Uses the caller's FIRST_MODEL and BASE_URL (bash dynamic scope).
-benchmark_chat_tps() {
-    local runs="${1:-2}" maxtok="${2:-192}"
-    local i body resp start_ms end_ms elapsed_ms prompt_tokens completion_tokens total_tokens tps
-    local ok=0 total_completion=0 total_elapsed=0
-
-    for i in $(seq 1 "$runs"); do
-        body=$(jq -n \
-            --arg m "$FIRST_MODEL" \
-            --argjson mt "$maxtok" \
-            '{
-                model: $m,
-                max_tokens: $mt,
-                temperature: 0,
-                messages: [
-                    {role: "user", content: "Write a dense technical paragraph about local AI inference performance, batching, KV cache behavior, and latency. Continue until you naturally reach the token budget."}
-                ]
-            }')
-
-        start_ms=$(now_ms)
-        resp=$(http_post "${BASE_URL}/v1/chat/completions" "$body" || true)
-        end_ms=$(now_ms)
-        elapsed_ms=$((end_ms - start_ms))
-        [ "$elapsed_ms" -le 0 ] && elapsed_ms=1
-
-        if [ -z "$resp" ]; then
-            warn "Throughput run ${i}/${runs}: no response"
-            continue
-        fi
-
-        prompt_tokens=$(printf '%s' "$resp" | jq -r '.usage.prompt_tokens // empty' 2>/dev/null || true)
-        completion_tokens=$(printf '%s' "$resp" | jq -r '.usage.completion_tokens // empty' 2>/dev/null || true)
-        total_tokens=$(printf '%s' "$resp" | jq -r '.usage.total_tokens // empty' 2>/dev/null || true)
-
-        if ! [[ "$completion_tokens" =~ ^[0-9]+$ ]] || [ "$completion_tokens" -eq 0 ]; then
-            warn "Throughput run ${i}/${runs}: response did not include usage.completion_tokens"
-            continue
-        fi
-
-        tps=$(tokens_per_second "$completion_tokens" "$elapsed_ms")
-        printf "  Run %d/%d : %4d completion tokens in %.2fs  =>  %s tok/s" \
-            "$i" "$runs" "$completion_tokens" "$(awk -v ms="$elapsed_ms" 'BEGIN { printf "%.2f", ms / 1000 }')" "$tps"
-        [ -n "$prompt_tokens" ] && printf "  (prompt=%s total=%s)" "$prompt_tokens" "${total_tokens:-?}"
-        printf "\n"
-
-        ok=$((ok + 1))
-        total_completion=$((total_completion + completion_tokens))
-        total_elapsed=$((total_elapsed + elapsed_ms))
-    done
-
-    if [ "$ok" -gt 0 ]; then
-        tps=$(tokens_per_second "$total_completion" "$total_elapsed")
-        pass "Average generation throughput: ${tps} completion tokens/sec (${total_completion} tokens across ${ok} run(s))"
-    else
-        warn "Could not calculate throughput for ${FIRST_MODEL}"
-    fi
-}
-
-# ── Helper: grade a response against a case-insensitive regex ─────────────────
-#    grade LABEL RESPONSE PATTERN   — updates QUALITY_PASS / QUALITY_TOTAL.
-grade() {
-    local label="$1" resp="$2" pat="$3"
-    QUALITY_TOTAL=$((QUALITY_TOTAL + 1))
-    if [ -n "$resp" ] && printf '%s' "$resp" | grep -qiE "$pat"; then
-        pass "${label}"
-        QUALITY_PASS=$((QUALITY_PASS + 1))
-        return 0
-    fi
-    warn "${label} — expected /${pat}/"
-    [ -n "$resp" ] && echo "     got: $(printf '%s' "$resp" | tr '\n' ' ' | head -c 160)"
-    return 1
-}
+# A distinct color rotates through instances so multiple models being tested
+# in one run are visually easy to tell apart at a glance.
+INSTANCE_COLORS = ["cyan", "magenta", "green", "yellow", "blue", "bright_red"]
 
 # ── Embedded test media (self-contained; no external files or network) ────────
 # 1-bit PNG containing the literal text "VLLM-OCR-7392"  (for the vision/OCR test)
-OCR_PNG_B64="iVBORw0KGgoAAAANSUhEUgAAAWgAAABaAQAAAAC9W/FqAAACU0lEQVR42u3WQW7bRhjF8d+MBi135tILAyFyjqBiexIfoSeIJ0XXPYNOEtBFDpBeoKABL7wrUxQF0445XcixLEVJkHVFgAAJvvn48b3/N2CovuKITuqT+qQ+qf/v6qQ2iZusBjctblruk3ch4DokPxF5RfTSclBh8ye39xk9qFf5vuaa+20nzZ645pptbDCCxaYYFm8P+s4jFgbZhAkU02wsiNZKu7ekMFZm25OZyTSbj3kyfztOy2pmXUByMXvBxVEHp/PzuaRvCrGwLqbn/DB7XkRdnrsPwuFX6BLnAcHWg96YTd8f1N56M/axzB59Le3F48JjWeZA55cPn9GtMrSI2mHqj6X84+5yaShn+aB2Gn/GwPKkwNQrn6EqkB9Stc3zroWaRM045k8g90+CbOxcsXye2OsGrtF3rz/uJP6xz9cjbhtvKI0oTdefrN4+1JtazO0XZucSmRdzswUy7ruxT2PIjwMWGDtR3F9xvbtbVzehJkJZRYZeZN4Z+PeDyxkbcn4Kfc7H+u6J7eCWfng6gIEoSDueut3Tl3QjS+MdpCUS+fcjBiujSLudy7e8z0o6zLKwXrphSY2KxrMKV+4qDZF8EKCxcLcgbae4kwzmluTp5tMvv9He3TWp/JV2eb7W/t64SWXbyX2IXoUHppv3XRvv22Y7xYX2TeO2nbYU9PsBSnSBlrAc4BWPbru9rHtCYrt180DdZYQcsks9rh5edpk+bKB1XFfCyHdn43JWax3Pap1XdVrX4arOz2oNta7qYFXD6a/3pD6pT+qT+iuO/wARid8UZkrVCQAAAABJRU5ErkJggg=="
+OCR_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAWgAAABaAQAAAAC9W/FqAAACU0lEQVR42u3WQW7bRhjF8d+MBi135tILAyFyjqBiexIfoSeIJ0XXPYNOEtBFDpBeoKABL7wrUxQF0445XcixLEVJkHVFgAAJvvn48b3/N2CovuKITuqT+qQ+qf/v6qQ2iZusBjctblruk3ch4DokPxF5RfTSclBh8ye39xk9qFf5vuaa+20nzZ645pptbDCCxaYYFm8P+s4jFgbZhAkU02wsiNZKu7ekMFZm25OZyTSbj3kyfztOy2pmXUByMXvBxVEHp/PzuaRvCrGwLqbn/DB7XkRdnrsPwuFX6BLnAcHWg96YTd8f1N56M/axzB59Le3F48JjWeZA55cPn9GtMrSI2mHqj6X84+5yaShn+aB2Gn/GwPKkwNQrn6EqkB9Stc3zroWaRM045k8g90+CbOxcsXye2OsGrtF3rz/uJP6xz9cjbhtvKI0oTdefrN4+1JtazO0XZucSmRdzswUy7ruxT2PIjwMWGDtR3F9xvbtbVzehJkJZRYZeZN4Z+PeDyxkbcn4Kfc7H+u6J7eCWfng6gIEoSDueut3Tl3QjS+MdpCUS+fcjBiujSLudy7e8z0o6zLKwXrphSY2KxrMKV+4qDZF8EKCxcLcgbae4kwzmluTp5tMvv9He3TWp/JV2eb7W/t64SWXbyX2IXoUHppv3XRvv22Y7xYX2TeO2nbYU9PsBSnSBlrAc4BWPbru9rHtCYrt180DdZYQcsks9rh5edpk+bKB1XFfCyHdn43JWax3Pap1XdVrX4arOz2oNta7qYFXD6a/3pD6pT+qT+iuO/wARid8UZkrVCQAAAABJRU5ErkJggg=="
+)
 # Short mono MP3 of the spoken phrase "the quick brown fox"  (for the ASR test)
-SPEECH_MP3_B64="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"
+SPEECH_MP3_B64 = (
+    "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"
+)
 
-# ── Helper: build a minimal self-contained PDF and extract its text once ──────
-#    Used by the "pull info from a PDF" test. Built at runtime (not embedded as
-#    base64) so its Length field is always byte-exact. If pdftotext isn't
-#    installed, PDF_TEXT stays empty and that test skips gracefully.
-PDF_ARTICLE_TEXT="The town council announced Tuesday that the new public library on Elm Street will open on November 3rd, marking the completion of an 18 month, 4.2 million dollar renovation. The project added a childrens reading wing, thirty public computer stations, and a rooftop garden. Library director Elena Vasquez said the goal is to triple foot traffic within the first year. Confirmation code: DOC-9931-B."
-PDF_TEXT=""
-if command -v pdftotext &>/dev/null; then
-    PDF_STREAM_BODY=$(printf 'BT /F1 10 Tf 40 700 Td (%s) Tj ET\n' "$PDF_ARTICLE_TEXT")
-    PDF_STREAM_LEN=$(printf '%s' "$PDF_STREAM_BODY" | wc -c | tr -d ' ')
-    PDF_TMP="${TMPDIR:-/tmp}/vllm_smoketest_$$.pdf"
-    {
-        printf '%%PDF-1.4\n'
-        printf '1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n'
-        printf '2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n'
-        printf '3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n'
-        printf '4 0 obj<</Length %s>>stream\n' "$PDF_STREAM_LEN"
-        printf '%s' "$PDF_STREAM_BODY"
-        printf 'endstream endobj\n'
-        printf '5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n'
-        printf 'trailer<</Size 6/Root 1 0 R>>\n'
-        printf '%%%%EOF\n'
-    } > "$PDF_TMP" 2>/dev/null
-    PDF_TEXT=$(pdftotext "$PDF_TMP" - 2>/dev/null || true)
-    rm -f "$PDF_TMP" 2>/dev/null || true
-fi
+PDF_ARTICLE_TEXT = (
+    "The town council announced Tuesday that the new public library on Elm Street will open on "
+    "November 3rd, marking the completion of an 18 month, 4.2 million dollar renovation. The "
+    "project added a childrens reading wing, thirty public computer stations, and a rooftop "
+    "garden. Library director Elena Vasquez said the goal is to triple foot traffic within the "
+    "first year. Confirmation code: DOC-9931-B."
+)
 
-# ── Helper: listening TCP ports owned by a PID ────────────────────────────────
-listen_ports_for_pid() {
-    local pid="$1"
-    if command -v lsof &>/dev/null; then
-        lsof -Pan -p "$pid" -iTCP -sTCP:LISTEN 2>/dev/null \
-            | awk 'NR>1 {n=split($9,a,":"); print a[n]}'
-    elif command -v ss &>/dev/null; then
-        ss -ltnpH 2>/dev/null \
-            | grep -F "pid=${pid}," \
-            | grep -oE ':[0-9]+ ' \
-            | tr -d ': '
-    fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Result bookkeeping (feeds the final roll-up report)
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class InstanceResult:
+    base_url: str
+    model: str = "(unknown)"
+    duration_s: float = 0.0
+    failures: int = 0
+    quality_pass: int = 0
+    quality_total: int = 0
+    cap_chat: bool = False
+    cap_embed: bool = False
+    reachable: bool = True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def http_get(url: str, timeout: int = 10) -> Optional[str]:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return r.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+
+
+def http_get_status(url: str, timeout: int = 10) -> tuple[Optional[int], str]:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return r.status, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, ""
+    except Exception:
+        return None, ""
+
+
+def http_post_json(url: str, obj: dict, timeout: int = 300) -> Optional[str]:
+    data = json.dumps(obj).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode("utf-8", "replace")
+    except Exception:
+        # Mirrors bash's `curl -sf` — fail silently on any error (connection,
+        # timeout, or non-2xx status) and let the caller treat it as "no response".
+        return None
+
+
+def http_post_multipart_audio(url: str, file_bytes: bytes, model: str, timeout: int = 300) -> Optional[str]:
+    boundary = "----vllmtester" + "".join(random.choices(string.ascii_letters + string.digits, k=16))
+    parts = [
+        f'--{boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n{model}\r\n'.encode(),
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="test.mp3"\r\n'
+        f'Content-Type: audio/mpeg\r\n\r\n'.encode(),
+        file_bytes,
+        f'\r\n--{boundary}--\r\n'.encode(),
+    ]
+    body = b"".join(parts)
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(len(body)),
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Small print helpers (styled like the previous bash [PASS]/[FAIL]/[WARN]/[INFO])
+# ─────────────────────────────────────────────────────────────────────────────
+def cpass(msg: str) -> None:
+    console.print(f"[bold green][PASS][/bold green] {msg}")
+
+
+def cfail(msg: str) -> None:
+    console.print(f"[bold red][FAIL][/bold red] {msg}")
+
+
+def cwarn(msg: str) -> None:
+    console.print(f"[bold yellow][WARN][/bold yellow] {msg}")
+
+
+def cinfo(msg: str) -> None:
+    console.print(f"[bold cyan][INFO][/bold cyan] {msg}")
+
+
+def section(title: str, color: str = "cyan") -> None:
+    console.print()
+    console.print(Rule(f"[bold {color}]{title}[/bold {color}]", style=color, align="left"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Chat / grading helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def chat_once(base_url: str, model: str, prompt: str, max_tokens: int = 256) -> str:
+    body = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    resp = http_post_json(f"{base_url}/v1/chat/completions", body)
+    return extract_message_text(resp)
+
+
+def extract_message_text(resp: Optional[str]) -> str:
+    if not resp:
+        return ""
+    try:
+        data = json.loads(resp)
+        msg = data["choices"][0]["message"]
+    except Exception:
+        return ""
+    content = msg.get("content") or ""
+    if content:
+        return content
+    # Reasoning models sometimes only populate reasoning_content / reasoning,
+    # leaving content null when the answer budget ran out mid-thought.
+    return msg.get("reasoning_content") or msg.get("reasoning") or ""
+
+
+def grade(label: str, resp: str, pattern: str, quality: "QualityTracker") -> bool:
+    quality.total += 1
+    if resp and re.search(pattern, resp, re.IGNORECASE):
+        cpass(label)
+        quality.passed += 1
+        return True
+    cwarn(f"{label} — expected /{pattern}/")
+    if resp:
+        console.print(f"     got: {resp.strip().replace(chr(10), ' ')[:160]}")
+    return False
+
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(y * y for y in b) ** 0.5
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+
+@dataclass
+class QualityTracker:
+    passed: int = 0
+    total: int = 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Code generation suite helper
+# ─────────────────────────────────────────────────────────────────────────────
+LEXER_BY_LABEL = {
+    "Python3 (basic)": "python",
+    "PHP (basic)": "php",
+    "Bash / Shell scripting (basic)": "bash",
+    "Node.js (basic)": "javascript",
+    "MySQL SELECT with JOINs and GROUP BY (advanced)": "sql",
+    "MongoDB query (medium)": "javascript",
+    "JavaScript (medium)": "javascript",
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# System Hardware  (printed once, host-wide)
-# ─────────────────────────────────────────────────────────────────────────────
-header "System Hardware"
-OS_TYPE=$(uname -s)
-ARCH=$(uname -m)
-info "Platform : ${OS_TYPE} / ${ARCH}"
+FENCE_RE = re.compile(r"^\s*```")
 
-if [ "$OS_TYPE" = "Linux" ]; then
-    CPU_NAME=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || \
-               lscpu 2>/dev/null | grep 'Model name' | cut -d: -f2 | xargs || echo "unknown")
-    CPU_CORES=$(nproc 2>/dev/null || echo "?")
-    RAM_INFO=$(free -h 2>/dev/null | awk '/^Mem:/{printf "total=%s  used=%s  free=%s", $2, $3, $4}' || echo "unknown")
-    info "CPU      : ${CPU_NAME}  (${CPU_CORES} cores)"
-    info "RAM      : ${RAM_INFO}"
-elif [ "$OS_TYPE" = "Darwin" ]; then
-    CPU_NAME=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "unknown")
-    TOTAL_RAM=$(sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.1f GB", $1/1073741824}' || echo "unknown")
-    info "CPU      : ${CPU_NAME}"
-    info "RAM      : ${TOTAL_RAM}"
-fi
 
-if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null 2>&1; then
-    DRIVER_VER=$(nvidia-smi 2>/dev/null | grep -oP 'Driver Version: \K[\d.]+' || echo "n/a")
-    CUDA_VER=$(nvidia-smi 2>/dev/null | grep -oP 'CUDA Version: \K[\d.]+' || echo "n/a")
-    GPU_COUNT=$(nvidia-smi --query-gpu=count --format=csv,noheader 2>/dev/null | head -1 | xargs || echo "?")
-    info "GPU      : NVIDIA  (driver=${DRIVER_VER}  CUDA=${CUDA_VER}  count=${GPU_COUNT})"
-    nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu,temperature.gpu \
-        --format=csv,noheader,nounits 2>/dev/null | \
-        while IFS=',' read -r idx name mtot mused mfree util temp; do
-            name=$(echo "$name" | xargs); mtot=$(echo "$mtot" | xargs)
-            mused=$(echo "$mused" | xargs); mfree=$(echo "$mfree" | xargs)
-            util=$(echo "$util" | xargs); temp=$(echo "$temp" | xargs)
-            echo "  [GPU ${idx}] ${name}"
-            echo "           VRAM : ${mtot} MiB total  |  ${mused} MiB used  |  ${mfree} MiB free"
-            echo "           Util : ${util}%  |  Temp: ${temp}°C"
-        done
-elif command -v rocm-smi &>/dev/null && rocm-smi &>/dev/null 2>&1; then
-    ROCM_VER=$(rocminfo 2>/dev/null | grep -oP 'ROCm Version: \K[\d.]+' || echo "n/a")
-    info "GPU      : AMD ROCm  (version=${ROCM_VER})"
-    rocm-smi --showmeminfo vram --showuse --showtemp 2>/dev/null | grep -v '^$' | sed 's/^/  /' || \
-        rocm-smi 2>/dev/null | grep -v '^$' | sed 's/^/  /' || true
-elif [ "$OS_TYPE" = "Darwin" ]; then
-    GPU_INFO=$(system_profiler SPDisplaysDataType 2>/dev/null | \
-        grep -E 'Chipset Model|Total Number of Cores|VRAM|Metal' | \
-        sed 's/^ *//' | paste -sd'  ' - || echo "unknown")
-    info "GPU      : Apple Silicon / Metal  —  ${GPU_INFO}"
-else
-    warn "GPU      : None detected — CPU-only inference"
-fi
+def code_gen_test(
+    base_url: str,
+    model: str,
+    test_num: str,
+    lang_label: str,
+    gen_prompt: str,
+    quality: QualityTracker,
+    color: str,
+    max_tokens: int = 2048,
+) -> None:
+    section(f"{test_num}. Code generation — {lang_label}", color)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 0. vLLM Instance Discovery
-#    Builds the TARGET_PORTS array of unique ports to test.
-# ─────────────────────────────────────────────────────────────────────────────
-header "0. vLLM Instance Discovery"
+    start = time.perf_counter()
+    code = chat_once(base_url, model, gen_prompt, max_tokens)
+    elapsed_s = time.perf_counter() - start
+    cinfo(f"Generation time: {elapsed_s:.2f}s")
 
-TARGET_PORTS=()
-
-if [ -n "$PORT_ARG" ]; then
-    # User pinned a specific port — honor it, skip auto-discovery.
-    info "Explicit port supplied — testing only ${HOST}:${PORT_ARG}"
-    TARGET_PORTS=("$PORT_ARG")
-else
-    VLLM_PROCS=$(ps aux 2>/dev/null | grep -E 'vllm serve|vllm[._]entrypoints[._]openai|[Vv]llm.*api_server' | grep -v grep || true)
-
-    if [ -z "$VLLM_PROCS" ]; then
-        warn "No running vLLM processes found on this host"
-    else
-        PROC_COUNT=$(echo "$VLLM_PROCS" | wc -l | tr -d ' ')
-        info "Found ${PROC_COUNT} vLLM-related process(es); resolving ports..."
-        while IFS= read -r line; do
-            [ -z "$line" ] && continue
-            V_PID=$(echo "$line" | awk '{print $2}')
-            V_HOST_BIND=$(echo "$line" | grep -oP '(?<=--host[= ])\S+' || true)
-            V_MODEL_NAME=$(echo "$line" | grep -oP '(?<=--served-model-name[= ])\S+' || \
-                           echo "$line" | grep -oP '(?<=vllm serve )\S+' || true)
-
-            # Port resolution: prefer the explicit --port flag, then the actual
-            # listening socket(s) for the PID, then the vLLM default (8000).
-            PORTS_FOUND=()
-            V_PORT_FLAG=$(echo "$line" | grep -oP '(?<=--port[= ])\d+' || true)
-            if [ -n "$V_PORT_FLAG" ]; then
-                PORTS_FOUND+=("$V_PORT_FLAG")
-            else
-                while IFS= read -r lp; do
-                    [ -n "$lp" ] && PORTS_FOUND+=("$lp")
-                done < <(listen_ports_for_pid "$V_PID")
-                [ "${#PORTS_FOUND[@]}" -eq 0 ] && PORTS_FOUND+=("8000")
-            fi
-
-            [ -z "$V_HOST_BIND" ]  && V_HOST_BIND="0.0.0.0"
-            [ -z "$V_MODEL_NAME" ] && V_MODEL_NAME="(from /v1/models)"
-
-            for p in "${PORTS_FOUND[@]}"; do
-                echo "  PID ${V_PID}  |  port=${p}  host=${V_HOST_BIND}  model=${V_MODEL_NAME}"
-                TARGET_PORTS+=("$p")
-            done
-        done <<< "$VLLM_PROCS"
-    fi
-fi
-
-# Dedup ports (multiple worker processes can share one server port).
-# Portable across bash 3.2 (macOS) — no mapfile.
-if [ "${#TARGET_PORTS[@]}" -gt 0 ]; then
-    UNIQUE_PORTS=()
-    while IFS= read -r p; do
-        [ -n "$p" ] && UNIQUE_PORTS+=("$p")
-    done < <(printf '%s\n' "${TARGET_PORTS[@]}" | sort -un)
-    TARGET_PORTS=("${UNIQUE_PORTS[@]}")
-fi
-
-if [ "${#TARGET_PORTS[@]}" -eq 0 ]; then
-    fail "No vLLM ports discovered — nothing to test."
-    echo "  Hint: start vLLM, or pass an explicit target: $0 ${HOST} <port>"
-    exit 1
-fi
-
-info "Will test ${#TARGET_PORTS[@]} instance(s) on ${HOST}: ports ${TARGET_PORTS[*]}"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-instance test suite.  Called once per discovered port.
-# Increments the global FAILURES counter on critical failures.
-# ─────────────────────────────────────────────────────────────────────────────
-run_instance_tests() {
-    local HOST="$1"
-    local PORT="$2"
-    local BASE_URL="http://${HOST}:${PORT}"
-    local FIRST_MODEL=""
-    local QUALITY_PASS=0 QUALITY_TOTAL=0 PCT   # capability scorecard
-
-    echo
-    echo -e "${BOLD}${CYAN}#############################################################${RESET}"
-    echo -e "${BOLD}${CYAN}#  Instance target: ${BASE_URL}${RESET}"
-    echo -e "${BOLD}${CYAN}#############################################################${RESET}"
-
-    # ── 1. Reachability ───────────────────────────────────────────────────────
-    header "1. Reachability"
-    if curl -sf --max-time 5 "${BASE_URL}" &>/dev/null || \
-       curl -sf --max-time 5 "${BASE_URL}/health" &>/dev/null || \
-       curl -sf --max-time 5 "${BASE_URL}/v1/models" &>/dev/null; then
-        pass "Host is reachable at ${BASE_URL}"
-    else
-        fail "Cannot reach ${BASE_URL}"
-        echo "  Hint: check that vLLM is running and the host/port are correct."
-        FAILURES=$((FAILURES + 1))
+    if not code.strip():
+        cwarn(f"No code generated for {lang_label} (empty response)")
         return
-    fi
 
-    # ── 2. Health endpoint ────────────────────────────────────────────────────
-    header "2. Health check  (GET /health)"
-    local HEALTH HEALTH_CODE HEALTH_TMP
-    HEALTH_TMP="${TMPDIR:-/tmp}/vllm_health_$$_${PORT}"
-    HEALTH_CODE=$(curl -s -o "$HEALTH_TMP" -w '%{http_code}' --max-time 10 "${BASE_URL}/health" 2>/dev/null || true)
-    HEALTH=$(cat "$HEALTH_TMP" 2>/dev/null || true)
-    rm -f "$HEALTH_TMP" 2>/dev/null || true
-    if [ "$HEALTH_CODE" = "200" ]; then
-        # vLLM's /health intentionally returns 200 with an empty body — that's a pass, not a warning.
-        pass "Health endpoint responded: HTTP 200${HEALTH:+ — ${HEALTH}}"
-    elif [ -n "$HEALTH_CODE" ] && [ "$HEALTH_CODE" != "000" ]; then
-        warn "/health responded with HTTP ${HEALTH_CODE} (may be unsupported on this version)"
-    else
-        warn "/health returned no response (may be unsupported on this version)"
-    fi
+    clean_lines = [ln for ln in code.splitlines() if not FENCE_RE.match(ln)]
+    clean_code = "\n".join(clean_lines).strip("\n")
 
-    # ── 3. Model list ─────────────────────────────────────────────────────────
-    header "3. Model list  (GET /v1/models)"
-    local MODELS_JSON MODEL_COUNT
-    MODELS_JSON=$(http_get "${BASE_URL}/v1/models" || true)
-    if [ -z "$MODELS_JSON" ]; then
-        fail "No response from /v1/models"
-        FAILURES=$((FAILURES + 1))
-    else
-        MODEL_COUNT=$(echo "$MODELS_JSON" | jq '.data | length' 2>/dev/null || echo 0)
-        if [ "$MODEL_COUNT" -eq 0 ]; then
-            warn "Model list is empty"
-            FAILURES=$((FAILURES + 1))
-        else
-            pass "Found ${MODEL_COUNT} model(s):"
-            echo "$MODELS_JSON" | jq -r '.data[] | "  • \(.id)  (owned_by: \(.owned_by // "n/a"))"'
-            # Pick the first model for subsequent tests (discovered, not hardcoded)
-            FIRST_MODEL=$(echo "$MODELS_JSON" | jq -r '.data[0].id')
-            info "Using model for tests: ${FIRST_MODEL}"
-        fi
-    fi
+    lexer = LEXER_BY_LABEL.get(lang_label, "text")
+    console.print(f"  [bold]Generated code ({lang_label}):[/bold]")
+    console.print(Syntax(clean_code, lexer, theme="monokai", line_numbers=False, word_wrap=True))
 
-    # ── 3b. Capability detection  (chat vs. embeddings) ───────────────────────
-    #     Any vLLM model on this port is supported — we never assume a name or
-    #     a model type, we ask the server what it can actually do and gate the
-    #     rest of the suite on the answer. Chat-only models skip embeddings-only
-    #     checks (and vice versa) as graceful skips, never as false failures.
-    header "3b. Capability detection"
-    local CAP_CHAT=0 CAP_EMBED=0
-    if [ -n "${FIRST_MODEL:-}" ]; then
-        local PROBE_BODY PROBE_RESP EPROBE_BODY EPROBE_RESP
-        PROBE_BODY=$(jq -n --arg m "$FIRST_MODEL" \
-            '{model:$m, max_tokens:1, messages:[{role:"user", content:"hi"}]}')
-        PROBE_RESP=$(http_post "${BASE_URL}/v1/chat/completions" "$PROBE_BODY" || true)
-        if [ -n "$PROBE_RESP" ] && printf '%s' "$PROBE_RESP" | jq -e '.choices[0]' >/dev/null 2>&1; then
-            CAP_CHAT=1
-        fi
+    judge_prompt = (
+        "Given the provided code, what is the likelihood this code is syntactically correct "
+        "and will work? Provide a percentage of its correctness in a 1-100% format, with just "
+        f"the number and a percent sign, nothing else.\n\nCode:\n{code}"
+    )
+    judge_resp = chat_once(base_url, model, judge_prompt, 512)
 
-        EPROBE_BODY=$(jq -n --arg m "$FIRST_MODEL" '{model:$m, input:"probe"}')
-        EPROBE_RESP=$(http_post "${BASE_URL}/v1/embeddings" "$EPROBE_BODY" || true)
-        if [ -n "$EPROBE_RESP" ] && printf '%s' "$EPROBE_RESP" | jq -e '.data[0].embedding[0]' >/dev/null 2>&1; then
-            CAP_EMBED=1
-        fi
+    score = None
+    m = re.findall(r"([0-9]{1,3})\s*%", judge_resp)
+    if m:
+        score = int(m[-1])
+    else:
+        m2 = re.findall(r"([0-9]{1,3})", judge_resp)
+        if m2:
+            score = int(m2[-1])
 
-        if [ "$CAP_CHAT" -eq 1 ] && [ "$CAP_EMBED" -eq 1 ]; then
-            info "Model supports both chat/completions and embeddings"
-        elif [ "$CAP_CHAT" -eq 1 ]; then
-            info "Model supports chat/completions (no embeddings support detected)"
-        elif [ "$CAP_EMBED" -eq 1 ]; then
-            info "Model supports embeddings only (embedding model) — chat-dependent tests will be skipped, not failed"
-        else
-            warn "Could not confirm chat or embeddings support via quick probe — will attempt chat tests anyway"
-            CAP_CHAT=1
-        fi
-    else
-        warn "Skipping — no model discovered"
-    fi
+    quality.total += 1
+    if score is not None:
+        score = min(score, 100)
+        if score >= 70:
+            cpass(f"Self-assessed correctness: {score}%")
+            quality.passed += 1
+        else:
+            cwarn(f"Self-assessed correctness: {score}% (below 70% confidence threshold)")
+    else:
+        cwarn("Could not parse a correctness percentage from the self-assessment")
+        if judge_resp:
+            console.print(f"     judge raw: {judge_resp.strip().replace(chr(10), ' ')[:160]}")
 
-    # ── 4. Server info / version ──────────────────────────────────────────────
-    header "4. Server info"
-    local path RESP
-    for path in "/version" "/v1/version" "/info"; do
-        RESP=$(http_get "${BASE_URL}${path}" || true)
-        if [ -n "$RESP" ]; then
-            pass "${path}: ${RESP}"
-        fi
-    done
 
-    # ── 5. OpenAI-compatible chat completion ──────────────────────────────────
-    header "5. Chat completion  (POST /v1/chat/completions)"
-    if [ -z "${FIRST_MODEL:-}" ]; then
-        warn "Skipping — no model discovered"
-    elif [ "$CAP_CHAT" -ne 1 ]; then
-        warn "Skipping — model does not support chat/completions (embedding-only model)"
-    else
-        local CHAT_BODY CHAT_RESP CHAT_TEXT USAGE
-        CHAT_BODY=$(jq -n \
-            --arg model "$FIRST_MODEL" \
-            '{
-                model: $model,
-                max_tokens: 512,
-                temperature: 0.1,
-                messages: [
-                    {role: "system", content: "You are a helpful assistant. Be concise."},
-                    {role: "user",   content: "What model are you and what are your key capabilities? What is your training data cut off date. Answer in 3-4 sentences."}
-                ]
-            }')
-        CHAT_RESP=$(http_post "${BASE_URL}/v1/chat/completions" "$CHAT_BODY" || true)
-        if [ -z "$CHAT_RESP" ]; then
-            fail "No response from /v1/chat/completions"
-            FAILURES=$((FAILURES + 1))
-        else
-            CHAT_TEXT=$(printf '%s' "$CHAT_RESP" | jq -r \
-                '(.choices[0].message.content // "") as $c
-                 | if ($c|length) > 0 then $c else (.choices[0].message.reasoning_content // .choices[0].message.reasoning // empty) end' \
-                2>/dev/null || true)
-            USAGE=$(echo "$CHAT_RESP"     | jq -r '"prompt=\(.usage.prompt_tokens) completion=\(.usage.completion_tokens) total=\(.usage.total_tokens)"' 2>/dev/null || true)
-            if [ -n "$CHAT_TEXT" ] && [ "$CHAT_TEXT" != "null" ]; then
-                pass "Chat completion succeeded"
-                echo "  Response : ${CHAT_TEXT}"
-                echo "  Tokens   : ${USAGE}"
-            else
-                fail "Chat response malformed"
-                echo "  Raw: ${CHAT_RESP}" | head -c 400
-                FAILURES=$((FAILURES + 1))
-            fi
-        fi
-    fi
+# ─────────────────────────────────────────────────────────────────────────────
+# PDF fixture — built once, at import time, and reused across every instance
+# ─────────────────────────────────────────────────────────────────────────────
+def build_pdf_and_extract_text() -> str:
+    if not shutil.which("pdftotext"):
+        return ""
+    stream_body = f"BT /F1 10 Tf 40 700 Td ({PDF_ARTICLE_TEXT}) Tj ET\n".encode("latin-1", "replace")
+    pdf_parts = [
+        b"%PDF-1.4\n",
+        b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n",
+        b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n",
+        b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 4 0 R"
+        b"/Resources<</Font<</F1 5 0 R>>>>>>endobj\n",
+        f"4 0 obj<</Length {len(stream_body)}>>stream\n".encode("ascii"),
+        stream_body,
+        b"endstream endobj\n",
+        b"5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n",
+        b"trailer<</Size 6/Root 1 0 R>>\n",
+        b"%%EOF\n",
+    ]
+    pdf_bytes = b"".join(pdf_parts)
 
-    # ── 5b. Generation throughput ─────────────────────────────────────────────
-    header "5b. Generation throughput  (completion tokens/sec)"
-    if [ -z "${FIRST_MODEL:-}" ]; then
-        warn "Skipping — no model discovered"
-    elif [ "$CAP_CHAT" -ne 1 ]; then
-        warn "Skipping — model does not support chat/completions (embedding-only model)"
-    else
-        info "Benchmarking model: ${FIRST_MODEL}"
-        info "Metric: non-streaming completion_tokens / end-to-end request seconds"
-        benchmark_chat_tps 2 192
-    fi
-
-    # ── 6. OpenAI-compatible text completion ──────────────────────────────────
-    header "6. Text completion  (POST /v1/completions)"
-    if [ -z "${FIRST_MODEL:-}" ]; then
-        warn "Skipping — no model discovered"
-    elif [ "$CAP_CHAT" -ne 1 ]; then
-        warn "Skipping — model does not support text completions (embedding-only model)"
-    else
-        local COMP_BODY COMP_RESP COMP_TEXT
-        COMP_BODY=$(jq -n \
-            --arg model "$FIRST_MODEL" \
-            '{
-                model: $model,
-                prompt: "The capital of France is",
-                max_tokens: 20,
-                temperature: 0
-            }')
-        COMP_RESP=$(http_post "${BASE_URL}/v1/completions" "$COMP_BODY" || true)
-        if [ -z "$COMP_RESP" ]; then
-            warn "/v1/completions not supported or returned no response (expected for chat-only models)"
-        else
-            COMP_TEXT=$(echo "$COMP_RESP" | jq -r '.choices[0].text' 2>/dev/null || true)
-            if [ -n "$COMP_TEXT" ] && [ "$COMP_TEXT" != "null" ]; then
-                pass "Text completion succeeded: \"The capital of France is${COMP_TEXT}\""
-            else
-                warn "Text completion response malformed (may be unsupported)"
-            fi
-        fi
-    fi
-
-    # ── 7. Embeddings endpoint ────────────────────────────────────────────────
-    header "7. Embeddings  (POST /v1/embeddings)"
-    if [ -z "${FIRST_MODEL:-}" ]; then
-        warn "Skipping — no model discovered"
-    elif [ "$CAP_EMBED" -ne 1 ]; then
-        warn "/v1/embeddings not supported (expected — embeddings require a dedicated embedding model)"
-    else
-        local EMB_BODY EMB_RESP EMB_LEN BATCH_BODY BATCH_RESP BATCH_COUNT
-        EMB_BODY=$(jq -n \
-            --arg model "$FIRST_MODEL" \
-            '{model: $model, input: "Hello, world!"}')
-        EMB_RESP=$(http_post "${BASE_URL}/v1/embeddings" "$EMB_BODY" || true)
-        if [ -z "$EMB_RESP" ]; then
-            fail "No response from /v1/embeddings"
-            FAILURES=$((FAILURES + 1))
-        else
-            EMB_LEN=$(echo "$EMB_RESP" | jq '.data[0].embedding | length' 2>/dev/null || echo 0)
-            if [ "$EMB_LEN" -gt 0 ] 2>/dev/null; then
-                pass "Embeddings returned vector of length ${EMB_LEN}"
-            else
-                fail "Embeddings endpoint responded but no vector returned"
-                FAILURES=$((FAILURES + 1))
-            fi
-        fi
-
-        BATCH_BODY=$(jq -n --arg model "$FIRST_MODEL" \
-            '{model: $model, input: ["Hello, world!", "Goodbye, world!"]}')
-        BATCH_RESP=$(http_post "${BASE_URL}/v1/embeddings" "$BATCH_BODY" || true)
-        BATCH_COUNT=$(printf '%s' "$BATCH_RESP" | jq '.data | length' 2>/dev/null || echo 0)
-        if [ "$BATCH_COUNT" = "2" ]; then
-            pass "Batch embeddings returned 2 vectors for 2 inputs"
-        else
-            warn "Batch embeddings request did not return 2 vectors (got ${BATCH_COUNT:-0})"
-        fi
-    fi
-
-    # ── 7b. Embedding semantic quality  (similarity sanity check) ─────────────
-    header "7b. Embedding semantic quality"
-    if [ -z "${FIRST_MODEL:-}" ]; then
-        warn "Skipping — no model discovered"
-    elif [ "$CAP_EMBED" -ne 1 ]; then
-        warn "Skipping — embeddings not supported by this model"
-    else
-        local SIM_BODY SIM_RESP VEC_A VEC_B VEC_C SIM_AB SIM_AC
-        SIM_BODY=$(jq -n --arg model "$FIRST_MODEL" \
-            '{model: $model, input: [
-                "The cat sat on the mat.",
-                "A feline rested on the rug.",
-                "Quantum entanglement defies classical intuition."
-            ]}')
-        SIM_RESP=$(http_post "${BASE_URL}/v1/embeddings" "$SIM_BODY" || true)
-        if [ -z "$SIM_RESP" ]; then
-            warn "Could not fetch vectors for similarity check"
-        else
-            VEC_A=$(printf '%s' "$SIM_RESP" | jq -c '.data[0].embedding' 2>/dev/null || true)
-            VEC_B=$(printf '%s' "$SIM_RESP" | jq -c '.data[1].embedding' 2>/dev/null || true)
-            VEC_C=$(printf '%s' "$SIM_RESP" | jq -c '.data[2].embedding' 2>/dev/null || true)
-            if [ -n "$VEC_A" ] && [ -n "$VEC_B" ] && [ -n "$VEC_C" ]; then
-                SIM_AB=$(cosine_similarity "$VEC_A" "$VEC_B")
-                SIM_AC=$(cosine_similarity "$VEC_A" "$VEC_C")
-                info "cos(similar pair)   = ${SIM_AB}"
-                info "cos(unrelated pair) = ${SIM_AC}"
-                QUALITY_TOTAL=$((QUALITY_TOTAL + 1))
-                if awk -v ab="$SIM_AB" -v ac="$SIM_AC" 'BEGIN{exit !(ab>ac)}' 2>/dev/null; then
-                    pass "Similar sentences score higher cosine similarity than an unrelated one"
-                    QUALITY_PASS=$((QUALITY_PASS + 1))
-                else
-                    warn "Similar sentences did NOT score higher cosine similarity than an unrelated one"
-                fi
-            else
-                warn "Could not parse vectors for similarity check"
-            fi
-        fi
-    fi
-
-    # ── 8. Sampling parameters / model introspection via chat ─────────────────
-    header "8. Model self-description prompts"
-    if [ -z "${FIRST_MODEL:-}" ]; then
-        warn "Skipping — no model discovered"
-    elif [ "$CAP_CHAT" -ne 1 ]; then
-        warn "Skipping — model does not support chat/completions (embedding-only model)"
-    else
-        local PROMPTS PROMPT BODY RESP TEXT
-        PROMPTS=(
-            "What is your max context window length in tokens?"
-            "List any special capabilities you have, such as vision, code, tool use, or multilingual support."
-            "What languages can you respond in?"
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        f.write(pdf_bytes)
+        pdf_path = f.name
+    try:
+        out = subprocess.run(
+            ["pdftotext", pdf_path, "-"], capture_output=True, text=True, timeout=10
         )
-        for PROMPT in "${PROMPTS[@]}"; do
-            BODY=$(jq -n \
-                --arg model "$FIRST_MODEL" \
-                --arg prompt "$PROMPT" \
-                '{
-                    model: $model,
-                    max_tokens: 1536,
-                    temperature: 0.1,
-                    messages: [{role: "user", content: $prompt}]
-                }')
-            RESP=$(http_post "${BASE_URL}/v1/chat/completions" "$BODY" || true)
-            TEXT=$(printf '%s' "$RESP" | jq -r \
-                '(.choices[0].message.content // "") as $c
-                 | if ($c|length) > 0 then $c else (.choices[0].message.reasoning_content // .choices[0].message.reasoning // empty) end' \
-                2>/dev/null || true)
-            if [ -n "$TEXT" ] && [ "$TEXT" != "null" ]; then
-                echo -e "  ${BOLD}Q:${RESET} ${PROMPT}"
-                echo    "  A: ${TEXT}"
-                echo
-            else
-                warn "No response for: ${PROMPT} (may need a larger max_tokens budget for this reasoning model)"
-            fi
-        done
-    fi
+        return out.stdout or ""
+    except Exception:
+        return ""
+    finally:
+        try:
+            os.unlink(pdf_path)
+        except OSError:
+            pass
 
-    # ── 9. Streaming check ────────────────────────────────────────────────────
-    header "9. Streaming  (POST /v1/chat/completions  stream=true)"
-    if [ -z "${FIRST_MODEL:-}" ]; then
-        warn "Skipping — no model discovered"
-    elif [ "$CAP_CHAT" -ne 1 ]; then
-        warn "Skipping — model does not support chat/completions (embedding-only model)"
-    else
-        local STREAM_BODY STREAM_OUT
-        STREAM_BODY=$(jq -n \
-            --arg model "$FIRST_MODEL" \
-            '{
-                model: $model,
-                max_tokens: 30,
-                temperature: 0,
-                stream: true,
-                messages: [{role: "user", content: "Say hello in one sentence."}]
-            }')
-        STREAM_OUT=$(curl -sf --max-time 20 \
-            -H "Content-Type: application/json" \
-            -d "$STREAM_BODY" \
-            "${BASE_URL}/v1/chat/completions" 2>/dev/null | head -5 || true)
-        if echo "$STREAM_OUT" | grep -q "data:"; then
-            pass "Streaming response received (first chunks):"
-            echo "$STREAM_OUT" | head -3 | sed 's/^/  /'
-        else
-            warn "Streaming check inconclusive (may still work — check manually)"
-        fi
-    fi
 
-    # ══════════════════════════════════════════════════════════════════════════
-    #  MODEL QUALITY & CAPABILITY TESTS (10-37)
-    #  Auto-graded against known answers. Tolerant of "thinking"/reasoning models:
-    #  the expected answer is matched ANYWHERE in the output, with a generous
-    #  token budget so a chain-of-thought preamble doesn't truncate the answer.
-    # ══════════════════════════════════════════════════════════════════════════
-    if [ -z "${FIRST_MODEL:-}" ]; then
-        warn "Skipping capability tests 10-37 — no model discovered"
-    elif [ "$CAP_CHAT" -ne 1 ]; then
-        warn "Skipping capability tests 10-37 — model does not support chat/completions (embedding-only model)"
-    else
-        local QTOK=1024
-        local R CLEAN JSON_ONLY SUM_SRC NEEDLE HAY i
-        local VBODY VRESP VTEXT ATMP AREQ ATEXT
+PDF_TEXT = build_pdf_and_extract_text()
 
-        header "10. Reasoning  (multi-step logic)"
-        R=$(chat_once "Alice is older than Bob. Carol is younger than Bob. Who is the oldest of the three? Reply with only the name." "$QTOK")
-        grade "Logical ordering -> Alice" "$R" "alice" || true
-
-        header "11. Math  (word problem)"
-        R=$(chat_once "A shirt costs \$40. It is discounted 25%, then 10% sales tax is added to the discounted price. What is the final price in dollars? Reply with only the number." "$QTOK")
-        grade "Arithmetic -> 33" "$R" "(^|[^0-9.])33([^0-9]|\$)" || true
-
-        header "12. Text summarization"
-        SUM_SRC="Photosynthesis is the process by which green plants, algae, and some bacteria convert light energy, usually from the sun, into chemical energy stored in glucose. It takes place in the chloroplasts, uses carbon dioxide and water, and releases oxygen as a byproduct. This process is the foundation of most food chains on Earth."
-        R=$(chat_once "Summarize the following text in one short sentence:\n\n${SUM_SRC}" "$QTOK")
-        grade "Summary captures the core topic" "$R" "photosynthes" || true
-
-        header "13. Instruction following  (strict JSON)"
-        R=$(chat_once "Respond with ONLY minified JSON, no markdown and no code fences, of the exact form {\"city\":\"\",\"country\":\"\"} giving the capital of France." "$QTOK")
-        CLEAN=$(printf '%s' "$R" | sed -E 's/```json//g; s/```//g')
-        JSON_ONLY=$(printf '%s' "$CLEAN" | grep -oE '\{[^{}]*\}' | tail -1)
-        QUALITY_TOTAL=$((QUALITY_TOTAL + 1))
-        if [ -n "$JSON_ONLY" ] && printf '%s' "$JSON_ONLY" | jq -e '.city' >/dev/null 2>&1 \
-             && printf '%s' "$JSON_ONLY" | jq -r '.city' | grep -qi 'paris'; then
-            pass "Valid JSON, city=Paris: ${JSON_ONLY}"
-            QUALITY_PASS=$((QUALITY_PASS + 1))
-        else
-            warn "Did not return valid JSON with city=Paris"
-            [ -n "$R" ] && echo "     got: $(printf '%s' "$R" | tr '\n' ' ' | head -c 160)"
-        fi
-
-        header "14. Code generation"
-        R=$(chat_once "Write a Python function named is_prime(n) that returns True if n is prime. Output only the code." "$QTOK")
-        grade "Defines is_prime()" "$R" "def[[:space:]]+is_prime" || true
-
-        header "15. Factual knowledge"
-        R=$(chat_once "What is the chemical symbol for gold? Reply with only the symbol." "$QTOK")
-        grade "Gold -> Au" "$R" "(^|[^A-Za-z])Au([^A-Za-z]|\$)" || true
-
-        header "16. Long-context needle retrieval"
-        NEEDLE="PLUM-4417"
-        HAY=""
-        for i in $(seq 1 60);   do HAY="${HAY}Log line ${i}: routine status nominal, nothing to report. "; done
-        HAY="${HAY}NOTE: the vault access code is ${NEEDLE}. "
-        for i in $(seq 61 120); do HAY="${HAY}Log line ${i}: routine status nominal, nothing to report. "; done
-        R=$(chat_once "The following is a long log. Find the vault access code buried in it and reply with only the code.\n\n${HAY}" "$QTOK")
-        grade "Recalled needle ${NEEDLE}" "$R" "PLUM[- ]?4417" || true
-
-        header "17. Translation  (multilingual)"
-        R=$(chat_once "Translate the phrase 'good morning' into French. Reply with only the translation." "$QTOK")
-        grade "EN->FR 'bonjour'" "$R" "bonjour" || true
-
-        header "18. Sentiment classification"
-        R=$(chat_once "Classify the sentiment of this review as POSITIVE or NEGATIVE. Reply with one word.\n\nReview: I absolutely loved this movie, it was fantastic and moving!" "$QTOK")
-        grade "Detected POSITIVE" "$R" "positive" || true
-
-        header "19. Vision / OCR  (multimodal image input)"
-        VBODY=$(jq -n --arg m "$FIRST_MODEL" --arg url "data:image/png;base64,${OCR_PNG_B64}" \
-            '{model:$m, max_tokens:64, temperature:0,
-              messages:[{role:"user", content:[
-                  {type:"text", text:"What text is written in this image? Reply with only the exact text."},
-                  {type:"image_url", image_url:{url:$url}}]}]}')
-        VRESP=$(http_post "${BASE_URL}/v1/chat/completions" "$VBODY" || true)
-        VTEXT=$(printf '%s' "$VRESP" | jq -r \
-            '(.choices[0].message.content // "") as $c
-             | if ($c|length) > 0 then $c else (.choices[0].message.reasoning_content // .choices[0].message.reasoning // empty) end' \
-            2>/dev/null || true)
-        if [ -z "$VRESP" ] || [ -z "$VTEXT" ]; then
-            warn "Vision not supported by this model (no multimodal image input) — skipped"
-        else
-            grade "OCR read 'VLLM-OCR-7392'" "$VTEXT" "VLLM[- ]?OCR[- ]?7392|OCR[- ]?7392" || true
-        fi
-
-        header "20. Audio processing  (speech-to-text)"
-        ATMP="${TMPDIR:-/tmp}/vllm_asr_$$_${PORT}.mp3"
-        printf '%s' "$SPEECH_MP3_B64" | b64decode > "$ATMP" 2>/dev/null || true
-        AREQ=$(curl -sf --max-time 60 \
-            -F "file=@${ATMP};type=audio/mpeg" \
-            -F "model=${FIRST_MODEL}" \
-            "${BASE_URL}/v1/audio/transcriptions" 2>/dev/null || true)
-        rm -f "$ATMP" 2>/dev/null || true
-        if [ -z "$AREQ" ]; then
-            warn "Audio/ASR not supported (no /v1/audio/transcriptions — needs a Whisper/ASR model) — skipped"
-        else
-            ATEXT=$(printf '%s' "$AREQ" | jq -r '.text // empty' 2>/dev/null || true)
-            [ -z "$ATEXT" ] && ATEXT="$AREQ"
-            grade "Transcribed 'the quick brown fox'" "$ATEXT" "quick|brown|fox" || true
-        fi
-
-        header "21. Summarization accuracy  (multi-fact article)"
-        local ART21 R21A
-        ART21="Meridian County officials confirmed Thursday that engineer Priya Nakamura will lead the replacement of the Route 9 bridge, a project expected to cost 12.6 million dollars and finish by March 2027. The current bridge, built in 1968, has been restricted to vehicles under 10 tons since a 2023 inspection found corrosion in its support beams. Nakamura said the new design adds a dedicated bike lane."
-        R=$(chat_once "Summarize the following article in 2-3 sentences, making sure to include the name of the person leading the project, the total cost, and the expected finish date:\n\n${ART21}" "$QTOK")
-        R21A="$R"
-        QUALITY_TOTAL=$((QUALITY_TOTAL + 1))
-        if printf '%s' "$R21A" | grep -qi "nakamura" \
-           && printf '%s' "$R21A" | grep -qiE "12\.6|12,600,000|\\\$12" \
-           && printf '%s' "$R21A" | grep -qiE "2027"; then
-            pass "Summary accurately includes name, cost, and finish date"
-            QUALITY_PASS=$((QUALITY_PASS + 1))
-        else
-            warn "Summary missing one or more key facts (name=Nakamura, cost=12.6M, date=2027)"
-            [ -n "$R21A" ] && echo "     got: $(printf '%s' "$R21A" | tr '\n' ' ' | head -c 200)"
-        fi
-
-        header "22. Counting  (numbers embedded in text)"
-        R=$(chat_once "Count how many numbers in the following list are greater than 50. Reply with only the count as a digit.\n\nThe readings were: 12, 87, 34, 91, 56, 3, 68, 45, 72, 19, 50, 99." "$QTOK")
-        grade "Correct count of numbers > 50 -> 6" "$R" "(^|[^0-9])6([^0-9]|\$)" || true
-
-        header "23. Pulling info from a PDF  (extract + summarize)"
-        if [ -z "$PDF_TEXT" ]; then
-            warn "Skipped — pdftotext not installed locally (used to extract text from the test PDF before sending it to the model)"
-        else
-            R=$(chat_once "The following text was extracted from a PDF document. Write a one-sentence summary that includes the confirmation code and the opening date mentioned:\n\n${PDF_TEXT}" "$QTOK")
-            QUALITY_TOTAL=$((QUALITY_TOTAL + 1))
-            if printf '%s' "$R" | grep -qiE "DOC[- ]?9931[- ]?B" && printf '%s' "$R" | grep -qiE "november"; then
-                pass "Accurately summarized PDF-extracted text (code + date present): $(printf '%s' "$R" | tr '\n' ' ' | head -c 160)"
-                QUALITY_PASS=$((QUALITY_PASS + 1))
-            else
-                warn "Summary of PDF-extracted text missing the confirmation code or date"
-                [ -n "$R" ] && echo "     got: $(printf '%s' "$R" | tr '\n' ' ' | head -c 200)"
-            fi
-        fi
-
-        header "24. Table lookup  (structured data)"
-        R=$(chat_once "Here is a small table of quarterly revenue in thousands of dollars:\n\n| Quarter | Revenue |\n|---------|---------|\n| Q1 | 120 |\n| Q2 | 145 |\n| Q3 | 98 |\n| Q4 | 210 |\n\nWhich quarter had the highest revenue? Reply with only the quarter, e.g. Q1." "$QTOK")
-        grade "Correctly identifies Q4 as highest" "$R" "q4" || true
-
-        header "25. Multi-turn context retention"
-        local BODY25 RESP25 R25
-        BODY25=$(jq -n --arg m "$FIRST_MODEL" --argjson mt "$QTOK" \
-            '{model:$m, max_tokens:$mt, temperature:0, messages:[
-                {role:"user", content:"My favorite programming language is Rust."},
-                {role:"assistant", content:"Got it, Rust is your favorite programming language."},
-                {role:"user", content:"What did I say my favorite programming language was? Reply with only the name."}
-            ]}')
-        RESP25=$(http_post "${BASE_URL}/v1/chat/completions" "$BODY25" || true)
-        R25=$(printf '%s' "$RESP25" | jq -r \
-            '(.choices[0].message.content // "") as $c
-             | if ($c|length) > 0 then $c else (.choices[0].message.reasoning_content // .choices[0].message.reasoning // empty) end' \
-            2>/dev/null || true)
-        grade "Recalled earlier turn -> Rust" "$R25" "rust" || true
-
-        header "26. Careful reading  (negation)"
-        R=$(chat_once "Of these three cities — Tokyo, Lima, and Oslo — which one is NOT in the Southern Hemisphere and NOT in Asia? Reply with only the city name." "$QTOK")
-        grade "Correctly resolves negation -> Oslo" "$R" "oslo" || true
-
-        header "27. Unit conversion  (numeric tolerance)"
-        R=$(chat_once "Convert 5 miles to kilometers. Reply with only the number, rounded to one decimal place." "$QTOK")
-        QUALITY_TOTAL=$((QUALITY_TOTAL + 1))
-        local UNIT27
-        UNIT27=$(printf '%s' "$R" | grep -oE '[0-9]+\.[0-9]+' | head -1)
-        if [ -n "$UNIT27" ] && awk -v v="$UNIT27" 'BEGIN{exit !(v>7.8 && v<8.2)}' 2>/dev/null; then
-            pass "5 miles converted within tolerance of 8.0 km (got ${UNIT27})"
-            QUALITY_PASS=$((QUALITY_PASS + 1))
-        else
-            warn "Unit conversion outside tolerance or unparseable"
-            [ -n "$R" ] && echo "     got: $(printf '%s' "$R" | tr '\n' ' ' | head -c 160)"
-        fi
-
-        header "28. Date arithmetic"
-        R=$(chat_once "If today is Wednesday, what day of the week will it be in 10 days? Reply with only the day name." "$QTOK")
-        grade "Correct day -> Saturday" "$R" "saturday" || true
-
-        header "29. Structured extraction to JSON"
-        R=$(chat_once "Extract the name, email, and phone number from this text as minified JSON with keys name, email, phone. No markdown, no code fences.\n\nText: \"Reach out to Marcus Webb at marcus.webb@example.com or call 555-201-4488 with any questions.\"" "$QTOK")
-        CLEAN=$(printf '%s' "$R" | sed -E 's/```json//g; s/```//g')
-        JSON_ONLY=$(printf '%s' "$CLEAN" | grep -oE '\{[^{}]*\}' | tail -1)
-        QUALITY_TOTAL=$((QUALITY_TOTAL + 1))
-        if [ -n "$JSON_ONLY" ] \
-           && printf '%s' "$JSON_ONLY" | jq -r '.email // empty' 2>/dev/null | grep -qi 'marcus.webb@example.com' \
-           && printf '%s' "$JSON_ONLY" | jq -r '.phone // empty' 2>/dev/null | grep -q '555-201-4488'; then
-            pass "Valid JSON with correct email and phone: ${JSON_ONLY}"
-            QUALITY_PASS=$((QUALITY_PASS + 1))
-        else
-            warn "Structured extraction missing or incorrect fields"
-            [ -n "$R" ] && echo "     got: $(printf '%s' "$R" | tr '\n' ' ' | head -c 200)"
-        fi
-
-        header "30. Code bug fix"
-        R=$(chat_once "This Python function is supposed to return the sum of a list but has a bug:\n\ndef total(nums):\n    result = 0\n    for n in nums:\n        result = n\n    return result\n\nReply with only the corrected function." "$QTOK")
-        grade "Fixes accumulator bug (result += n or result = result + n)" "$R" "result[[:space:]]*(\+=|=[[:space:]]*result[[:space:]]*\+)" || true
-
-        # ══════════════════════════════════════════════════════════════════════
-        #  CODE GENERATION SUITE (31-37)  —  timed generation + model self-graded
-        #  correctness. Each test prints the readable, fenced-stripped code,
-        #  how long generation took, and a 1-100% self-assessed correctness
-        #  score obtained by sending the code back to the same model.
-        # ══════════════════════════════════════════════════════════════════════
-        code_gen_test "31" "Python3 (basic)" \
-            "Write a basic Python3 function named bubble_sort(nums) that sorts a list of integers in ascending order using the bubble sort algorithm (do not use sorted() or .sort()). Include a short usage example. Provide the code in a single fenced code block with clear, properly indented, multi-line formatting and brief comments. No explanation outside the code block." \
-            2048
-
-        code_gen_test "32" "PHP (basic)" \
-            "Write a basic PHP script that defines a function calculateFactorial(\$n) which returns the factorial of \$n, and then prints the factorial of 5. Include the opening and closing PHP tags. Provide the code in a single fenced code block with clear, properly indented, multi-line formatting and brief comments. No explanation outside the code block." \
-            2048
-
-        code_gen_test "33" "Bash / Shell scripting (basic)" \
-            "Write a basic Bash shell script that loops through the numbers 1 to 20 and prints only the even numbers, one per line, with a comment explaining the logic. Provide the code in a single fenced code block with clear, properly indented, multi-line formatting. No explanation outside the code block." \
-            2048
-
-        code_gen_test "34" "Node.js (basic)" \
-            "Write a basic Node.js script, using only built-in core modules (no npm packages), that asynchronously reads a file named data.txt and prints its contents to the console, with proper error handling for a missing file. Provide the code in a single fenced code block with clear, properly indented, multi-line formatting and brief comments. No explanation outside the code block." \
-            2048
-
-        code_gen_test "35" "MySQL SELECT with JOINs and GROUP BY (advanced)" \
-            "Write an advanced MySQL query that selects each customer's name and their total number of orders, joining a customers table (columns: id, name) with an orders table (columns: id, customer_id, order_date), grouping by customer, including only customers with more than 3 orders, and ordering the results by order count descending. Provide the query in a single fenced sql code block, formatted across multiple readable lines with each clause (SELECT, FROM, JOIN, GROUP BY, HAVING, ORDER BY) on its own line. No explanation outside the code block." \
-            2048
-
-        code_gen_test "36" "MongoDB query (medium)" \
-            "Write a MongoDB query, using mongosh shell syntax, that finds all documents in the products collection where price is greater than 50 and category is 'electronics', sorted by price descending, returning only the name and price fields. Provide the query in a single fenced javascript code block with clear, properly indented, multi-line formatting. No explanation outside the code block." \
-            2048
-
-        code_gen_test "37" "JavaScript (medium)" \
-            "Write a medium-difficulty JavaScript function named groupByProperty(arr, prop) that takes an array of objects and a property name, and returns an object grouping the array elements by the value of that property. Include a short example usage with sample output shown as a comment. Provide the code in a single fenced code block with clear, properly indented, multi-line formatting and brief comments. No explanation outside the code block." \
-            2048
-    fi
-
-    # ── Capability scorecard ────────────────────────────────────────────────
-    header "Capability Scorecard — ${BASE_URL}"
-    if [ -n "${FIRST_MODEL:-}" ]; then
-        info "Model : ${FIRST_MODEL}"
-        if [ "$QUALITY_TOTAL" -gt 0 ]; then
-            PCT=$(( QUALITY_PASS * 100 / QUALITY_TOTAL ))
-            info "Quality score : ${QUALITY_PASS}/${QUALITY_TOTAL} graded checks passed (${PCT}%)"
-        else
-            warn "No graded checks were run"
-        fi
-    else
-        warn "No model discovered — nothing to score"
-    fi
-}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Run the suite against every discovered instance.
+# System hardware
 # ─────────────────────────────────────────────────────────────────────────────
-for p in "${TARGET_PORTS[@]}"; do
-    run_instance_tests "$HOST" "$p"
-done
+def run_cmd(args: list[str], timeout: int = 5) -> str:
+    try:
+        out = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return out.stdout
+    except Exception:
+        return ""
 
-# ── Summary ───────────────────────────────────────────────────────────────────
-header "Summary"
-info "Tested ${#TARGET_PORTS[@]} instance(s) on ${HOST}: ports ${TARGET_PORTS[*]}"
-if [ "$FAILURES" -eq 0 ]; then
-    pass "All critical checks passed across all instances"
-else
-    fail "${FAILURES} critical check(s) failed across all instances"
-fi
 
-exit "$FAILURES"
+def cpu_utilization(os_type: str) -> str:
+    if os_type == "Linux" and os.path.exists("/proc/stat"):
+        try:
+
+            def sample():
+                with open("/proc/stat") as f:
+                    parts = f.readline().split()
+                nums = [int(x) for x in parts[1:8]]
+                return sum(nums), nums[3]
+
+            t1, i1 = sample()
+            time.sleep(0.3)
+            t2, i2 = sample()
+            dt, di = t2 - t1, i2 - i1
+            if dt > 0:
+                return f"{100 * (1 - di / dt):.1f}"
+        except Exception:
+            pass
+        return "n/a"
+    elif os_type == "Darwin":
+        out = run_cmd(["top", "-l", "1", "-n", "0"], timeout=5)
+        m = re.search(r"([\d.]+)%\s*idle", out)
+        if m:
+            return f"{100 - float(m.group(1)):.1f}"
+        return "n/a"
+    return "n/a"
+
+
+def print_system_hardware() -> None:
+    section("System Hardware")
+    os_type = os.uname().sysname if hasattr(os, "uname") else "Unknown"
+    arch = os.uname().machine if hasattr(os, "uname") else "unknown"
+    cinfo(f"Platform : {os_type} / {arch}")
+
+    if os_type == "Linux":
+        cpu_name = "unknown"
+        try:
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    if line.lower().startswith("model name"):
+                        cpu_name = line.split(":", 1)[1].strip()
+                        break
+        except Exception:
+            pass
+        cores = os.cpu_count() or "?"
+        ram = run_cmd(["free", "-h"])
+        ram_info = "unknown"
+        for line in ram.splitlines():
+            if line.startswith("Mem:"):
+                cols = line.split()
+                ram_info = f"total={cols[1]}  used={cols[2]}  free={cols[3]}"
+        cinfo(f"CPU      : {cpu_name}  ({cores} cores)")
+        cinfo(f"CPU Util : {cpu_utilization(os_type)}%")
+        cinfo(f"RAM      : {ram_info}")
+    elif os_type == "Darwin":
+        cpu_name = run_cmd(["sysctl", "-n", "machdep.cpu.brand_string"]).strip() or "unknown"
+        mem_bytes = run_cmd(["sysctl", "-n", "hw.memsize"]).strip()
+        try:
+            total_ram = f"{int(mem_bytes) / 1073741824:.1f} GB"
+        except ValueError:
+            total_ram = "unknown"
+        cinfo(f"CPU      : {cpu_name}")
+        cinfo(f"CPU Util : {cpu_utilization(os_type)}%")
+        cinfo(f"RAM      : {total_ram}")
+
+    if shutil.which("nvidia-smi") and run_cmd(["nvidia-smi"], timeout=5):
+        driver_out = run_cmd(["nvidia-smi"], timeout=5)
+        driver_m = re.search(r"Driver Version:\s*([\d.]+)", driver_out)
+        cuda_m = re.search(r"CUDA Version:\s*([\d.]+)", driver_out)
+        driver_ver = driver_m.group(1) if driver_m else "n/a"
+        cuda_ver = cuda_m.group(1) if cuda_m else "n/a"
+        gpu_count = run_cmd(["nvidia-smi", "--query-gpu=count", "--format=csv,noheader"]).splitlines()
+        gpu_count_s = gpu_count[0].strip() if gpu_count else "?"
+        cinfo(f"GPU      : NVIDIA  (driver={driver_ver}  CUDA={cuda_ver}  count={gpu_count_s})")
+
+        # Generic NVIDIA memory/util query — also covers unified-memory Grace
+        # Blackwell (GB10) and Grace Hopper (GH200) superchips, which still
+        # expose their GPU memory pool through nvidia-smi like any other
+        # CUDA-visible device.
+        query_out = run_cmd(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu,temperature.gpu",
+                "--format=csv,noheader,nounits",
+            ]
+        )
+        any_mem = False
+        for line in query_out.splitlines():
+            cols = [c.strip() for c in line.split(",")]
+            if len(cols) != 7:
+                continue
+            idx, name, mtot, mused, mfree, util, temp = cols
+            if mtot and mtot != "[N/A]":
+                any_mem = True
+            console.print(f"  [GPU {idx}] {name}")
+            console.print(f"           VRAM : {mtot} MiB total  |  {mused} MiB used  |  {mfree} MiB free")
+            console.print(f"           Util : {util}%  |  Temp: {temp}°C")
+        if not any_mem:
+            cwarn(
+                "nvidia-smi found a GPU but reported no memory figures (seen on some "
+                "unified-memory superchips like GB10) — check 'nvidia-smi -q' manually"
+            )
+    elif shutil.which("rocm-smi") and run_cmd(["rocm-smi"], timeout=5):
+        rocminfo_out = run_cmd(["rocminfo"], timeout=5)
+        rocm_m = re.search(r"ROCm Version:\s*([\d.]+)", rocminfo_out)
+        cinfo(f"GPU      : AMD ROCm  (version={rocm_m.group(1) if rocm_m else 'n/a'})")
+        out = run_cmd(["rocm-smi", "--showmeminfo", "vram", "--showuse", "--showtemp"], timeout=5)
+        for line in out.splitlines():
+            if line.strip():
+                console.print(f"  {line}")
+    elif os_type == "Darwin":
+        gpu_out = run_cmd(["system_profiler", "SPDisplaysDataType"], timeout=10)
+        fields = [
+            ln.strip()
+            for ln in gpu_out.splitlines()
+            if re.search(r"Chipset Model|Total Number of Cores|VRAM|Metal", ln)
+        ]
+        cinfo(f"GPU      : Apple Silicon / Metal  —  {'  '.join(fields) if fields else 'unknown'}")
+    else:
+        cwarn("GPU      : None detected — CPU-only inference")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Instance discovery
+# ─────────────────────────────────────────────────────────────────────────────
+def listen_ports_for_pid(pid: str) -> list[str]:
+    if shutil.which("lsof"):
+        out = run_cmd(["lsof", "-Pan", "-p", pid, "-iTCP", "-sTCP:LISTEN"], timeout=5)
+        ports = []
+        for line in out.splitlines()[1:]:
+            cols = line.split()
+            if cols:
+                addr = cols[-2] if len(cols) >= 2 else ""
+                m = re.search(r":(\d+)$", addr)
+                if m:
+                    ports.append(m.group(1))
+        return ports
+    return []
+
+
+def discover_instances(host: str) -> list[str]:
+    ps_out = run_cmd(["ps", "aux"], timeout=5)
+    proc_lines = [
+        ln
+        for ln in ps_out.splitlines()
+        if re.search(r"vllm serve|vllm[._]entrypoints[._]openai|[Vv]llm.*api_server", ln)
+        and "grep" not in ln
+    ]
+
+    if not proc_lines:
+        cwarn("No running vLLM processes found on this host")
+        return []
+
+    cinfo(f"Found {len(proc_lines)} vLLM-related process(es); resolving ports...")
+    target_ports: list[str] = []
+    for line in proc_lines:
+        cols = line.split()
+        if len(cols) < 2:
+            continue
+        pid = cols[1]
+        host_bind_m = re.search(r"--host[= ](\S+)", line)
+        model_m = re.search(r"--served-model-name[= ](\S+)", line) or re.search(r"vllm serve (\S+)", line)
+        port_flag_m = re.search(r"--port[= ](\d+)", line)
+
+        ports_found: list[str] = []
+        if port_flag_m:
+            ports_found.append(port_flag_m.group(1))
+        else:
+            ports_found = listen_ports_for_pid(pid) or ["8000"]
+
+        host_bind = host_bind_m.group(1) if host_bind_m else "0.0.0.0"
+        model_name = model_m.group(1) if model_m else "(from /v1/models)"
+
+        for p in ports_found:
+            console.print(f"  PID {pid}  |  port={p}  host={host_bind}  model={model_name}")
+            target_ports.append(p)
+
+    # Dedup while preserving numeric order.
+    unique_ports = sorted(set(target_ports), key=lambda p: int(p))
+    return unique_ports
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-instance test suite
+# ─────────────────────────────────────────────────────────────────────────────
+def run_instance_tests(host: str, port: str, color: str) -> InstanceResult:
+    base_url = f"http://{host}:{port}"
+    result = InstanceResult(base_url=base_url)
+    start_time = time.perf_counter()
+    quality = QualityTracker()
+
+    console.print()
+    console.print(Panel(f"Instance target: [bold]{base_url}[/bold]", style=color, box=box.DOUBLE))
+
+    # auto_refresh is deliberately OFF: Progress normally repaints from a
+    # background timer thread, and that thread racing against the heavy
+    # interleaved console.print() calls below (panels, syntax blocks, tables)
+    # intermittently corrupted output — lines would silently vanish. Manual,
+    # synchronous refresh() calls (only right after we advance the bar, never
+    # concurrently with anything else) avoid that race entirely.
+    progress = Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(complete_style=color, finished_style=color),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        transient=False,
+        auto_refresh=False,
+    )
+
+    with progress:
+        task = progress.add_task(f"[{color}]Testing {base_url}", total=TOTAL_TEST_STEPS)
+        progress.refresh()
+
+        def step():
+            progress.advance(task)
+            progress.refresh()
+
+        # ── 1. Reachability ─────────────────────────────────────────────────
+        section("1. Reachability", color)
+        reachable = False
+        for path in ("", "/health", "/v1/models"):
+            _, body = http_get_status(f"{base_url}{path}", timeout=5)
+            if body is not None and http_get_status(f"{base_url}{path}", timeout=5)[0] is not None:
+                reachable = True
+                break
+        status, _ = http_get_status(base_url, timeout=5)
+        if status is None:
+            status, _ = http_get_status(f"{base_url}/health", timeout=5)
+        if status is None:
+            status, _ = http_get_status(f"{base_url}/v1/models", timeout=5)
+        reachable = status is not None
+        if reachable:
+            cpass(f"Host is reachable at {base_url}")
+        else:
+            cfail(f"Cannot reach {base_url}")
+            console.print("  Hint: check that vLLM is running and the host/port are correct.")
+            result.failures += 1
+            result.reachable = False
+            progress.update(task, completed=TOTAL_TEST_STEPS)
+            progress.refresh()
+            result.duration_s = time.perf_counter() - start_time
+            return result
+        step()
+
+        # ── 2. Health check ─────────────────────────────────────────────────
+        section("2. Health check  (GET /health)", color)
+        health_code, health_body = http_get_status(f"{base_url}/health", timeout=10)
+        if health_code == 200:
+            cpass(f"Health endpoint responded: HTTP 200{' — ' + health_body if health_body else ''}")
+        elif health_code is not None:
+            cwarn(f"/health responded with HTTP {health_code} (may be unsupported on this version)")
+        else:
+            cwarn("/health returned no response (may be unsupported on this version)")
+        step()
+
+        # ── 3. Model list ────────────────────────────────────────────────────
+        section("3. Model list  (GET /v1/models)", color)
+        models_json = http_get(f"{base_url}/v1/models", timeout=10)
+        first_model = ""
+        if not models_json:
+            cfail("No response from /v1/models")
+            result.failures += 1
+        else:
+            try:
+                data = json.loads(models_json)
+                models = data.get("data", [])
+            except Exception:
+                models = []
+            if not models:
+                cwarn("Model list is empty")
+                result.failures += 1
+            else:
+                cpass(f"Found {len(models)} model(s):")
+                for m in models:
+                    console.print(f"  • {m.get('id')}  (owned_by: {m.get('owned_by', 'n/a')})")
+                first_model = models[0].get("id", "")
+                cinfo(f"Using model for tests: {first_model}")
+        result.model = first_model or "(unknown)"
+        step()
+
+        # ── 3b. Capability detection ────────────────────────────────────────
+        section("3b. Capability detection", color)
+        cap_chat = False
+        cap_embed = False
+        if first_model:
+            probe_body = {
+                "model": first_model,
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "hi"}],
+            }
+            probe_resp = http_post_json(f"{base_url}/v1/chat/completions", probe_body)
+            if probe_resp:
+                try:
+                    cap_chat = bool(json.loads(probe_resp).get("choices"))
+                except Exception:
+                    cap_chat = False
+
+            eprobe_body = {"model": first_model, "input": "probe"}
+            eprobe_resp = http_post_json(f"{base_url}/v1/embeddings", eprobe_body)
+            if eprobe_resp:
+                try:
+                    d = json.loads(eprobe_resp)
+                    cap_embed = bool(d.get("data") and d["data"][0].get("embedding"))
+                except Exception:
+                    cap_embed = False
+
+            if not cap_chat and not cap_embed:
+                cwarn("Could not confirm chat or embeddings support via quick probe — will attempt chat tests anyway")
+                cap_chat = True
+
+            if cap_chat and cap_embed:
+                cinfo("Model supports both chat/completions and embeddings")
+            elif cap_chat:
+                cinfo("Model supports chat/completions (no embeddings support detected) — tests 7 and 7b will be skipped")
+            elif cap_embed:
+                cinfo("Model supports embeddings only (embedding model) — chat-dependent tests will be skipped, not failed")
+        else:
+            cwarn("Skipping — no model discovered")
+        result.cap_chat = cap_chat
+        result.cap_embed = cap_embed
+        step()
+
+        # ── 4. Server info ──────────────────────────────────────────────────
+        section("4. Server info", color)
+        for path in ("/version", "/v1/version", "/info"):
+            resp = http_get(f"{base_url}{path}", timeout=10)
+            if resp:
+                cpass(f"{path}: {resp}")
+        step()
+
+        # ── 5. Chat completion (fully skipped for embedding-only models) ────
+        if first_model and cap_chat:
+            section("5. Chat completion  (POST /v1/chat/completions)", color)
+            chat_body = {
+                "model": first_model,
+                "max_tokens": 512,
+                "temperature": 0.1,
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant. Be concise."},
+                    {
+                        "role": "user",
+                        "content": "What model are you and what are your key capabilities? "
+                        "What is your training data cut off date. Answer in 3-4 sentences.",
+                    },
+                ],
+            }
+            chat_resp = http_post_json(f"{base_url}/v1/chat/completions", chat_body)
+            if not chat_resp:
+                cfail("No response from /v1/chat/completions")
+                result.failures += 1
+            else:
+                chat_text = extract_message_text(chat_resp)
+                try:
+                    usage = json.loads(chat_resp).get("usage", {})
+                    usage_s = (
+                        f"prompt={usage.get('prompt_tokens')} "
+                        f"completion={usage.get('completion_tokens')} "
+                        f"total={usage.get('total_tokens')}"
+                    )
+                except Exception:
+                    usage_s = ""
+                if chat_text:
+                    cpass("Chat completion succeeded")
+                    console.print(f"  Response : {chat_text}")
+                    console.print(f"  Tokens   : {usage_s}")
+                else:
+                    cfail("Chat response malformed")
+                    console.print(f"  Raw: {chat_resp[:400]}")
+                    result.failures += 1
+        step()
+
+        # ── 5b. Generation throughput ────────────────────────────────────────
+        if first_model and cap_chat:
+            section("5b. Generation throughput  (completion tokens/sec)", color)
+            cinfo(f"Benchmarking model: {first_model}")
+            cinfo("Metric: non-streaming completion_tokens / end-to-end request seconds")
+            ok, total_completion, total_elapsed = 0, 0, 0.0
+            for i in range(1, 3):
+                body = {
+                    "model": first_model,
+                    "max_tokens": 192,
+                    "temperature": 0,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "Write a dense technical paragraph about local AI inference "
+                            "performance, batching, KV cache behavior, and latency. Continue until "
+                            "you naturally reach the token budget.",
+                        }
+                    ],
+                }
+                t0 = time.perf_counter()
+                resp = http_post_json(f"{base_url}/v1/chat/completions", body)
+                elapsed = time.perf_counter() - t0
+                if not resp:
+                    cwarn(f"Throughput run {i}/2: no response")
+                    continue
+                try:
+                    usage = json.loads(resp).get("usage", {})
+                    completion_tokens = usage.get("completion_tokens", 0)
+                    prompt_tokens = usage.get("prompt_tokens")
+                    total_tokens = usage.get("total_tokens")
+                except Exception:
+                    completion_tokens = 0
+                    prompt_tokens = total_tokens = None
+                if not completion_tokens:
+                    cwarn(f"Throughput run {i}/2: response did not include usage.completion_tokens")
+                    continue
+                tps = completion_tokens / elapsed if elapsed > 0 else 0
+                extra = f"  (prompt={prompt_tokens} total={total_tokens})" if prompt_tokens else ""
+                console.print(
+                    f"  Run {i}/2 : {completion_tokens:4d} completion tokens in {elapsed:.2f}s"
+                    f"  =>  {tps:.2f} tok/s{extra}"
+                )
+                ok += 1
+                total_completion += completion_tokens
+                total_elapsed += elapsed
+            if ok:
+                tps = total_completion / total_elapsed if total_elapsed > 0 else 0
+                cpass(f"Average generation throughput: {tps:.2f} completion tokens/sec ({total_completion} tokens across {ok} run(s))")
+            else:
+                cwarn(f"Could not calculate throughput for {first_model}")
+        step()
+
+        # ── 6. Text completion ───────────────────────────────────────────────
+        if first_model and cap_chat:
+            section("6. Text completion  (POST /v1/completions)", color)
+            comp_body = {"model": first_model, "prompt": "The capital of France is", "max_tokens": 20, "temperature": 0}
+            comp_resp = http_post_json(f"{base_url}/v1/completions", comp_body)
+            if not comp_resp:
+                cwarn("/v1/completions not supported or returned no response (expected for chat-only models)")
+            else:
+                try:
+                    comp_text = json.loads(comp_resp)["choices"][0]["text"]
+                except Exception:
+                    comp_text = ""
+                if comp_text:
+                    cpass(f'Text completion succeeded: "The capital of France is{comp_text}"')
+                else:
+                    cwarn("Text completion response malformed (may be unsupported)")
+        step()
+
+        # ── 7. Embeddings (fully skipped for chat-only models) ──────────────
+        if first_model and cap_embed:
+            section("7. Embeddings  (POST /v1/embeddings)", color)
+            emb_resp = http_post_json(f"{base_url}/v1/embeddings", {"model": first_model, "input": "Hello, world!"})
+            if not emb_resp:
+                cfail("No response from /v1/embeddings")
+                result.failures += 1
+            else:
+                try:
+                    emb_len = len(json.loads(emb_resp)["data"][0]["embedding"])
+                except Exception:
+                    emb_len = 0
+                if emb_len > 0:
+                    cpass(f"Embeddings returned vector of length {emb_len}")
+                else:
+                    cfail("Embeddings endpoint responded but no vector returned")
+                    result.failures += 1
+
+            batch_resp = http_post_json(
+                f"{base_url}/v1/embeddings", {"model": first_model, "input": ["Hello, world!", "Goodbye, world!"]}
+            )
+            try:
+                batch_count = len(json.loads(batch_resp)["data"]) if batch_resp else 0
+            except Exception:
+                batch_count = 0
+            if batch_count == 2:
+                cpass("Batch embeddings returned 2 vectors for 2 inputs")
+            else:
+                cwarn(f"Batch embeddings request did not return 2 vectors (got {batch_count})")
+        step()
+
+        # ── 7b. Embedding semantic quality ──────────────────────────────────
+        if first_model and cap_embed:
+            section("7b. Embedding semantic quality", color)
+            sim_resp = http_post_json(
+                f"{base_url}/v1/embeddings",
+                {
+                    "model": first_model,
+                    "input": [
+                        "The cat sat on the mat.",
+                        "A feline rested on the rug.",
+                        "Quantum entanglement defies classical intuition.",
+                    ],
+                },
+            )
+            if not sim_resp:
+                cwarn("Could not fetch vectors for similarity check")
+            else:
+                try:
+                    vecs = [d["embedding"] for d in json.loads(sim_resp)["data"]]
+                    vec_a, vec_b, vec_c = vecs[0], vecs[1], vecs[2]
+                except Exception:
+                    vec_a = vec_b = vec_c = None
+                if vec_a and vec_b and vec_c:
+                    sim_ab = cosine_similarity(vec_a, vec_b)
+                    sim_ac = cosine_similarity(vec_a, vec_c)
+                    cinfo(f"cos(similar pair)   = {sim_ab}")
+                    cinfo(f"cos(unrelated pair) = {sim_ac}")
+                    quality.total += 1
+                    if sim_ab > sim_ac:
+                        cpass("Similar sentences score higher cosine similarity than an unrelated one")
+                        quality.passed += 1
+                    else:
+                        cwarn("Similar sentences did NOT score higher cosine similarity than an unrelated one")
+                else:
+                    cwarn("Could not parse vectors for similarity check")
+        step()
+
+        # ── 8. Model self-description prompts ───────────────────────────────
+        if first_model and cap_chat:
+            section("8. Model self-description prompts", color)
+            for prompt in (
+                "What is your max context window length in tokens?",
+                "List any special capabilities you have, such as vision, code, tool use, or multilingual support.",
+                "What languages can you respond in?",
+            ):
+                body = {"model": first_model, "max_tokens": 1536, "temperature": 0.1, "messages": [{"role": "user", "content": prompt}]}
+                resp = http_post_json(f"{base_url}/v1/chat/completions", body)
+                text = extract_message_text(resp)
+                if text:
+                    console.print(f"  [bold]Q:[/bold] {prompt}")
+                    console.print(f"  A: {text}")
+                    console.print()
+                else:
+                    cwarn(f"No response for: {prompt} (may need a larger max_tokens budget for this reasoning model)")
+        step()
+
+        # ── 9. Streaming check ───────────────────────────────────────────────
+        if first_model and cap_chat:
+            section("9. Streaming  (POST /v1/chat/completions  stream=true)", color)
+            stream_body = {
+                "model": first_model,
+                "max_tokens": 30,
+                "temperature": 0,
+                "stream": True,
+                "messages": [{"role": "user", "content": "Say hello in one sentence."}],
+            }
+            data = json.dumps(stream_body).encode("utf-8")
+            req = urllib.request.Request(
+                f"{base_url}/v1/chat/completions",
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            chunks: list[str] = []
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    for i, raw_line in enumerate(r):
+                        if i >= 5:
+                            break
+                        chunks.append(raw_line.decode("utf-8", "replace").rstrip("\n"))
+            except Exception:
+                pass
+            if any("data:" in c for c in chunks):
+                cpass("Streaming response received (first chunks):")
+                for c in chunks[:3]:
+                    console.print(f"  {c}")
+            else:
+                cwarn("Streaming check inconclusive (may still work — check manually)")
+        step()
+
+        # ══════════════════════════════════════════════════════════════════
+        # MODEL QUALITY & CAPABILITY TESTS (10-30) + CODE GEN SUITE (31-37)
+        # ══════════════════════════════════════════════════════════════════
+        if first_model and cap_chat:
+            qtok = 1024
+
+            section("10. Reasoning  (multi-step logic)", color)
+            r = chat_once(base_url, first_model, "Alice is older than Bob. Carol is younger than Bob. Who is the oldest of the three? Reply with only the name.", qtok)
+            grade("Logical ordering -> Alice", r, "alice", quality)
+            step()
+
+            section("11. Math  (word problem)", color)
+            r = chat_once(base_url, first_model, "A shirt costs $40. It is discounted 25%, then 10% sales tax is added to the discounted price. What is the final price in dollars? Reply with only the number.", qtok)
+            grade("Arithmetic -> 33", r, r"(^|[^0-9.])33([^0-9]|$)", quality)
+            step()
+
+            section("12. Text summarization", color)
+            sum_src = (
+                "Photosynthesis is the process by which green plants, algae, and some bacteria convert "
+                "light energy, usually from the sun, into chemical energy stored in glucose. It takes "
+                "place in the chloroplasts, uses carbon dioxide and water, and releases oxygen as a "
+                "byproduct. This process is the foundation of most food chains on Earth."
+            )
+            r = chat_once(base_url, first_model, f"Summarize the following text in one short sentence:\n\n{sum_src}", qtok)
+            grade("Summary captures the core topic", r, "photosynthes", quality)
+            step()
+
+            section("13. Instruction following  (strict JSON)", color)
+            r = chat_once(base_url, first_model, 'Respond with ONLY minified JSON, no markdown and no code fences, of the exact form {"city":"","country":""} giving the capital of France.', qtok)
+            clean = re.sub(r"```json|```", "", r)
+            json_matches = re.findall(r"\{[^{}]*\}", clean)
+            json_only = json_matches[-1] if json_matches else ""
+            quality.total += 1
+            city_ok = False
+            if json_only:
+                try:
+                    city_ok = "paris" in json.loads(json_only).get("city", "").lower()
+                except Exception:
+                    city_ok = False
+            if city_ok:
+                cpass(f"Valid JSON, city=Paris: {json_only}")
+                quality.passed += 1
+            else:
+                cwarn("Did not return valid JSON with city=Paris")
+                if r:
+                    console.print(f"     got: {r.strip().replace(chr(10), ' ')[:160]}")
+            step()
+
+            section("14. Code generation", color)
+            r = chat_once(base_url, first_model, "Write a Python function named is_prime(n) that returns True if n is prime. Output only the code.", qtok)
+            grade("Defines is_prime()", r, r"def[ \t]+is_prime", quality)
+            step()
+
+            section("15. Factual knowledge", color)
+            r = chat_once(base_url, first_model, "What is the chemical symbol for gold? Reply with only the symbol.", qtok)
+            grade("Gold -> Au", r, r"(^|[^A-Za-z])Au([^A-Za-z]|$)", quality)
+            step()
+
+            section("16. Long-context needle retrieval", color)
+            needle = "PLUM-4417"
+            hay_parts = [f"Log line {i}: routine status nominal, nothing to report. " for i in range(1, 61)]
+            hay_parts.append(f"NOTE: the vault access code is {needle}. ")
+            hay_parts += [f"Log line {i}: routine status nominal, nothing to report. " for i in range(61, 121)]
+            hay = "".join(hay_parts)
+            r = chat_once(base_url, first_model, f"The following is a long log. Find the vault access code buried in it and reply with only the code.\n\n{hay}", qtok)
+            grade(f"Recalled needle {needle}", r, r"PLUM[- ]?4417", quality)
+            step()
+
+            section("17. Translation  (multilingual)", color)
+            r = chat_once(base_url, first_model, "Translate the phrase 'good morning' into French. Reply with only the translation.", qtok)
+            grade("EN->FR 'bonjour'", r, "bonjour", quality)
+            step()
+
+            section("18. Sentiment classification", color)
+            r = chat_once(base_url, first_model, "Classify the sentiment of this review as POSITIVE or NEGATIVE. Reply with one word.\n\nReview: I absolutely loved this movie, it was fantastic and moving!", qtok)
+            grade("Detected POSITIVE", r, "positive", quality)
+            step()
+
+            section("19. Vision / OCR  (multimodal image input)", color)
+            vbody = {
+                "model": first_model,
+                "max_tokens": 64,
+                "temperature": 0,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "What text is written in this image? Reply with only the exact text."},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{OCR_PNG_B64}"}},
+                        ],
+                    }
+                ],
+            }
+            vresp = http_post_json(f"{base_url}/v1/chat/completions", vbody)
+            vtext = extract_message_text(vresp)
+            if not vresp or not vtext:
+                cwarn("Vision not supported by this model (no multimodal image input) — skipped")
+            else:
+                grade("OCR read 'VLLM-OCR-7392'", vtext, r"VLLM[- ]?OCR[- ]?7392|OCR[- ]?7392", quality)
+            step()
+
+            section("20. Audio processing  (speech-to-text)", color)
+            areq = http_post_multipart_audio(
+                f"{base_url}/v1/audio/transcriptions", base64.b64decode(SPEECH_MP3_B64), first_model
+            )
+            if not areq:
+                cwarn("Audio/ASR not supported (no /v1/audio/transcriptions — needs a Whisper/ASR model) — skipped")
+            else:
+                try:
+                    atext = json.loads(areq).get("text", "") or areq
+                except Exception:
+                    atext = areq
+                grade("Transcribed 'the quick brown fox'", atext, "quick|brown|fox", quality)
+            step()
+
+            section("21. Summarization accuracy  (multi-fact article)", color)
+            art21 = (
+                "Meridian County officials confirmed Thursday that engineer Priya Nakamura will lead the "
+                "replacement of the Route 9 bridge, a project expected to cost 12.6 million dollars and "
+                "finish by March 2027. The current bridge, built in 1968, has been restricted to vehicles "
+                "under 10 tons since a 2023 inspection found corrosion in its support beams. Nakamura said "
+                "the new design adds a dedicated bike lane."
+            )
+            r21 = chat_once(
+                base_url, first_model,
+                "Summarize the following article in 2-3 sentences, making sure to include the name of the "
+                f"person leading the project, the total cost, and the expected finish date:\n\n{art21}",
+                qtok,
+            )
+            quality.total += 1
+            if (
+                re.search("nakamura", r21, re.IGNORECASE)
+                and re.search(r"12\.6|12,600,000|\$12", r21, re.IGNORECASE)
+                and re.search("2027", r21, re.IGNORECASE)
+            ):
+                cpass("Summary accurately includes name, cost, and finish date")
+                quality.passed += 1
+            else:
+                cwarn("Summary missing one or more key facts (name=Nakamura, cost=12.6M, date=2027)")
+                if r21:
+                    console.print(f"     got: {r21.strip().replace(chr(10), ' ')[:200]}")
+            step()
+
+            section("22. Counting  (numbers embedded in text)", color)
+            r = chat_once(
+                base_url, first_model,
+                "Count how many numbers in the following list are greater than 50. Reply with only the "
+                "count as a digit.\n\nThe readings were: 12, 87, 34, 91, 56, 3, 68, 45, 72, 19, 50, 99.",
+                qtok,
+            )
+            grade("Correct count of numbers > 50 -> 6", r, r"(^|[^0-9])6([^0-9]|$)", quality)
+            step()
+
+            section("23. Pulling info from a PDF  (extract + summarize)", color)
+            if not PDF_TEXT:
+                cwarn("Skipped — pdftotext not installed locally (used to extract text from the test PDF before sending it to the model)")
+            else:
+                r = chat_once(
+                    base_url, first_model,
+                    "The following text was extracted from a PDF document. Write a one-sentence summary "
+                    f"that includes the confirmation code and the opening date mentioned:\n\n{PDF_TEXT}",
+                    qtok,
+                )
+                quality.total += 1
+                if re.search(r"DOC[- ]?9931[- ]?B", r, re.IGNORECASE) and re.search("november", r, re.IGNORECASE):
+                    cpass(f"Accurately summarized PDF-extracted text (code + date present): {r.strip()[:160]}")
+                    quality.passed += 1
+                else:
+                    cwarn("Summary of PDF-extracted text missing the confirmation code or date")
+                    if r:
+                        console.print(f"     got: {r.strip().replace(chr(10), ' ')[:200]}")
+            step()
+
+            section("24. Table lookup  (structured data)", color)
+            r = chat_once(
+                base_url, first_model,
+                "Here is a small table of quarterly revenue in thousands of dollars:\n\n"
+                "| Quarter | Revenue |\n|---------|---------|\n| Q1 | 120 |\n| Q2 | 145 |\n| Q3 | 98 |\n| Q4 | 210 |\n\n"
+                "Which quarter had the highest revenue? Reply with only the quarter, e.g. Q1.",
+                qtok,
+            )
+            grade("Correctly identifies Q4 as highest", r, "q4", quality)
+            step()
+
+            section("25. Multi-turn context retention", color)
+            body25 = {
+                "model": first_model,
+                "max_tokens": qtok,
+                "temperature": 0,
+                "messages": [
+                    {"role": "user", "content": "My favorite programming language is Rust."},
+                    {"role": "assistant", "content": "Got it, Rust is your favorite programming language."},
+                    {"role": "user", "content": "What did I say my favorite programming language was? Reply with only the name."},
+                ],
+            }
+            resp25 = http_post_json(f"{base_url}/v1/chat/completions", body25)
+            r25 = extract_message_text(resp25)
+            grade("Recalled earlier turn -> Rust", r25, "rust", quality)
+            step()
+
+            section("26. Careful reading  (negation)", color)
+            r = chat_once(base_url, first_model, "Of these three cities — Tokyo, Lima, and Oslo — which one is NOT in the Southern Hemisphere and NOT in Asia? Reply with only the city name.", qtok)
+            grade("Correctly resolves negation -> Oslo", r, "oslo", quality)
+            step()
+
+            section("27. Unit conversion  (numeric tolerance)", color)
+            r = chat_once(base_url, first_model, "Convert 5 miles to kilometers. Reply with only the number, rounded to one decimal place.", qtok)
+            quality.total += 1
+            unit_m = re.search(r"[0-9]+\.[0-9]+", r)
+            if unit_m and 7.8 < float(unit_m.group(0)) < 8.2:
+                cpass(f"5 miles converted within tolerance of 8.0 km (got {unit_m.group(0)})")
+                quality.passed += 1
+            else:
+                cwarn("Unit conversion outside tolerance or unparseable")
+                if r:
+                    console.print(f"     got: {r.strip().replace(chr(10), ' ')[:160]}")
+            step()
+
+            section("28. Date arithmetic", color)
+            r = chat_once(base_url, first_model, "If today is Wednesday, what day of the week will it be in 10 days? Reply with only the day name.", qtok)
+            grade("Correct day -> Saturday", r, "saturday", quality)
+            step()
+
+            section("29. Structured extraction to JSON", color)
+            r = chat_once(
+                base_url, first_model,
+                "Extract the name, email, and phone number from this text as minified JSON with keys "
+                "name, email, phone. No markdown, no code fences.\n\nText: \"Reach out to Marcus Webb at "
+                "marcus.webb@example.com or call 555-201-4488 with any questions.\"",
+                qtok,
+            )
+            clean = re.sub(r"```json|```", "", r)
+            json_matches = re.findall(r"\{[^{}]*\}", clean)
+            json_only = json_matches[-1] if json_matches else ""
+            quality.total += 1
+            fields_ok = False
+            if json_only:
+                try:
+                    d = json.loads(json_only)
+                    fields_ok = "marcus.webb@example.com" in d.get("email", "").lower() and "555-201-4488" in d.get("phone", "")
+                except Exception:
+                    fields_ok = False
+            if fields_ok:
+                cpass(f"Valid JSON with correct email and phone: {json_only}")
+                quality.passed += 1
+            else:
+                cwarn("Structured extraction missing or incorrect fields")
+                if r:
+                    console.print(f"     got: {r.strip().replace(chr(10), ' ')[:200]}")
+            step()
+
+            section("30. Code bug fix", color)
+            r = chat_once(
+                base_url, first_model,
+                "This Python function is supposed to return the sum of a list but has a bug:\n\n"
+                "def total(nums):\n    result = 0\n    for n in nums:\n        result = n\n    return result\n\n"
+                "Reply with only the corrected function.",
+                qtok,
+            )
+            grade("Fixes accumulator bug (result += n or result = result + n)", r, r"result[ \t]*(\+=|=[ \t]*result[ \t]*\+)", quality)
+            step()
+
+            # ── Code generation suite (31-37) ───────────────────────────────
+            code_gen_test(
+                base_url, first_model, "31", "Python3 (basic)",
+                "Write a basic Python3 function named bubble_sort(nums) that sorts a list of integers in "
+                "ascending order using the bubble sort algorithm (do not use sorted() or .sort()). Include "
+                "a short usage example. Provide the code in a single fenced code block with clear, properly "
+                "indented, multi-line formatting and brief comments. No explanation outside the code block.",
+                quality, color,
+            )
+            step()
+
+            code_gen_test(
+                base_url, first_model, "32", "PHP (basic)",
+                "Write a basic PHP script that defines a function calculateFactorial($n) which returns the "
+                "factorial of $n, and then prints the factorial of 5. Include the opening and closing PHP "
+                "tags. Provide the code in a single fenced code block with clear, properly indented, "
+                "multi-line formatting and brief comments. No explanation outside the code block.",
+                quality, color,
+            )
+            step()
+
+            code_gen_test(
+                base_url, first_model, "33", "Bash / Shell scripting (basic)",
+                "Write a basic Bash shell script that loops through the numbers 1 to 20 and prints only the "
+                "even numbers, one per line, with a comment explaining the logic. Provide the code in a "
+                "single fenced code block with clear, properly indented, multi-line formatting. No "
+                "explanation outside the code block.",
+                quality, color,
+            )
+            step()
+
+            code_gen_test(
+                base_url, first_model, "34", "Node.js (basic)",
+                "Write a basic Node.js script, using only built-in core modules (no npm packages), that "
+                "asynchronously reads a file named data.txt and prints its contents to the console, with "
+                "proper error handling for a missing file. Provide the code in a single fenced code block "
+                "with clear, properly indented, multi-line formatting and brief comments. No explanation "
+                "outside the code block.",
+                quality, color,
+            )
+            step()
+
+            code_gen_test(
+                base_url, first_model, "35", "MySQL SELECT with JOINs and GROUP BY (advanced)",
+                "Write an advanced MySQL query that selects each customer's name and their total number of "
+                "orders, joining a customers table (columns: id, name) with an orders table (columns: id, "
+                "customer_id, order_date), grouping by customer, including only customers with more than 3 "
+                "orders, and ordering the results by order count descending. Provide the query in a single "
+                "fenced sql code block, formatted across multiple readable lines with each clause (SELECT, "
+                "FROM, JOIN, GROUP BY, HAVING, ORDER BY) on its own line. No explanation outside the code block.",
+                quality, color,
+            )
+            step()
+
+            code_gen_test(
+                base_url, first_model, "36", "MongoDB query (medium)",
+                "Write a MongoDB query, using mongosh shell syntax, that finds all documents in the products "
+                "collection where price is greater than 50 and category is 'electronics', sorted by price "
+                "descending, returning only the name and price fields. Provide the query in a single fenced "
+                "javascript code block with clear, properly indented, multi-line formatting. No explanation "
+                "outside the code block.",
+                quality, color,
+            )
+            step()
+
+            code_gen_test(
+                base_url, first_model, "37", "JavaScript (medium)",
+                "Write a medium-difficulty JavaScript function named groupByProperty(arr, prop) that takes "
+                "an array of objects and a property name, and returns an object grouping the array elements "
+                "by the value of that property. Include a short example usage with sample output shown as a "
+                "comment. Provide the code in a single fenced code block with clear, properly indented, "
+                "multi-line formatting and brief comments. No explanation outside the code block.",
+                quality, color,
+            )
+            step()
+        else:
+            reason = "no model discovered" if not first_model else "model does not support chat/completions (embedding-only model)"
+            cwarn(f"Skipping capability tests 10-37 — {reason}")
+            progress.update(task, completed=TOTAL_TEST_STEPS)
+            progress.refresh()
+
+        # ── Capability scorecard ────────────────────────────────────────────
+        section(f"Capability Scorecard — {base_url}", color)
+        if first_model:
+            cinfo(f"Model : {first_model}")
+            if quality.total:
+                pct = quality.passed * 100 // quality.total
+                cinfo(f"Quality score : {quality.passed}/{quality.total} graded checks passed ({pct}%)")
+            else:
+                cwarn("No graded checks were run")
+        else:
+            cwarn("No model discovered — nothing to score")
+
+    result.quality_pass = quality.passed
+    result.quality_total = quality.total
+    result.duration_s = time.perf_counter() - start_time
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Roll-up report
+# ─────────────────────────────────────────────────────────────────────────────
+def print_rollup_report(results: list[InstanceResult]) -> None:
+    section("Roll-Up Report")
+    table = Table(box=box.SIMPLE_HEAVY, show_lines=False)
+    table.add_column("Model", style="bold")
+    table.add_column("Instance")
+    table.add_column("Duration", justify="right")
+    table.add_column("Capabilities")
+    table.add_column("Failures", justify="right")
+    table.add_column("Quality Score", justify="right")
+
+    total_duration = 0.0
+    for res, color in zip(results, INSTANCE_COLORS * (len(results) // len(INSTANCE_COLORS) + 1)):
+        total_duration += res.duration_s
+        caps = []
+        if res.cap_chat:
+            caps.append("chat")
+        if res.cap_embed:
+            caps.append("embed")
+        caps_s = "+".join(caps) if caps else ("unreachable" if not res.reachable else "n/a")
+        quality_s = f"{res.quality_pass}/{res.quality_total}" if res.quality_total else "—"
+        fail_style = "bold red" if res.failures else "green"
+        table.add_row(
+            f"[{color}]{res.model}[/{color}]",
+            res.base_url,
+            f"{res.duration_s:.1f}s",
+            caps_s,
+            f"[{fail_style}]{res.failures}[/{fail_style}]",
+            quality_s,
+        )
+    console.print(table)
+    cinfo(f"Total wall-clock time across all instances: {total_duration:.1f}s")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# main
+# ─────────────────────────────────────────────────────────────────────────────
+def main() -> int:
+    parser = argparse.ArgumentParser(description="vLLM smoke test with a Rich UI")
+    parser.add_argument("host", nargs="?", default="localhost")
+    parser.add_argument("port", nargs="?", default=None)
+    args = parser.parse_args()
+
+    console.print()
+    console.print(Rule(f"[bold cyan]tester_vllm.py[/bold cyan]", style="cyan", align="left"))
+    cinfo(f"Author  : {SCRIPT_AUTHOR}")
+    cinfo(f"Version : {SCRIPT_VERSION}")
+    cinfo(f"Updated : {SCRIPT_UPDATED}")
+
+    print_system_hardware()
+
+    section("0. vLLM Instance Discovery")
+    if args.port:
+        cinfo(f"Explicit port supplied — testing only {args.host}:{args.port}")
+        target_ports = [args.port]
+    else:
+        target_ports = discover_instances(args.host)
+
+    if not target_ports:
+        cfail("No vLLM ports discovered — nothing to test.")
+        console.print(f"  Hint: start vLLM, or pass an explicit target: {sys.argv[0]} {args.host} <port>")
+        return 1
+
+    cinfo(f"Will test {len(target_ports)} instance(s) on {args.host}: ports {', '.join(target_ports)}")
+
+    results: list[InstanceResult] = []
+    failures_total = 0
+    for i, port in enumerate(target_ports):
+        color = INSTANCE_COLORS[i % len(INSTANCE_COLORS)]
+        res = run_instance_tests(args.host, port, color)
+        results.append(res)
+        failures_total += res.failures
+
+    print_rollup_report(results)
+
+    section("Summary")
+    cinfo(f"Tested {len(target_ports)} instance(s) on {args.host}: ports {', '.join(target_ports)}")
+    if failures_total == 0:
+        cpass("All critical checks passed across all instances")
+    else:
+        cfail(f"{failures_total} critical check(s) failed across all instances")
+
+    return failures_total
+
+
+if __name__ == "__main__":
+    sys.exit(main())
