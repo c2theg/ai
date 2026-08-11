@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Install & run SearXNG via Docker Compose.
-# By: Christopher Gray / https://github.com/c2theg |  Version: 1.0.28  | Updated: 8/11/2026
+# By: Christopher Gray / https://github.com/c2theg |  Version: 1.0.29  | Updated: 8/11/2026
 #
 # ONE-COMMAND INSTALL — installs Docker if missing, fetches every config file
 # from GitHub, generates the compose stack, starts it and verifies the JSON API:
@@ -395,13 +395,32 @@ log "Pulling images ..."
 # ---------------------------------------------------------------------------
 if [[ $VALIDATE -eq 1 ]]; then
   log "Validating engine references against $IMAGE ..."
-  if ! docker run --rm -i --entrypoint python3 \
-        -v "$INSTALL_DIR/settings.yml:/tmp/settings.yml:ro" \
-        "$IMAGE" - <<'PYCHECK'
-import os, sys, yaml
+
+  # The script is written to a host file and mounted in, rather than piped to
+  # stdin, so the container can choose its own interpreter. PyYAML lives only in
+  # SearXNG's venv (/usr/local/searxng/.venv) — the image's bare `python3` has
+  # no site-packages, so `--entrypoint python3` fails with ModuleNotFoundError.
+  PYCHECK_FILE="$(mktemp)"
+  # mktemp gives 0600 root-only; the container runs as uid 977 and would not be
+  # able to read the mounted script. It holds no secrets.
+  chmod 0644 "$PYCHECK_FILE"
+  cat > "$PYCHECK_FILE" <<'PYCHECK'
+import os, sys
+
+# Exit codes are meaningful to the caller:
+#   0 = clean, 4 = real problems found, anything else = could not validate
+try:
+    import yaml
+except ImportError:
+    print("PyYAML not importable in this interpreter", file=sys.stderr)
+    sys.exit(3)
 
 ENGINE_DIR = "/usr/local/searxng/searx/engines"
 DEFAULTS   = "/usr/local/searxng/searx/settings.yml"
+
+if not os.path.isdir(ENGINE_DIR) or not os.path.isfile(DEFAULTS):
+    print(f"unexpected image layout: {ENGINE_DIR} / {DEFAULTS} missing", file=sys.stderr)
+    sys.exit(3)
 
 modules = {f[:-3] for f in os.listdir(ENGINE_DIR) if f.endswith(".py")}
 with open(DEFAULTS, encoding="utf-8") as fh:
@@ -437,13 +456,35 @@ if problems:
     print(f"{len(problems)} problem(s) found in settings.yml:", file=sys.stderr)
     for p in problems:
         print(f"  - {p}", file=sys.stderr)
-    sys.exit(1)
+    sys.exit(4)
 
 print(f"validated {len(user_engines)} engine override(s) against {len(modules)} engine modules")
 PYCHECK
-  then
-    die "settings.yml references engines this image does not have (see above). Fix it, or re-run with --no-validate."
-  fi
+
+  set +e
+  docker run --rm \
+    -v "$INSTALL_DIR/settings.yml:/tmp/settings.yml:ro" \
+    -v "$PYCHECK_FILE:/tmp/enginecheck.py:ro" \
+    --entrypoint sh "$IMAGE" -c '
+      for py in /usr/local/searxng/.venv/bin/python \
+                /usr/local/searxng/venv/bin/python \
+                python3; do
+        command -v "$py" >/dev/null 2>&1 && exec "$py" /tmp/enginecheck.py
+      done
+      echo "no usable python found in image" >&2
+      exit 3
+    '
+  vrc=$?
+  set -e
+  rm -f "$PYCHECK_FILE"
+
+  case $vrc in
+    0) ;;
+    4) die "settings.yml references engines this image does not have (listed above).
+    Fix the config, or re-run with --no-validate to install anyway." ;;
+    *) warn "Could not run the engine preflight (exit $vrc) — skipping it."
+       warn "Install continues; check afterwards with: docker logs searxng | grep -i engine" ;;
+  esac
 fi
 
 log "Starting the stack ..."
