@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Install & run SearXNG via Docker Compose.
-# By: Christopher Gray / https://github.com/c2theg |  Version: 1.0.29  | Updated: 8/11/2026
+# By: Christopher Gray / https://github.com/c2theg |  Version: 1.0.30  | Updated: 8/11/2026
 #
 # ONE-COMMAND INSTALL — installs Docker if missing, fetches every config file
 # from GitHub, generates the compose stack, starts it and verifies the JSON API:
@@ -132,7 +132,7 @@ fetch_asset() {
   if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/$asset" ]]; then
     log "Using $asset from $SCRIPT_DIR"
     install -m 0644 "$SCRIPT_DIR/$asset" "$dest"
-    SETTINGS_ORIGIN="$SCRIPT_DIR/$asset"
+    ASSET_ORIGIN="$SCRIPT_DIR/$asset"
     return 0
   fi
 
@@ -162,7 +162,7 @@ fetch_asset() {
   fi
   install -m 0644 "$tmp" "$dest"
   rm -f "$tmp"
-  SETTINGS_ORIGIN="$url"
+  ASSET_ORIGIN="$url"
   return 0
 }
 
@@ -241,6 +241,7 @@ elif [[ -n "$SETTINGS_URL" ]]; then
   SETTINGS_ORIGIN="$SETTINGS_URL"
 else
   fetch_asset "$SETTINGS_ASSET" "$INSTALL_DIR/settings.yml" required
+  SETTINGS_ORIGIN="$ASSET_ORIGIN"
 fi
 
 # Sanity-check it actually looks like a SearXNG config before using it.
@@ -265,8 +266,11 @@ fi
 
 # --- limiter.toml -----------------------------------------------------------
 # Optional in the repo; if it is not there, the built-in default below is used.
-if ! fetch_asset "$LIMITER_ASSET" "$INSTALL_DIR/limiter.toml" optional; then
+if fetch_asset "$LIMITER_ASSET" "$INSTALL_DIR/limiter.toml" optional; then
+  LIMITER_ORIGIN="$ASSET_ORIGIN"
+else
   WRITE_DEFAULT_LIMITER=1
+  LIMITER_ORIGIN="built-in default (no $LIMITER_ASSET in $REPO@$REF)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -533,8 +537,12 @@ done
 
 # Surface any engine that failed to register, even on a successful start —
 # SearXNG logs these and carries on, which is how the previous config looked
-# healthy while most of it was dead.
-engine_errors="$(docker logs searxng 2>&1 | grep -c "can't register engine" || true)"
+# healthy while most of it was dead. Name them rather than counting: the count
+# alone says nothing about whether it is benign.
+# Log line: "... ERROR:searx.engines: (PID 42) <name>: can't register engine ..."
+failed_engines="$(docker logs searxng 2>&1 \
+  | sed -nE "s/.*\(PID [0-9]+\) (.+): can.t register engine.*/\1/p" \
+  | sort -u | tr '\n' ' ' || true)"
 
 echo
 if [[ $ok -eq 1 ]]; then
@@ -549,7 +557,7 @@ cat <<EOF
   JSON API       http://${HOST}:${PORT}/search?q=<query>&format=json
   Install dir    $INSTALL_DIR
     settings.yml       <- ${SETTINGS_ORIGIN:-unknown}
-    limiter.toml       <- ${LIMITER_ASSET} (or built-in default)
+    limiter.toml       <- ${LIMITER_ORIGIN:-unknown}
     docker-compose.yml   generated
     .secret_key          generated, preserved across re-runs
     .install-manifest    what was deployed, and from where
@@ -559,11 +567,81 @@ cat <<EOF
     Query URL: http://${HOST}:${PORT}/search?q=<query>&format=json
 EOF
 
-if [[ "$engine_errors" -gt 0 ]]; then
+if [[ -n "${failed_engines// /}" ]]; then
   echo
-  warn "$engine_errors engine(s) failed to register. Two are expected (ahmia, torch —"
-  warn "they are Tor-only and always skipped without a Tor proxy). More than that means"
-  warn "a config problem:  docker logs searxng | grep -i 'engine'"
+  warn "Engines that failed to register: ${failed_engines}"
+  warn "  'ahmia' and 'torch' are Tor-only and always fail without a Tor proxy — ignore those."
+  warn "  Anything else is worth a look:  docker logs searxng | grep -i engine"
+fi
+
+# ---------------------------------------------------------------------------
+# Smoke test — run a real query through the JSON API and report what came back.
+# A 200 response is not proof of a working install: SearXNG answers happily with
+# zero results if every engine is failing, which is exactly the failure mode
+# this whole config rewrite was about.
+# ---------------------------------------------------------------------------
+if [[ $ok -eq 1 ]]; then
+  echo
+  log "Running a test search ..."
+  TEST_JSON="$(curl -fsS --max-time 45 --get \
+      --data-urlencode 'q=anthropic claude' \
+      --data-urlencode 'format=json' \
+      "http://127.0.0.1:${PORT}/search" 2>/dev/null || true)"
+
+  if [[ -z "$TEST_JSON" ]]; then
+    warn "The test search returned nothing. Try it by hand:"
+    warn "  curl -s 'http://127.0.0.1:${PORT}/search?q=test&format=json' | head -c 400"
+  elif command -v python3 >/dev/null 2>&1; then
+    # The response travels in an env var, not on stdin, because stdin is already
+    # carrying the program itself via the heredoc. That also keeps the Python
+    # free of shell-quoting hazards.
+    SEARXNG_TEST_JSON="$TEST_JSON" python3 - <<'PYSMOKE'
+import json, os
+
+raw = os.environ.get("SEARXNG_TEST_JSON", "")
+try:
+    d = json.loads(raw)
+except Exception as exc:
+    print(f"  could not parse the JSON response: {exc}")
+    raise SystemExit(0)
+
+results = d.get("results", [])
+engines = sorted({e for r in results for e in (r.get("engines") or [])})
+dead    = d.get("unresponsive_engines") or []
+
+print(f"  results returned : {len(results)}")
+line = f"  engines answering: {len(engines)}"
+if engines:
+    line += "  (" + ", ".join(engines[:12]) + ")"
+print(line)
+
+for r in results[:3]:
+    print("    - " + (r.get("title") or "").strip()[:68])
+
+if dead:
+    print(f"  engines erroring : {len(dead)}")
+    for entry in dead[:8]:
+        if isinstance(entry, (list, tuple)):
+            pair = list(entry) + ["", ""]
+            name, reason = pair[0], pair[1]
+        else:
+            name, reason = entry, ""
+        print(f"    ! {name}: {reason}")
+
+if not results:
+    print("  NO RESULTS — every engine failed or was filtered out.")
+    print("  Check:  docker logs searxng | grep -iE 'engine|error'")
+PYSMOKE
+  else
+    # python3 absent: fall back to a crude but dependency-free count.
+    hits="$(printf '%s' "$TEST_JSON" | grep -o '"url"' | wc -l | tr -d ' ')"
+    log "  test search returned roughly $hits result URLs"
+  fi
+
+  echo
+  echo "  Test it yourself any time:"
+  echo "    curl -s 'http://127.0.0.1:${PORT}/search?q=test&format=json' | python3 -m json.tool | head -40"
+  echo "    curl -s 'http://127.0.0.1:${PORT}/search?q=test&format=json' | python3 -c 'import json,sys; print(len(json.load(sys.stdin)[\"results\"]), \"results\")'"
 fi
 
 if [[ $ok -ne 1 ]]; then
