@@ -22,7 +22,7 @@ INSTALL_DIR="/opt/searxng"
 SETTINGS_URL="https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/searxng_settings.yml"
 # Local settings file; if set (via --settings) it wins over downloading.
 SETTINGS_SRC=""
-PORT="8040"
+PORT="7042"
 HOST="0.0.0.0"
 IMAGE="searxng/searxng:latest"
 UNINSTALL=0
