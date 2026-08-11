@@ -1,0 +1,40 @@
+# SearXNG limiter / botdetection config.
+# Deployed by install_searxng.sh to /opt/searxng/limiter.toml -> /etc/searxng/limiter.toml
+#
+# Two reasons this file exists even though server.limiter is false in
+# searxng_settings.yml:
+#   1. SearXNG logs "missing config file: /etc/searxng/limiter.toml" on every
+#      boot without it.
+#   2. The trusted_proxies default of ['127.0.0.0/8', '::1'] makes the
+#      botdetection WSGI middleware expect an X-Forwarded-For / X-Real-IP
+#      header on loopback requests. Docker's userland port proxy makes
+#      published-port traffic arrive from 127.0.0.1 inside the container, so
+#      that header is never set and you get:
+#        ERROR:searx.botdetection: X-Forwarded-For nor X-Real-IP header is set!
+#      An empty list is correct while the container is published directly.
+#
+# If you put nginx / Traefik / a load balancer in front of SearXNG, add that
+# proxy's network back to trusted_proxies or the limiter will rate-limit every
+# client as if they were one IP.
+
+[botdetection]
+
+ipv4_prefix = 32
+ipv6_prefix = 48
+
+trusted_proxies = [
+  # '172.16.0.0/12',   # docker bridge networks
+  # '10.0.0.0/8',
+]
+
+[botdetection.ip_limit]
+
+filter_link_local = false
+link_token = false
+
+[botdetection.ip_lists]
+
+block_ip = []
+pass_ip = []
+
+pass_searxng_org = true
