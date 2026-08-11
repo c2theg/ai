@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
 #
 # Install & run SearXNG via Docker Compose.
-# By: Christopher Gray / https://github.com/c2theg |  Version: 0.0.27  | Updated: 8/11/2026
+# By: Christopher Gray / https://github.com/c2theg |  Version: 1.0.28  | Updated: 8/11/2026
 #
-# Install:
-#   wget https://raw.githubusercontent.com/c2theg/ai/main/install_searxng.sh && chmod u+x install_searxng.sh && sudo ./install_searxng.sh
+# ONE-COMMAND INSTALL — installs Docker if missing, fetches every config file
+# from GitHub, generates the compose stack, starts it and verifies the JSON API:
 #
-# Companion files pulled from the same repo (c2theg/ai, flat layout):
-#   searxng_settings.yml   -> /opt/searxng/settings.yml   (required)
-#   searxng_limiter.toml   -> /opt/searxng/limiter.toml   (optional, has a built-in default)
-# A copy of either sitting next to this script always wins over the download.
+#   curl -fsSL https://raw.githubusercontent.com/c2theg/ai/main/install_searxng.sh | sudo bash
+#
+#
+# Everything ends up in /opt/searxng, pulled from c2theg/ai (flat layout):
+#   searxng_settings.yml -> /opt/searxng/settings.yml         (required)
+#   searxng_limiter.toml -> /opt/searxng/limiter.toml         (optional, built-in default)
+#   install_searxng.sh   -> /opt/searxng/install_searxng.sh   (copy of this script)
+#   generated            -> docker-compose.yml, .secret_key, .install-manifest
+#
+# When run from a file, a copy of an asset sitting next to this script wins over
+# the download. When piped, sibling lookup is disabled and everything comes from
+# the repo — re-running is safe and idempotent (the secret_key is preserved).
 #
 # Usage:
 #   sudo ./install_searxng.sh                  # fetch config from GitHub, install, start
@@ -68,7 +76,15 @@ while [[ $# -gt 0 ]]; do
     --no-validate) VALIDATE=0;       shift   ;;
     --offline)    OFFLINE=1;         shift   ;;
     -h|--help)
-      grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -n 24
+      # Print the comment header verbatim, up to the first line of code, so the
+      # help text can never drift out of sync with a hard-coded line count.
+      if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
+        awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "${BASH_SOURCE[0]}"
+      else
+        echo "Usage: curl -fsSL <raw-url>/install_searxng.sh | sudo bash"
+        echo "Flags: --repo --ref --settings --url --dir --port --host --image"
+        echo "       --offline --no-validate --uninstall"
+      fi
       exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
@@ -79,7 +95,26 @@ warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 [[ -n "$RAW_BASE" ]] || RAW_BASE="https://raw.githubusercontent.com/${REPO}/${REF}"
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# When the script is piped (curl ... | sudo bash) there is no directory to look
+# in: $0 is "bash" and dirname resolves to $PWD, which is wherever the user
+# happened to be standing. Picking up a stale searxng_settings.yml from there
+# would silently override the repo copy, so sibling lookup is disabled entirely
+# in that mode and everything comes from GitHub.
+if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
+  SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  SCRIPT_PATH="$SCRIPT_DIR/$(basename -- "${BASH_SOURCE[0]}")"
+else
+  SCRIPT_DIR=""
+  SCRIPT_PATH=""
+fi
+
+# fetch_asset reports where it got a file via ASSET_ORIGIN; callers copy that
+# into their own variable so errors and the closing summary can name the real
+# source instead of always blaming the repo.
+ASSET_ORIGIN=""
+SETTINGS_ORIGIN=""
+LIMITER_ORIGIN=""
 
 # ---------------------------------------------------------------------------
 # fetch_asset <repo-filename> <destination> <required|optional>
@@ -94,14 +129,17 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 fetch_asset() {
   local asset="$1" dest="$2" mode="${3:-required}" url tmp
 
-  if [[ -f "$SCRIPT_DIR/$asset" ]]; then
+  if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/$asset" ]]; then
     log "Using $asset from $SCRIPT_DIR"
     install -m 0644 "$SCRIPT_DIR/$asset" "$dest"
+    SETTINGS_ORIGIN="$SCRIPT_DIR/$asset"
     return 0
   fi
 
   if [[ $OFFLINE -eq 1 ]]; then
-    [[ "$mode" == "required" ]] && die "--offline given but $asset is not next to the script ($SCRIPT_DIR)."
+    if [[ "$mode" == "required" ]]; then
+      die "--offline was given but $asset is not available locally${SCRIPT_DIR:+ (looked in $SCRIPT_DIR)}."
+    fi
     return 1
   fi
 
@@ -124,6 +162,7 @@ fetch_asset() {
   fi
   install -m 0644 "$tmp" "$dest"
   rm -f "$tmp"
+  SETTINGS_ORIGIN="$url"
   return 0
 }
 
@@ -181,11 +220,16 @@ fi
 # ---------------------------------------------------------------------------
 log "Creating $INSTALL_DIR ..."
 mkdir -p "$INSTALL_DIR"
+# settings.yml has to stay readable by the container's non-root searxng user, so
+# the secret is protected by the directory mode rather than the file mode. Bind
+# mounts are resolved by the daemon as root, so 0750 here does not block Docker.
+chmod 0750 "$INSTALL_DIR"
 
 # --- settings.yml -----------------------------------------------------------
 if [[ -n "$SETTINGS_SRC" ]]; then
   log "Copying local settings into $INSTALL_DIR/settings.yml ..."
   install -m 0644 "$SETTINGS_SRC" "$INSTALL_DIR/settings.yml"
+  SETTINGS_ORIGIN="$SETTINGS_SRC"
 elif [[ -n "$SETTINGS_URL" ]]; then
   # --url bypasses the repo layout entirely.
   tmp="$(mktemp)"
@@ -194,6 +238,7 @@ elif [[ -n "$SETTINGS_URL" ]]; then
     || die "Failed to download settings from $SETTINGS_URL"
   install -m 0644 "$tmp" "$INSTALL_DIR/settings.yml"
   rm -f "$tmp"
+  SETTINGS_ORIGIN="$SETTINGS_URL"
 else
   fetch_asset "$SETTINGS_ASSET" "$INSTALL_DIR/settings.yml" required
 fi
@@ -210,9 +255,12 @@ grep -qE '^use_default_settings:' "$INSTALL_DIR/settings.yml" \
 stale_engines="$(grep -oE '^[[:space:]]*engine:[[:space:]]*(xml_feed|yahoo_finance|tradingview|phind|reddit)[[:space:]]*$' \
   "$INSTALL_DIR/settings.yml" | awk '{print $2}' | sort -u | tr '\n' ' ' || true)"
 if [[ -n "${stale_engines// /}" ]]; then
-  die "settings.yml references engines that no longer exist: ${stale_engines}
-    You are installing the old revision. Push the current searxng_settings.yml to
-    $REPO (ref: $REF), or pass --settings /path/to/searxng_settings.yml."
+  rm -f "$INSTALL_DIR/settings.yml"
+  die "This is an outdated settings.yml — it references engines that no longer exist:
+      ${stale_engines}
+    Source was: ${SETTINGS_ORIGIN:-unknown}
+    If that is a local file, delete it (or pass --settings with the current one)
+    so the copy in $REPO@$REF is used instead."
 fi
 
 # --- limiter.toml -----------------------------------------------------------
@@ -224,13 +272,31 @@ fi
 # ---------------------------------------------------------------------------
 # Inject a fresh secret_key (never ship the committed placeholder to prod)
 # ---------------------------------------------------------------------------
-NEW_SECRET="$(openssl rand -hex 32)"
-if grep -qE '^\s*secret_key:' "$INSTALL_DIR/settings.yml"; then
-  sed -i.bak -E "s|^(\s*secret_key:).*|\1 \"${NEW_SECRET}\"|" "$INSTALL_DIR/settings.yml"
-  rm -f "$INSTALL_DIR/settings.yml.bak"
-  log "Generated a fresh secret_key."
+# The secret is kept out of band in $INSTALL_DIR/.secret_key and re-applied on
+# every run. settings.yml is overwritten from the repo each time, so without
+# this a re-run would mint a new key and invalidate every existing session.
+SECRET_FILE="$INSTALL_DIR/.secret_key"
+if [[ -s "$SECRET_FILE" ]]; then
+  SECRET="$(< "$SECRET_FILE")"
+  log "Reusing the existing secret_key from $SECRET_FILE"
 else
-  warn "No secret_key line found — leaving settings.yml untouched."
+  SECRET="$(openssl rand -hex 32)"
+  ( umask 077; printf '%s\n' "$SECRET" > "$SECRET_FILE" )
+  log "Generated a fresh secret_key."
+fi
+chmod 0600 "$SECRET_FILE"
+
+if grep -qE '^[[:space:]]*secret_key:' "$INSTALL_DIR/settings.yml"; then
+  sed -i.bak -E "s|^([[:space:]]*secret_key:).*|\1 \"${SECRET}\"|" "$INSTALL_DIR/settings.yml"
+  rm -f "$INSTALL_DIR/settings.yml.bak"
+else
+  die "settings.yml has no secret_key line to replace — refusing to start with the shipped placeholder."
+fi
+
+# Verify the substitution actually landed — a silently-unreplaced placeholder
+# would ship a known secret_key to production.
+if grep -q 'CHANGE_ME_AT_INSTALL_TIME' "$INSTALL_DIR/settings.yml"; then
+  die "Failed to inject the secret_key into settings.yml — refusing to start."
 fi
 
 # ---------------------------------------------------------------------------
@@ -384,29 +450,95 @@ log "Starting the stack ..."
 ( cd "$INSTALL_DIR" && docker compose up -d )
 
 # ---------------------------------------------------------------------------
-# Health check
+# Make the install directory self-contained
+#
+# A copy of this script lands next to the config it produced, so --uninstall and
+# re-runs work from $INSTALL_DIR without fetching anything. The manifest records
+# what was deployed and from where — useful when a later `docker compose pull`
+# changes behaviour and you need to know which ref you were on.
+# ---------------------------------------------------------------------------
+if [[ -n "$SCRIPT_PATH" && "$SCRIPT_PATH" != "$INSTALL_DIR/install_searxng.sh" ]]; then
+  install -m 0755 "$SCRIPT_PATH" "$INSTALL_DIR/install_searxng.sh"
+elif [[ -z "$SCRIPT_PATH" && $OFFLINE -eq 0 ]]; then
+  # Piped run: pull a copy of ourselves so the install dir is still complete.
+  curl -fsSL -H 'Cache-Control: no-cache' "$RAW_BASE/install_searxng.sh" \
+    -o "$INSTALL_DIR/install_searxng.sh" 2>/dev/null \
+    && chmod 0755 "$INSTALL_DIR/install_searxng.sh" || true
+fi
+
+{
+  printf 'installed_at   = %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  printf 'repo           = %s\n' "$REPO"
+  printf 'ref            = %s\n' "$REF"
+  printf 'settings_from  = %s\n' "${SETTINGS_ORIGIN:-unknown}"
+  printf 'image          = %s\n' "$IMAGE"
+  printf 'listen         = %s:%s\n' "$HOST" "$PORT"
+  printf 'settings_sha256= %s\n' "$(sha256sum "$INSTALL_DIR/settings.yml" | awk '{print $1}')"
+  printf 'limiter_sha256 = %s\n' "$(sha256sum "$INSTALL_DIR/limiter.toml" | awk '{print $1}')"
+} > "$INSTALL_DIR/.install-manifest"
+chmod 0644 "$INSTALL_DIR/.install-manifest"
+
+# ---------------------------------------------------------------------------
+# Health check — poll the JSON API, since that is what OpenWebUI actually calls
 # ---------------------------------------------------------------------------
 log "Waiting for SearXNG to answer ..."
 ok=0
 for _ in $(seq 1 30); do
-  if curl -fsS "http://127.0.0.1:${PORT}/" >/dev/null 2>&1; then ok=1; break; fi
+  if curl -fsS "http://127.0.0.1:${PORT}/search?q=test&format=json" >/dev/null 2>&1; then
+    ok=1; break
+  fi
   sleep 2
 done
 
+# Surface any engine that failed to register, even on a successful start —
+# SearXNG logs these and carries on, which is how the previous config looked
+# healthy while most of it was dead.
+engine_errors="$(docker logs searxng 2>&1 | grep -c "can't register engine" || true)"
+
 echo
 if [[ $ok -eq 1 ]]; then
-  log "SearXNG is up: http://${HOST}:${PORT}/  (JSON API: http://${HOST}:${PORT}/search?q=test&format=json)"
+  log "SearXNG is up."
 else
-  warn "SearXNG did not respond yet. Check logs:  cd $INSTALL_DIR && docker compose logs -f searxng"
+  warn "SearXNG did not answer within 60s."
 fi
 
 cat <<EOF
 
-Manage the stack:
-  cd $INSTALL_DIR
-  docker compose ps            # status
-  docker compose logs -f       # tail logs
-  docker compose restart       # after editing settings.yml
-  docker compose down          # stop
-  sudo $0 --uninstall          # remove
+  URL            http://${HOST}:${PORT}/
+  JSON API       http://${HOST}:${PORT}/search?q=<query>&format=json
+  Install dir    $INSTALL_DIR
+    settings.yml       <- ${SETTINGS_ORIGIN:-unknown}
+    limiter.toml       <- ${LIMITER_ASSET} (or built-in default)
+    docker-compose.yml   generated
+    .secret_key          generated, preserved across re-runs
+    .install-manifest    what was deployed, and from where
+
+  OpenWebUI -> Admin Settings -> Web Search
+    Engine: searxng
+    Query URL: http://${HOST}:${PORT}/search?q=<query>&format=json
+EOF
+
+if [[ "$engine_errors" -gt 0 ]]; then
+  echo
+  warn "$engine_errors engine(s) failed to register. Two are expected (ahmia, torch —"
+  warn "they are Tor-only and always skipped without a Tor proxy). More than that means"
+  warn "a config problem:  docker logs searxng | grep -i 'engine'"
+fi
+
+if [[ $ok -ne 1 ]]; then
+  echo
+  warn "Check the logs:  cd $INSTALL_DIR && docker compose logs -f searxng"
+  exit 1
+fi
+
+cat <<EOF
+
+  Manage the stack:
+    cd $INSTALL_DIR
+    docker compose ps                          # status
+    docker compose logs -f searxng             # tail logs
+    docker compose restart searxng             # after editing settings.yml
+    docker compose down                        # stop
+    sudo $INSTALL_DIR/install_searxng.sh            # re-pull config & restart
+    sudo $INSTALL_DIR/install_searxng.sh --uninstall # remove
 EOF
