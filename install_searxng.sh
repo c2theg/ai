@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Install & run SearXNG via Docker Compose.
-# By: Christopher Gray / https://github.com/c2theg |  Version: 1.0.30  | Updated: 8/11/2026
+# By: Christopher Gray / https://github.com/c2theg |  Version: 1.0.31  | Updated: 8/11/2026
 #
 # ONE-COMMAND INSTALL — installs Docker if missing, fetches every config file
 # from GitHub, generates the compose stack, starts it and verifies the JSON API:
