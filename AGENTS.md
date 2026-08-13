@@ -2,6 +2,8 @@
 
 These instructions apply to the entire repository. More-specific `AGENTS.md`
 files add or override guidance within their directory trees.
+author: Christopher Gray | url: github.com/c2theg | version: 0.0.46 | updated: 8/13/2026
+
 
 ## Requirement Language and Priority
 
