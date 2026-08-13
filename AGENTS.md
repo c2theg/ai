@@ -53,6 +53,31 @@ conflict.
 - [WORK-07] Present alternatives only when a real decision remains. Summarize
   material benefits, costs, risks, and the recommended choice.
 
+## Multi-Agent Work
+
+- [TEAM-01] When the harness supports delegation, use multiple agents only for
+  two or more bounded workstreams whose expected benefit exceeds coordination
+  and integration cost. Read `.agent/workflows/multi-agent.md` first.
+- [TEAM-02] The coordinating agent owns decomposition, dependency ordering,
+  task contracts, integration, final validation, and the user-facing result.
+- [TEAM-03] Parallelize independent research, disjoint component changes, and
+  isolated test shards. Serialize decisions or work where one result determines
+  the next step, agents would edit the same files, or shared state is mutated.
+- [TEAM-04] Prefer a hybrid sequence: parallel reconnaissance, one coordinated
+  design decision, parallel implementation only across stable boundaries,
+  serialized integration, parallel safe checks, then one final acceptance gate.
+- [TEAM-05] Give each delegated task an objective, owned paths, read-only paths,
+  inputs, dependencies, constraints, expected output, and completion checks.
+- [TEAM-06] In a shared workspace, assign one write owner per file or use isolated
+  worktrees. Agents MUST NOT overwrite, revert, or reformat another agent's work.
+- [TEAM-07] Delegation never broadens task scope, permissions, credentials, or
+  authorization. Subagents must follow all applicable repository instructions.
+- [TEAM-08] Do not create nested subagents unless the coordinator explicitly
+  authorizes it and the additional work is independently bounded.
+- [TEAM-09] Before completion, the coordinator reviews every contribution,
+  resolves interface conflicts, runs integration checks, and reports any skipped
+  work or unresolved risk.
+
 ## Permissions and Destructive Actions
 
 - [SAFE-01] Harness approval and sandbox policies control whether an operation
