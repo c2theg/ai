@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.3.28  |  Update: 8/8/2026
+# Christopher Gray  |  Version: 0.3.29  |  Update: 8/14/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
 #   curl -fsSL -o 'install_ai_spark_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark_vllm.sh' && chmod u+x install_ai_spark_vllm.sh
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4:8011,Qwen3-Reranker-4B:8010"
 #   ./install_ai_spark_vllm.sh --start "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16:8006,Qwen3-Reranker-4B:8010"
-#   
+#
 #   ./install_ai_spark_vllm.sh --start "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8:8018,Qwen3-Reranker-4B:8010"
 #   ./install_ai_spark_vllm.sh --start "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4:8019,Qwen3-Reranker-4B:8010"
 
@@ -18,7 +18,7 @@
 #
 # Move to DGX Spark / GB10:
 #   scp install_ai_spark_vllm.sh root@<dgx-ip>:/home/user/install_ai_spark_vllm.sh
-#   
+#
 #   scp install_ai_spark_vllm.sh user@10.11.1.10:/home/user/install_ai_spark_vllm.sh
 #
 # Usage:
@@ -59,6 +59,16 @@
 #   (interactive) or reclaims it only from a prior vLLM process (headless).
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.3.29  8/14/2026
+#   - Added Qwen/Qwen3.8-27B (BF16, dense, native text/image/video model) with a
+#     DGX Spark serve profile. Interactive runs ask whether to enable text-only,
+#     image, or video input, then ask "Thinking [y/N]" (default off). Text-only
+#     uses --language-model-only to avoid loading the vision encoder; image/video
+#     modes restrict vLLM to the chosen modality. The thinking selection becomes
+#     a server-wide chat-template default, with qwen3 reasoning parsing enabled
+#     only when thinking is selected. Headless/cron starts stay prompt-free and
+#     default to text-only with thinking disabled.
 #
 # v0.3.28  8/8/2026
 #   - Reorganized the catalog's menu grouping: the "General"/"Coding"/"Reasoning"
@@ -827,6 +837,8 @@ MDL_VRAM=()
 MDL_PORT=()
 MDL_CAT=()
 MDL_SLEEP=()
+MDL_INPUT_MODE=()      # Qwen3.8 runtime choice: text | image | video
+MDL_THINKING=()        # Qwen3.8 runtime choice: true | false
 MDL_PORT_EXPLICIT=()   # [idx]=1 when a --start "model:PORT" pinned this model's port
                        # (pinned models are exempt from sequential re-assignment)
 
@@ -933,6 +945,14 @@ _add "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4"        "Nemotron-3-Na
 # memory pressure versus the 65536 / 0.82 profile.
 #        HF Repo                                Local Dir                       Display Name                              Disk VRAM  Port  Category
 _add "nvidia/Gemma-4-31B-IT-NVFP4"            "Gemma-4-31B-IT-NVFP4"         "Gemma 4 31B IT (NVFP4, nvidia)"          24   56   8001  "Dense Models"
+
+# ── Qwen3.8 dense multimodal model ───────────────────────────────────────────────────────────
+# Native 262144-token text/image/video model. The interactive serve flow asks
+# which input path to load and whether thinking should be enabled. It is appended
+# to preserve every existing catalog index.
+# https://huggingface.co/Qwen/Qwen3.8-27B
+#        HF Repo                  Local Dir        Display Name                    Disk VRAM  Port  Category
+_add "Qwen/Qwen3.8-27B"         "Qwen3.8-27B"    "Qwen3.8-27B (BF16, multimodal)"  56   75   8023  "Dense Models"
 
 MODEL_TOTAL=${#MDL_HF[@]}
 
@@ -1423,6 +1443,61 @@ _checkbox_menu() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Qwen3.8 can skip its vision tower entirely or load exactly one visual input
+# path. Headless runs cannot prompt, so environment variables provide optional
+# overrides while retaining deterministic text/no-thinking defaults:
+#   QWEN38_INPUT_MODE=image QWEN38_THINKING=true ./... --start Qwen3.8-27B
+_configure_qwen38() {
+    local idx input_choice thinking_choice input_mode thinking
+    for idx in "${RUN_SELECTED[@]+${RUN_SELECTED[@]}}"; do
+        [ "${MDL_HF[$idx]}" = "Qwen/Qwen3.8-27B" ] || continue
+
+        if [ "$HEADLESS" -eq 1 ]; then
+            input_mode="${QWEN38_INPUT_MODE:-text}"
+            thinking="${QWEN38_THINKING:-false}"
+            case "$input_mode" in
+                text|image|video) ;;
+                *) echo "⚠️  Invalid QWEN38_INPUT_MODE='$input_mode'; using text."; input_mode=text ;;
+            esac
+            case "$thinking" in
+                true|false) ;;
+                1|yes|y|Y|TRUE|True) thinking=true ;;
+                0|no|n|N|FALSE|False) thinking=false ;;
+                *) echo "⚠️  Invalid QWEN38_THINKING='$thinking'; using false."; thinking=false ;;
+            esac
+        else
+            echo ""
+            echo "  ── Qwen3.8-27B options ─────────────────────────────────────────────"
+            echo "  Input types:"
+            echo "    1) Text only (default)"
+            echo "    2) Image Input"
+            echo "    3) Video input"
+            while true; do
+                printf "  Select input type [1]: "
+                read -r input_choice
+                case "$input_choice" in
+                    ""|1|text|Text) input_mode=text; break ;;
+                    2|image|Image)   input_mode=image; break ;;
+                    3|video|Video)   input_mode=video; break ;;
+                    *) echo "  ⚠️  Enter 1, 2, or 3." ;;
+                esac
+            done
+
+            printf "  Thinking [y/N]: "
+            read -r thinking_choice
+            if [[ "$thinking_choice" =~ ^[Yy]$ ]]; then
+                thinking=true
+            else
+                thinking=false
+            fi
+        fi
+
+        MDL_INPUT_MODE[$idx]="$input_mode"
+        MDL_THINKING[$idx]="$thinking"
+        echo "  Qwen3.8-27B: input=$input_mode, thinking=$thinking"
+    done
+}
+
 # VRAM PRE-FLIGHT CHECK
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2825,6 +2900,10 @@ else
     _check_vram
 fi
 
+# Ask Qwen3.8-specific questions only when that model was selected. In headless
+# mode this applies prompt-free defaults (or the documented env overrides).
+_configure_qwen38
+
 # Assign predictable sequential ports (BASE_PORT, +1, …) in launch order.
 _assign_sequential_ports
 
@@ -3671,6 +3750,54 @@ _serve_model() {
     [ "${MDL_PORT[$idx]}" = "0" ] && return 0
 
     case "${MDL_HF[$idx]}" in
+
+    # Native Qwen3.8 dense vision-language model. The catalog checkpoint is BF16
+    # (~56 GB on disk); 0.62 of a DGX Spark's ~121 GB pool leaves room for the
+    # model, selected encoder path, and a practical 32K KV cache. The model card
+    # advertises 262K native context, available for a solo deployment with:
+    #   QWEN38_MAX_MODEL_LEN=262144 ./install_ai_spark_vllm.sh --start Qwen3.8-27B
+    # Interactive choices were captured by _configure_qwen38. Text-only avoids
+    # loading the vision encoder; the visual modes admit only the chosen type.
+    "Qwen/Qwen3.8-27B")
+        local -a _qwen38_input_args=() _qwen38_thinking_args=()
+        case "${MDL_INPUT_MODE[$idx]:-text}" in
+            image)
+                _qwen38_input_args=(--limit-mm-per-prompt '{"image":1,"video":0}')
+                ;;
+            video)
+                _qwen38_input_args=(--limit-mm-per-prompt '{"image":0,"video":1}')
+                ;;
+            *)
+                _qwen38_input_args=(--language-model-only)
+                ;;
+        esac
+        if [ "${MDL_THINKING[$idx]:-false}" = "true" ]; then
+            _qwen38_thinking_args=(
+                --reasoning-parser qwen3
+                --default-chat-template-kwargs '{"enable_thinking":true}'
+            )
+        else
+            _qwen38_thinking_args=(
+                --default-chat-template-kwargs '{"enable_thinking":false}'
+            )
+        fi
+        _vllm_launch "$idx" \
+            --served-model-name "Qwen3.8-27B" \
+            --dtype auto \
+            --tensor-parallel-size 1 \
+            --gpu-memory-utilization 0.62 \
+            --max-model-len "${QWEN38_MAX_MODEL_LEN:-32768}" \
+            --max-num-seqs 4 \
+            --max-num-batched-tokens 8192 \
+            --kv-cache-dtype fp8 \
+            --enable-chunked-prefill \
+            --enable-prefix-caching \
+            --enable-auto-tool-choice \
+            --tool-call-parser qwen3_coder \
+            --trust-remote-code \
+            "${_qwen38_input_args[@]+"${_qwen38_input_args[@]}"}" \
+            "${_qwen38_thinking_args[@]+"${_qwen38_thinking_args[@]}"}"
+        ;;
 
     "Qwen/Qwen3.6-35B-A3B-FP8")
         _vllm_launch "$idx" \
