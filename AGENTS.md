@@ -2,7 +2,7 @@
 
 These instructions apply to the entire repository. More-specific `AGENTS.md`
 files add or override guidance within their directory trees.
-author: Christopher Gray | url: github.com/c2theg | version: 0.0.46 | updated: 8/13/2026
+author: Christopher Gray | url: github.com/c2theg | version: 0.0.52 | updated: 8/13/2026
 
 
 ## Requirement Language and Priority
@@ -24,13 +24,14 @@ conflict.
 
 ## Repository Scope
 
-- The main PHP application is under `site_data/`.
-- `containers/`, `services/`, `ws/`, and `other_websites/` contain separate
-  deployable components. Inspect their local documentation and manifests before
-  changing them.
-- Treat paths containing `vendor/`, `node_modules/`, `_backups/`,
-  `BACKUP-To_DELETE/`, generated files, and third-party distributions as
-  read-only unless the task explicitly targets them.
+- Treat the directory containing this `AGENTS.md` as the repository root. Unless
+  stated otherwise, all paths in these instructions are relative to that root;
+  `/` does not mean the operating system's filesystem root.
+- Inspect the repository structure, local documentation, and manifests before
+  assuming an application layout or changing a component.
+- Treat dependency, generated, cache, build-output, backup, and third-party
+  paths (for example, `vendor/` and `node_modules/`) as read-only unless the
+  task explicitly targets them.
 - Read the nearest applicable `AGENTS.md` before editing files in a nested
   directory.
 
@@ -46,10 +47,13 @@ conflict.
 - [WORK-04] Ask a clarifying question only when the answer materially changes
   the implementation, security boundary, persistent data, production target, or
   irreversible outcome. Otherwise state a reasonable assumption and proceed.
-- [WORK-05] Give a concise plan before changes involving authentication,
-  authorization, persistent-data schemas, public APIs, deployments, or multiple
-  components. A plan is not an approval gate unless the action itself requires
-  approval.
+- [WORK-05] Before implementing any change, MUST create a concise tracked plan
+  whose steps are specific enough for another agent to resume. Use the harness's
+  planning mechanism when available and keep it current as work proceeds: mark
+  completed steps, record which checks passed or failed, and note blockers,
+  changed files, and remaining work. If work stops because of a token or context
+  limit, the current plan MUST provide a usable handoff. A plan is not an
+  approval gate unless the action itself requires approval.
 - [WORK-06] When a user is dissatisfied with an approach, stop repeating it,
   re-check evidence and assumptions, and propose a materially different path.
 - [WORK-07] Present alternatives only when a real decision remains. Summarize
