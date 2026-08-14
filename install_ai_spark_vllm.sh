@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.3.29  |  Update: 8/14/2026
+# Christopher Gray  |  Version: 0.3.31  |  Update: 8/14/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
 #   curl -fsSL -o 'install_ai_spark_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark_vllm.sh' && chmod u+x install_ai_spark_vllm.sh
-#   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4:8011,Qwen3-Reranker-4B:8010"
-#   ./install_ai_spark_vllm.sh --start "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16:8006,Qwen3-Reranker-4B:8010"
+#   ./install_ai_spark_vllm.sh --start "Qwen3.8-27B-FP8,Qwen3-Embedding-4B"
+#   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3-Embedding-4B"
+#   ./install_ai_spark_vllm.sh --start "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16,Qwen3-Reranker-4B"
 #
-#   ./install_ai_spark_vllm.sh --start "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8:8018,Qwen3-Reranker-4B:8010"
-#   ./install_ai_spark_vllm.sh --start "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4:8019,Qwen3-Reranker-4B:8010"
+#   ./install_ai_spark_vllm.sh --start "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8,Qwen3-Reranker-4B"
+#   ./install_ai_spark_vllm.sh --start "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4,Qwen3-Reranker-4B"
 
-#   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-FP8:8006,Qwen3-Reranker-4B:8010"
-#   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4:8006,Qwen3-Reranker-4B:8010"
-#   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4:8006"
-#   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4:8010,Qwen3.6-27B-NVFP4:8011"
-#   ./install_ai_spark_vllm.sh --start "Gemma-4-31B-IT-NVFP4:8001"
+#   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-FP8,Qwen3-Reranker-4B"
+#   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3-Reranker-4B"
+#   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4"
+#   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3.6-27B-NVFP4"
+#   ./install_ai_spark_vllm.sh --start "Gemma-4-31B-IT-NVFP4"
 #
 # Move to DGX Spark / GB10:
 #   scp install_ai_spark_vllm.sh root@<dgx-ip>:/home/user/install_ai_spark_vllm.sh
@@ -50,15 +51,32 @@
 #   ./install_ai_spark_vllm.sh --list-models           — print the servable-model catalog and exit
 #   ./install_ai_spark_vllm.sh --health                — report which served models are up, and exit
 #
-#   Ports: served models get SEQUENTIAL ports in launch order starting at
-#   BASE_PORT (default 8006) — 1st model → 8006, 2nd → 8007, and so on — so the
-#   same launch order always yields the same ports. Pin a specific model with
-#   "model:PORT" (e.g. --start "Qwen3-Reranker-4B:8021"); pinned ports are kept
-#   and skipped over by the sequential counter. Before binding, the script checks
+#   Ports/names: non-embedding models get sequential ports from BASE_PORT
+#   (default 8006): port 8006 is always served as "primary", port 8007 as
+#   "secondary". Embedding models use their own sequence from port 8010 and are
+#   always served as "embedding1", "embedding2", etc. Pin a specific model with
+#   "model:PORT"; embedding pins must be >= 8010. Pinned ports are kept and
+#   skipped over by both allocators. Before binding, the script checks
 #   whether a port is already in use, shows what holds it, and offers to kill it
 #   (interactive) or reclaims it only from a prior vLLM process (headless).
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.3.31  8/14/2026
+#   - Added Qwen/Qwen3.8-27B-FP8 (official fine-grained 128x128 block-FP8
+#     quantization) as a 31 GB download / ~51 GB DGX Spark serve profile. It
+#     shares Qwen3.8's interactive text/image/video and thinking controls, uses
+#     automatic FP8 detection, FP8 KV cache, qwen3 reasoning parsing, qwen3_coder
+#     tool parsing, and a 0.42 memory reservation with a practical 32K default
+#     context (QWEN38_MAX_MODEL_LEN still enables the native 262144 context).
+#
+# v0.3.30  8/14/2026
+#   - Added stable, port-role vLLM aliases. The model assigned to port 8006 is
+#     always exposed as "primary", port 8007 as "secondary", with deterministic
+#     names for later/custom ports. Embedding models now have an independent port
+#     sequence beginning at 8010 and stable aliases "embedding1", "embedding2",
+#     etc. _vllm_launch replaces every profile-specific --served-model-name so
+#     retries and future catalog entries cannot accidentally expose a model name.
 #
 # v0.3.29  8/14/2026
 #   - Added Qwen/Qwen3.8-27B (BF16, dense, native text/image/video model) with a
@@ -133,417 +151,7 @@
 #     model's _vllm_launch call (prefix-assignment on the call, not a global
 #     export), so it can't leak into any other model's launch.
 #
-# v0.3.25  8/1/2026
-#   - The venv rebuild worked — flashinfer/cutlass-dsl/quack/torch/GPU preflight
-#     all passed cleanly. Nemotron then hit a completely different, non-
-#     environment bug: "AssertionError: In Mamba cache align mode, block_size
-#     (2128) must be <= max_num_batched_tokens (2048)". Nemotron-3-Nano is a
-#     hybrid Mamba/attention architecture; with --enable-prefix-caching on, vLLM
-#     computes a Mamba-aligned KV block_size from the model's state layout and
-#     REQUIRES max_num_batched_tokens >= that value. None of the three
-#     Nemotron-3-Nano-Omni catalog entries (BF16/FP8/NVFP4) or the plain
-#     Nemotron-3-Nano-30B-A3B-NVFP4 entry set --max-num-batched-tokens, so
-#     vLLM's own default (2048) was too small. Fixed all four with
-#     --max-num-batched-tokens 4096 (clears the observed 2128 with headroom).
-#   - Added a general auto-repair for this failure class in
-#     _diagnose_and_repair: parses "block_size (N) must be <= max_num_batched_
-#     tokens (M)" from the log, computes a safe value (N rounded up to the next
-#     1024), and retries the SAME model with --max-num-batched-tokens overridden
-#     — not a venv reinstall, since this is a launch-args problem. Covers future
-#     Mamba-hybrid catalog entries or context-length changes that shift the
-#     required block_size past whatever constant is hardcoded.
-#   - This required a new mechanism: _VLLM_ARG_OVERRIDE lets a repair inject
-#     extra CLI args into the retry (argparse keeps the last value of a repeated
-#     flag, so an appended override wins over the catalog's own args). Verified
-#     the array plumbing is nounset-safe for an EMPTY override too — bash's
-#     `${arr[@]}` on a legitimately-empty array throws "unbound variable" under
-#     `set -u` on bash <4.4; guarded with the `${arr[@]+"${arr[@]}"}` idiom at
-#     every expansion site (this script's `set -uo pipefail` needs it even
-#     though Ubuntu 24.04 ships bash 5.2, which alone would not hit this).
-#
-# v0.3.24  8/1/2026
-#   - Found the real ThrMma culprit, from the engine traceback v0.3.22 started
-#     printing. cutlass-dsl was never the mismatch: a clean reinstall at BOTH
-#     vLLM's pin (4.6.0) and the latest PyPI release (4.6.1) still lacked
-#     cutlass.cute.core.ThrMma, proving no published cutlass-dsl has that symbol.
-#     The traceback named the actual cause: NVIDIA's `quack` kernel library
-#     (imported by vllm/model_executor/kernels/linear/cute_dsl/ll_bf16.py)
-#     references cute.core.ThrMma in a type annotation, evaluated at import
-#     time — quack itself is the stale/mismatched package.
-#   - Added _repair_symbol_consumer as the next playbook tier after
-#     _repair_cutlass_stack: when the symbol-defining package checks out clean
-#     at every version, parse the engine traceback for the last non-
-#     infrastructure site-packages/<pkg>/ frame (the code that actually
-#     REFERENCES the symbol), map it to its distribution name via
-#     importlib.metadata.packages_distributions, and reinstall that fresh —
-#     letting pip's resolver reconcile it against whatever cutlass-dsl is
-#     already installed, rather than guessing versions ourselves. Verified
-#     against the exact missing attribute, not a bare import.
-#     Ladder is now: cutlass-dsl repair → symbol-consumer repair → retry →
-#     full venv rebuild → final retry.
-#
-# v0.3.23  8/1/2026
-#   - Final escalation tier: automatic venv rebuild. When a model dies with an
-#     environment-shaped error (missing symbol / import error / invisible GPU —
-#     explicitly NOT out-of-memory) and the targeted repair + retry did not fix
-#     it, _rebuild_vllm_venv moves vllm-install aside to .broken-<timestamp>,
-#     re-runs the DGX Spark vendor installer in the correct parent directory,
-#     verifies the fresh venv (vllm imports AND torch sees the GPU), and retries
-#     the model one final time. On any rebuild failure the old env is restored.
-#     Gated by AUTO_REBUILD_VENV (default true) and a 24h loop-guard stamp so a
-#     non-venv failure can't loop 15-minute builds on cron restarts.
-#     Rationale: per-package surgery on a venv this far off the vendor state is
-#     guesswork; the vendor build is the tested GB10 combination.
-#   - FORCE_VLLM_REINSTALL now works with --start/--serve-only. It previously
-#     lived only in the full-install branch, which those modes skip entirely —
-#     the flag was unreachable from the normal restart command.
-#
-# v0.3.22  8/1/2026
-#   - ThrMma, round three — with evidence this time. v0.3.21's clean rebuild ran,
-#     verified, retried… and still crashed, which proves a PRISTINE
-#     nvidia-cutlass-dsl[cu13]==4.6.0 does not provide cutlass.cute.core.ThrMma.
-#     The orphan-files theory is dead: vLLM's ==4.6.0 pin is metadata-stale — the
-#     code path that executes (flashinfer 0.6.14's cute-dsl kernels, own
-#     requirement just >=4.5.0) was written against a newer cutlass API.
-#   - _repair_cutlass_stack now parses the EXACT missing symbol from the crash
-#     ("module 'X' has no attribute 'Y'") and verifies repairs with getattr —
-#     `import cutlass.cute.core` passes in every version and proved nothing,
-#     which is how v0.3.21 declared success on a broken install. If a clean
-#     install at vLLM's pin still lacks the symbol, it escalates to the latest
-#     cutlass-dsl and keeps it only when the symbol appears. Runtime
-#     compatibility beats metadata: the override is recorded in
-#     $VENV/.cutlass-dsl-override and _align_vllm_pins skips cutlass while it
-#     exists, so the next preflight can't tug-of-war the fix back down.
-#   - Repair also purges JIT/compile caches (~/.cache/flashinfer, ~/.cache/vllm,
-#     /tmp/torchinductor_*) — generated code survives every pip operation and
-#     keeps referencing whatever cutlass API existed when it was generated.
-#   - _show_log_tail now prints the EngineCore traceback frames (ERROR lines
-#     tagged [core.py:NNN]) — they name WHICH file raised, e.g. who is calling a
-#     missing symbol. All day we have known WHAT was missing but never WHO
-#     wanted it; that gap is why root-causing took multiple rounds.
-#
-# v0.3.21  8/1/2026
-#   - Added a post-mortem playbook with ONE automatic retry. When a model dies
-#     during load, _diagnose_and_repair matches the log against failure signatures
-#     the script knows (corrupted cutlass-dsl install, flashinfer version skew,
-#     GPU not visible), runs the matching repair, and relaunches the model once.
-#     This replaces the pattern of a human reading the traceback and running the
-#     fix by hand — the crash names the broken subsystem; fix it, retry.
-#   - Added _repair_cutlass_stack for "module 'cutlass.cute.core' has no attribute
-#     'ThrMma'" persisting across ALL version combinations. Root cause: repeated
-#     in-place install/upgrade/downgrade of nvidia-cutlass-dsl leaves orphaned files
-#     in the `cutlass` package dir (pip removes only what the outgoing RECORD lists),
-#     so version-correct metadata sits on a mixed package directory and Python
-#     imports the stale files. Repair: uninstall all five cutlass-dsl dists, DELETE
-#     leftover cutlass* dirs from site-packages, reinstall vLLM's exact pin with
-#     extras intact, verify `import cutlass.cute.core`.
-#   - _align_vllm_pins: compare PUBLIC versions so torchaudio 2.11.0+cu130 satisfies
-#     ==2.11.0 instead of being flagged as drift (the constraints file blocked any
-#     damage, but the report was wrong); torch/torchvision/torchaudio now skipped
-#     outright — the constraints file owns them.
-#   - _vllm_launch now rotates the previous vllm-<port>.log to .log.old at launch.
-#     Headless mode skips the interactive clean-start wipe, so logs accumulated
-#     across runs and the root-cause extractor kept greping exceptions from OLD
-#     crashes (the stale pids in earlier output). On a playbook retry the failed
-#     log is likewise moved aside so the retry's diagnosis is clean.
-#
-# v0.3.20  8/1/2026
-#   - Added _align_vllm_pins(): reconciles EVERY unsatisfied "==" pin vLLM declares,
-#     not just flashinfer. Special-casing flashinfer was too narrow — the same drift
-#     hit nvidia-cutlass-dsl (4.6.1 installed, with its cu13 libs stranded at 4.6.0,
-#     while vllm 0.26.0 pins nvidia-cutlass-dsl[cu13]==4.6.0) and apache-tvm-ffi.
-#     That drift surfaces as a missing symbol deep in engine startup —
-#     "module 'cutlass.cute.core' has no attribute 'ThrMma'" — not as a version
-#     error, which is what made it so hard to place.
-#     Extras are preserved in the install spec (nvidia-cutlass-dsl[cu13]==4.6.0, not
-#     the bare name); installing without the extra is exactly what leaves a split
-#     base/cu13 install behind. Runs under the torch constraints file, before the
-#     flashinfer pass so flashinfer still gets the final say on its own packages.
-#     LIMITATION: only exact "==" pins are reconciled. Range requirements (vLLM's
-#     setuptools<81, numba's numpy<2.5) are reported by `pip check` but not auto-
-#     fixed, since resolving ranges risks more collateral than it prevents.
-#
-# v0.3.19  8/1/2026
-#   - Corrected the flashinfer guard's core premise. flashinfer-cubin is an OPTIONAL
-#     prebuilt-kernel cache, not a required sibling — so "align the trio" was the
-#     wrong goal whenever vLLM's pin has no cubin wheel. vllm 0.26.0 pins
-#     flashinfer-python==0.6.14 and nvidia-cutlass-dsl[cu13]==4.6.0; no cubin 0.6.14
-#     was ever published because that install has no cubin. Downgrading
-#     flashinfer-python to 0.6.13 to match a stale cubin (v0.3.14–0.3.18 behavior)
-#     produced the next failure instead: 0.6.13 calls cutlass.cute.core.ThrMma, which
-#     nvidia-cutlass-dsl 4.6.0 does not expose, killing EngineCore at model load.
-#     The guard now REMOVES cubin and honors vLLM's pin, only laddering down if that
-#     also fails. First launch then JIT-compiles kernels (slower once, then cached).
-#
-# v0.3.18  7/31/2026
-#   - flashinfer reconciliation now uses a pip CONSTRAINTS file instead of --no-deps.
-#     --no-deps was too blunt: it did stop pip replacing NVIDIA's DGX Spark torch, but
-#     it also stopped pip adjusting flashinfer's SIBLING packages. Pinning
-#     flashinfer-python down from 0.6.14 to 0.6.13 that way left nvidia-cutlass-dsl at
-#     the version 0.6.14 wanted, and the engine then died at model-load time with
-#       AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'
-#     — flashinfer calling a CuTe DSL API its sibling no longer exposed. Introduced by
-#     the v0.3.14 guard; this is the fix. New _torch_constraints_file pins the
-#     installed torch/torchvision/torchaudio (local segment stripped, so 2.11.0
-#     still matches the 2.11.0+cu130 NVIDIA wheel) and lets the resolver correct
-#     everything else.
-#   - Torch rollback/restore still uses --no-deps deliberately: there the goal IS to
-#     move torch alone without cascading into the rest of the stack.
-#
-# v0.3.17  7/31/2026
-#   - Full install no longer re-runs the DGX Spark vendor installer when a working
-#     vLLM venv already exists. That installer builds its venv at ./vllm-install
-#     RELATIVE TO CWD and compiles Triton from source (~10 min, ~1 GB) — so running
-#     the script from a new directory produced a second venv at a path the venv
-#     search did not even look in, and the entire build was discarded. Override with
-#     FORCE_VLLM_REINSTALL=true.
-#   - Added "$PWD/vllm-install/.vllm" to the venv search list, so a venv the vendor
-#     installer just created in the current directory is found instead of orphaned.
-#   - Banner version is now parsed from the header comment instead of being a second
-#     hand-maintained copy. It had drifted to "0.3.12 / 7/15/2026" while the header
-#     was several versions ahead, making a freshly-copied script look stale.
-#   - flashinfer: when vLLM pins a companion version that was never PUBLISHED, say so
-#     instead of printing a remediation command that cannot succeed. vllm 0.26.0 pins
-#     flashinfer-python==0.6.14 but flashinfer-cubin stops at 0.6.13 upstream, so the
-#     trio correctly settles at 0.6.13 and the old advice told the user to run an
-#     install that always fails. Detected via pip's "No matching distribution found".
-#
-# v0.3.16  7/31/2026
-#   - flashinfer reconciliation now targets the version vLLM actually PINS, read
-#     from vllm's own metadata (importlib.metadata.requires), instead of whatever
-#     flashinfer-python happens to be installed. Aligning the trio to each other is
-#     enough to make `import flashinfer` succeed, but it can settle on a version
-#     vLLM does not want — observed in the wild as a venv self-consistent at 0.6.13
-#     while vllm 0.26.0 required 0.6.14: it imported fine, served fine, and `pip
-#     check` flagged it as broken. Falls back to the old behavior when vLLM declares
-#     no pin. If the pinned version has no wheels, it ladders down (vLLM's pin →
-#     installed flashinfer-python → a companion's version) and WARNS instead of
-#     failing, since a self-consistent trio does run.
-#   - _repair_gpu_driver no longer swallows modprobe's error. "Module nvidia not
-#     found in directory /lib/modules/<kver>" / "Invalid module format" / "Key was
-#     rejected by service" each name the cause outright; discarding that message is
-#     what made this failure feel unexplainable.
-#   - _repair_gpu_driver now distinguishes "no nvidia module exists for the running
-#     kernel" (modinfo finds nothing) from a version mismatch, prints the running
-#     kernel, and lists which kernels DO have a DKMS-built module — so "you booted a
-#     kernel the driver was never built for" is visible rather than inferred.
-#
-# v0.3.15  7/31/2026
-#   - GPU visibility guard for "RuntimeError: Failed to infer device type" (with
-#     "Can't initialize NVML" / "0 active driver(s) found" / "No CUDA runtime is
-#     found" above it). vLLM instantiates a default VllmConfig just to BUILD its CLI
-#     parser, and DeviceConfig.__post_init__ probes for a device — so with no visible
-#     GPU it dies during argument parsing, before any model or memory is involved.
-#     New _preflight_gpu() splits the two root causes that log identically:
-#       • DRIVER DOWN — nvidia-smi also fails. Attempts modprobe of the nvidia
-#         modules, then compares the running driver (/proc/driver/nvidia/version)
-#         against the installed one (modinfo); a mismatch means the module was built
-#         for a different kernel and is reported with the dkms/reboot fix rather
-#         than guessed at.
-#       • TORCH BLIND — nvidia-smi works but the venv's torch has no CUDA runtime,
-#         i.e. its wheel was replaced. Restored automatically from TORCH_STAMP.
-#     nvidia-smi's exit status is what separates them. torch.version.cuda (build
-#     metadata, driver-independent) is what distinguishes a clobbered wheel from a
-#     driver outage — torch.cuda.is_available() cannot, since it is False for both.
-#   - _maybe_update_vllm now snapshots torch before pip runs and rolls it back
-#     automatically if the upgrade strips CUDA support (pip resolves torch against
-#     PyPI, which does not carry NVIDIA's DGX Spark aarch64+CUDA build).
-#   - AUTO_UPDATE_VLLM default flipped true → false. It ran an unpinned
-#     `pip install -U vllm` on EVERY restart including cron @reboot, against the
-#     exact build the script's own comments say not to replace. The rollback above
-#     makes turning it back on much safer, but off is the right default here.
-#   - Added AUTO_REPAIR_GPU (default true), AUTO_REPAIR_TORCH (default false — it
-#     re-runs the vendor curl|bash installer, not something to fire unattended),
-#     and TORCH_STAMP recording the last known-good CUDA-capable torch.
-#
-# v0.3.14  7/31/2026
-#   - Fixed the flashinfer version-skew crash. flashinfer is three separately
-#     versioned PyPI packages (flashinfer-python / -cubin / -jit-cache) that refuse
-#     to import unless all three match. `pip install -U vllm` bumps flashinfer-python
-#     only, so AUTO_UPDATE_VLLM silently broke the NEXT serve with "flashinfer-cubin
-#     version (0.6.13) does not match flashinfer version (0.6.14)". vLLM imports
-#     flashinfer from Sampler.__init__, so EngineCore died in init_device() — it
-#     looked like an OOM (and sent us chasing --gpu-memory-utilization) but no GPU
-#     memory had been allocated yet.
-#     New _fix_flashinfer_versions() reconciles the trio automatically (aligns the
-#     companions up to flashinfer-python, or pins flashinfer-python back down when
-#     no matching companion wheel exists), using --no-deps so pip cannot clobber the
-#     hardware-specific DGX Spark build. Called after every vLLM install/upgrade.
-#   - Added _preflight_vllm_stack(), run before the serve section in all modes:
-#     advisory `pip check` for dependency conflicts, the flashinfer self-heal, then
-#     an `import vllm` gate. Environment breakage is reported once, up front, with
-#     the real exception — instead of N identical 200-line EngineCore tracebacks
-#     buried in per-port logs that the clean-start step then wipes.
-#     The flashinfer result is gated separately from the vLLM import: `import vllm`
-#     succeeds even with a broken flashinfer (vLLM only reaches for it later, in the
-#     engine subprocess), so trusting the vLLM import alone would still green-light
-#     a doomed serve.
-#   - Added PREFLIGHT_STRICT (default true): a failed pre-flight aborts BEFORE the
-#     clean-start block. That block kills every running vLLM process, so continuing
-#     into a serve that cannot work would tear down healthy models and leave nothing
-#     in their place. Override for one run with
-#     PREFLIGHT_STRICT=false ./install_ai_spark_vllm.sh -s
-#
-# v0.3.12  7/15/2026
-#   - Lowered the Gemma-4-31B-IT-NVFP4 serve profile for text-only use:
-#     --language-model-only, 32768 context, 0.46 gpu-memory-utilization,
-#     max-num-seqs 1, fp8 KV cache with scale calculation, prefix caching, and
-#     chunked prefill. Pin it with :8001 when you want NVIDIA's example port.
-#
-# v0.3.11  7/15/2026
-#   - Sequential served-model ports now start at 8006 instead of 8010. Headless
-#     --start order already controlled launch order; the interactive serve menu
-#     now also preserves the order models are toggled on, so the first chosen
-#     model gets 8006, the second gets 8007, etc. Pinned model:PORT specs still
-#     keep their explicit port and are skipped by the sequential allocator.
-#
-# v0.3.10  7/15/2026
-#   - Added nvidia/Gemma-4-31B-IT-NVFP4 to the download/serve catalog. It uses
-#     the NVIDIA ModelOpt NVFP4 vLLM profile. The later v0.3.12 profile lowers
-#     context/utilization for text-only DGX Spark use.
-#
-# v0.3.7  7/14/2026
-#   - Added nvidia/Qwen3.6-27B-NVFP4 to the download/serve catalog. It serves
-#     with the current HF ModelOpt profile (modelopt v0.45 / NVFP4 1.0),
-#     Qwen3 reasoning parser support, and a conservative 0.25
-#     gpu-memory-utilization profile so it can co-run with
-#     Qwen3.6-35B-A3B-NVFP4 (0.30) on a DGX Spark shared-memory pool. The HF
-#     model card advertises up to 262144 context; this script defaults lower for
-#     co-residency but exposes QWEN36_27B_MAX_MODEL_LEN to raise it for solo runs.
-#
-# v0.3.6  7/11/2026
-#   - Added two quantized builds of the Omni reasoning model:
-#     nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8  (port 8018, ~34 GB) and
-#     nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4 (port 8019, ~20 GB).
-#     FP8 serves with --quantization modelopt @ 0.35 util; NVFP4 with
-#     --quantization modelopt_fp4 @ 0.20 util. Both --trust-remote-code like the
-#     BF16 build. Serve via --start with their local dir name or catalog index.
-#
-# v0.3.5  7/11/2026
-#   - NVFP4 kernel-compile fix. On Blackwell (GB10, sm_121) FlashInfer JIT-compiles
-#     ~29 CUTLASS GEMM kernels on first NVFP4/FP8 launch; ninja defaults to one
-#     compile per core (~20) and each nvcc needs several GB, so the compiler was
-#     OOM-killed ("Killed") and the engine died. Now: export MAX_JOBS (default 4)
-#     + NVCC_THREADS=1 to cap parallelism; detect and export CUDA_HOME/PATH so
-#     nvcc is found (and warn if it isn't); raise the readiness wait to
-#     VLLM_READY_TIMEOUT (default 1800s) since the one-time compile can take
-#     10-30 min (cached under /root/.cache/flashinfer afterward).
-#
-# v0.3.4  7/11/2026
-#   - Auto-update vLLM (AUTO_UPDATE_VLLM=true): before serving, the script checks
-#     PyPI for a newer vLLM and upgrades the venv if one is out (version-aware, so
-#     it never downgrades a local nightly). Runs in every mode; best-effort so a
-#     network error just logs and continues. Set false to pin the installed
-#     version. Motivation: NVFP4 MoE checkpoints (Qwen3.6-35B-A3B-NVFP4) fail on
-#     vLLM 0.20.2 with "KeyError: '…experts.w2_input_scale'" — newer vLLM adds the
-#     modelopt NVFP4 expert-scale support.
-#   - Failure diagnostics: _show_log_tail now extracts the real "ClassName:
-#     message" exception line (last one, minus vLLM's generic wrapper) instead of
-#     the earliest error-ish line, which had false-matched the huge INFO config
-#     dump on substrings like device_config=cuda.
-#
-# v0.3.3  7/11/2026
-#   - Qwen3-Reranker-4B is no longer pre-selected — DEFAULT_DL_INDICES and
-#     DEFAULT_SERVE_INDICES are now empty, so nothing auto-starts; pick models in
-#     the menus or with --start. Dropped the "★Default" label.
-#   - RIGHT-SIZED --gpu-memory-utilization for the small models. The old values
-#     were oversized on a false premise ("raise the fraction to clear the
-#     all-process baseline"): the fraction is how much of the 121.7 GB pool THIS
-#     model reserves and must be free at startup, so a big fraction on a small
-#     model both wastes RAM and fails to start when memory is tight. The 4B
-#     reranker at 0.55 was holding ~68 GB. New values (approx GB on a 121 GB box):
-#       Qwen3-Reranker-4B 0.55→0.12 (~15), Qwen3-Embedding-4B 0.60→0.10 (~12),
-#       bge-m3 0.45→0.06 (~7), bge-reranker-v2-m3 0.45→0.06 (~7),
-#       Qwen3.5-4B 0.50→0.12 (~15), Qwen3.5-2B 0.45→0.08 (~10),
-#       Qwen3.5-9B 0.75→0.20 (~24).
-#   - Pre-flight memory check: before launching, the script compares the model's
-#     reservation (fraction × total) against free RAM and, if it won't fit, prints
-#     an actionable message (free memory or lower the fraction) instead of letting
-#     vLLM crash with the cryptic "Free memory … less than desired" ValueError.
-#     Headless skips a doomed launch; interactive asks before trying.
-#
-# v0.3.2  7/11/2026
-#   - Predictable ports: served models are now assigned SEQUENTIAL ports in
-#     launch order from BASE_PORT — so the same selection always maps to the
-#     same ports (was: fixed per-model catalog
-#     ports). Pin one with "model:PORT"; pinned ports are kept and skipped over.
-#     A port map is printed before serving.
-#   - Port-in-use guard: before a model binds its port, the script detects any
-#     existing listener (lsof/ss/fuser), prints what it is, and — interactively —
-#     asks whether to kill it; headless mode reclaims the port only if a prior
-#     vLLM process holds it, else skips that model (never kills other services).
-#   - Health check: after serving, an explicit UP / NOT-READY line per model with
-#     its /v1/models test command and log path. New `--health` flag re-runs the
-#     check standalone (probes catalog + BASE_PORT block); good for cron/monitoring.
-#   - Auto-download (AUTO_DOWNLOAD=true): if a selected model is missing on disk
-#     when it's time to serve it, the script downloads it first (HF CLI + HF_TOKEN)
-#     instead of skipping — works in --serve-only and headless --start too.
-#   - Failure diagnostics: on a model that dies during load, _show_log_tail now
-#     prints a longer tail AND greps the whole log for the earliest error, since
-#     vLLM's "Engine core initialization failed. See root cause above" hides the
-#     real cause far above the shown traceback.
-#   - Self-update line switched from `curl | bash` to `curl -o … && chmod` so it
-#     replaces the saved local copy instead of executing the download.
-#
-# v0.3.0  7/11/2026
-#   - Added nvidia/Qwen3.6-35B-A3B-NVFP4  (catalog idx 22, port 8016, ~22 GB)
-#     and unsloth/Qwen3.6-35B-A3B-NVFP4-Fast (catalog idx 23, port 8017, ~22 GB).
-#     NVFP4 (4-bit) halves the FP8 footprint — both use --quantization modelopt_fp4.
-#   - Headless startup mode: --start "model[:port],..." serves 1+ models with NO
-#     prompts (skips install, menus, memory prompts, docker containers, OpenWebUI).
-#     Models are matched by local dir name, HF repo id, or catalog index; an
-#     optional :port overrides the catalog port. Designed for cron @reboot.
-#   - --install-cron <spec> writes the @reboot crontab entry for you (and
-#     --remove-cron deletes it). --list-models prints the catalog and exits.
-#   - REFACTOR: replaced the ~280 lines of per-index `if is_run_selected N`
-#     serve blocks with one _serve_model() dispatching on the HF repo id, plus a
-#     single loop over RUN_SELECTED. Serve args can no longer silently mis-map
-#     when catalog indices shift (the v0.1.5 bug class is now impossible).
-#   - BUGFIX (found during refactor): Qwen3.5-9B is really catalog idx 19 (its
-#     _add line sits before the two appended ASR entries), but its serve block
-#     checked idx 21 — so selecting 9B launched NOTHING, and selecting
-#     Qwen3-ASR-1.7B (really idx 21) launched the 9B serve args. Fixed
-#     automatically by the repo-id dispatch above.
-#   - _vllm_launch: readiness poll now hits /health (cheaper than /v1/models)
-#     every 5s instead of every 15s, printing progress every 30s — small models
-#     become ready up to ~14s sooner; log noise unchanged.
-#   - _kill_vllm_processes now also kills a previous run's sleep_watchdog.sh so
-#     watchdogs no longer stack across restarts.
-#   - Removed dead helpers is_dl_selected/is_run_selected (unused after refactor).
-#
-# v0.2.9  6/27/2026
-#   - Per-model sleep prompt: replaced the single "Standard models timeout"
-#     prompt with a prompt for every selected servable model. Default shown in
-#     brackets is the catalog SLEEP_MIN override if set, else IDLE_SLEEP_MINUTES.
-#     User can set a different idle-sleep timeout for each model before serving.
-#
-# v0.2.8  6/27/2026
-#   - Sequential model startup: _vllm_launch now polls GET /v1/models after
-#     launch and blocks until the model reports ready (or 12-minute timeout).
-#     Each model fully loads before the next one starts, so later models see a
-#     stable baseline when the KV-cache profiler runs — no more OOM from racing
-#     concurrent startups. Also detects if the process dies mid-load and prints
-#     the tail of the log immediately.
-#   - Qwen3.5-9B gpu-memory-utilization raised 0.50 → 0.75 and max-model-len
-#     capped at 16384. When Nemotron-3-Nano-Omni-30B (~62 GB) is already loaded,
-#     0.75×121=90.75 GB budget leaves ~10 GB for KV cache after 9B weights.
-#
-# v0.2.7  6/26/2026
-#   - Raised Qwen3-Reranker-4B gpu-memory-utilization 0.50 → 0.55. With more
-#     models now loaded concurrently (4B/2B/9B small models), the KV-cache
-#     profiler baseline crept to ~61.2 GB — just 0.71 GB over the 60.5 GB
-#     budget at 0.50. New 0.55 budget (66.6 GB) gives ~5 GB KV headroom.
-#
-# v0.2.6  6/26/2026
-#   - Fixed HF repo IDs for small Qwen3.5 dense models: Qwen/Qwen3.5-4B-Instruct
-#     and Qwen/Qwen3.5-2B-Instruct → Qwen/Qwen3.5-4B and Qwen/Qwen3.5-2B
-#     (the repos have no -Instruct suffix). Updated catalog, local dirs,
-#     serve block --served-model-name args, and changelog refs.
-#   - Fixed download loop to check exit code: now prints ❌ on failure instead of
-#     falsely printing ✅ regardless of whether huggingface-cli succeeded.
-#   - Added Qwen/Qwen3.5-9B (catalog idx 21, port 8015, ~18 GB VRAM)
-#     with SLEEP_MIN=60 (same idle-sleep pattern as the 2B/4B small models).
-#
+
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ─── strict mode ──────────────────────────────────────────────────────────────
@@ -662,13 +270,13 @@ BOOT_MODEL_SPEC_FILE="$BASE_DIR/.boot-model-spec"
 # =============================================
 # PREDICTABLE SERVE PORTS
 # =============================================
-# Served models are assigned sequential ports in launch order starting here:
-# the 1st served model gets BASE_PORT, the 2nd BASE_PORT+1, and so on. This
-# overrides each model's catalog port so the same launch order always yields the
-# same ports. A per-model port pinned with `--start model:PORT` is respected and
-# skipped over. Before binding, the script checks whether the port is already in
-# use, shows what holds it, and (interactively) offers to kill it.
+# Non-embedding models are assigned sequential ports in launch order starting
+# here. Embedding models have a separate sequence beginning at EMBEDDING_BASE_PORT.
+# A per-model port pinned with `--start model:PORT` is respected and skipped over.
+# Stable served-model aliases are derived from the assigned role/port rather than
+# the checkpoint: 8006=primary, 8007=secondary, 8010=embedding1, etc.
 BASE_PORT=8006
+EMBEDDING_BASE_PORT=8010
 
 # If a selected model isn't present on disk when it's time to serve it, download
 # it automatically first (uses the HF CLI + HF_TOKEN). Applies to every mode,
@@ -841,6 +449,7 @@ MDL_INPUT_MODE=()      # Qwen3.8 runtime choice: text | image | video
 MDL_THINKING=()        # Qwen3.8 runtime choice: true | false
 MDL_PORT_EXPLICIT=()   # [idx]=1 when a --start "model:PORT" pinned this model's port
                        # (pinned models are exempt from sequential re-assignment)
+MDL_SERVED_NAME=()     # [idx]=stable API alias assigned from the model's port/role
 
 _add() {
     local i=${#MDL_HF[@]}
@@ -948,11 +557,13 @@ _add "nvidia/Gemma-4-31B-IT-NVFP4"            "Gemma-4-31B-IT-NVFP4"         "Ge
 
 # ── Qwen3.8 dense multimodal model ───────────────────────────────────────────────────────────
 # Native 262144-token text/image/video model. The interactive serve flow asks
-# which input path to load and whether thinking should be enabled. It is appended
-# to preserve every existing catalog index.
+# which input path to load and whether thinking should be enabled. Both entries
+# are appended to preserve every existing catalog index.
 # https://huggingface.co/Qwen/Qwen3.8-27B
-#        HF Repo                  Local Dir        Display Name                    Disk VRAM  Port  Category
-_add "Qwen/Qwen3.8-27B"         "Qwen3.8-27B"    "Qwen3.8-27B (BF16, multimodal)"  56   75   8023  "Dense Models"
+# https://huggingface.co/Qwen/Qwen3.8-27B-FP8
+#        HF Repo                  Local Dir             Display Name                    Disk VRAM  Port  Category
+_add "Qwen/Qwen3.8-27B"         "Qwen3.8-27B"         "Qwen3.8-27B (BF16, multimodal)"  56   75   8023  "Dense Models"
+_add "Qwen/Qwen3.8-27B-FP8"     "Qwen3.8-27B-FP8"     "Qwen3.8-27B (FP8, multimodal)"   31   51   8024  "Dense Models"
 
 MODEL_TOTAL=${#MDL_HF[@]}
 
@@ -1021,6 +632,10 @@ _resolve_start_specs() {
         fi
         if [ -n "$p" ]; then
             [[ "$p" =~ ^[0-9]+$ ]] || { echo "❌ Invalid port '$p' for model '$m'"; exit 1; }
+            if [ "${MDL_CAT[$idx]}" = "Embeddings" ] && [ "$p" -lt "$EMBEDDING_BASE_PORT" ]; then
+                echo "❌ Embedding model '$m' must use port ${EMBEDDING_BASE_PORT} or above (got $p)."
+                exit 1
+            fi
             MDL_PORT[$idx]="$p"
             MDL_PORT_EXPLICIT[$idx]=1   # pinned — exempt from sequential re-assignment
         fi
@@ -1029,23 +644,61 @@ _resolve_start_specs() {
     [ "${#RUN_SELECTED[@]}" -eq 0 ] && { echo "❌ --start: no models resolved from '$spec'"; exit 1; }
 }
 
-# Reassign servable models to sequential ports (BASE_PORT, +1, +2, …) in launch
-# order, so the same selection always maps to the same ports. Models pinned via
-# --start "model:PORT" keep their port and are skipped over (their port is also
-# avoided so sequential assignment never collides with a pin). Download-only
-# models (PORT=0) are left untouched.
+# Assign independent ordinary-model and Embeddings port sequences, preserving
+# explicit pins and deriving stable API aliases from the resulting port roles.
 _assign_sequential_ports() {
-    local idx next="$BASE_PORT" pinned=" "
-    # Collect pinned ports first so sequential assignment can skip past them.
+    local idx port next used=" "
+    local embedding_next="$EMBEDDING_BASE_PORT"
+
+    # Collect and validate pinned ports first.
     for idx in "${RUN_SELECTED[@]}"; do
-        [ "${MDL_PORT_EXPLICIT[$idx]:-0}" = "1" ] && pinned="${pinned}${MDL_PORT[$idx]} "
+        [ "${MDL_PORT_EXPLICIT[$idx]:-0}" = "1" ] || continue
+        port="${MDL_PORT[$idx]}"
+        if [[ "$used" == *" $port "* ]]; then
+            echo "❌ Port $port was pinned to more than one selected model."
+            exit 1
+        fi
+        used="${used}${port} "
     done
+
+    # Embeddings always claim the 8010+ sequence first.
+    for idx in "${RUN_SELECTED[@]}"; do
+        [ "${MDL_CAT[$idx]}" = "Embeddings" ] || continue
+        [ "${MDL_PORT_EXPLICIT[$idx]:-0}" = "1" ] && continue
+        while [[ "$used" == *" $embedding_next "* ]]; do embedding_next=$((embedding_next + 1)); done
+        MDL_PORT[$idx]="$embedding_next"
+        used="${used}${embedding_next} "
+        embedding_next=$((embedding_next + 1))
+    done
+
+    # All other servable models use the ordinary sequence from 8006.
+    next="$BASE_PORT"
     for idx in "${RUN_SELECTED[@]}"; do
         [ "${MDL_PORT[$idx]}" = "0" ] && continue                 # download-only
+        [ "${MDL_CAT[$idx]}" = "Embeddings" ] && continue
         [ "${MDL_PORT_EXPLICIT[$idx]:-0}" = "1" ] && continue      # user-pinned
-        while [[ "$pinned" == *" $next "* ]]; do next=$((next + 1)); done
+        while [[ "$used" == *" $next "* ]]; do next=$((next + 1)); done
         MDL_PORT[$idx]="$next"
+        used="${used}${next} "
         next=$((next + 1))
+    done
+
+    # Stable aliases. Common ports get human-friendly role names; custom/later
+    # ordinary ports remain deterministic by including the port number.
+    for idx in "${RUN_SELECTED[@]}"; do
+        port="${MDL_PORT[$idx]}"
+        [ "$port" = "0" ] && continue
+        if [ "${MDL_CAT[$idx]}" = "Embeddings" ]; then
+            MDL_SERVED_NAME[$idx]="embedding$((port - EMBEDDING_BASE_PORT + 1))"
+        else
+            case "$port" in
+                8006) MDL_SERVED_NAME[$idx]="primary" ;;
+                8007) MDL_SERVED_NAME[$idx]="secondary" ;;
+                8008) MDL_SERVED_NAME[$idx]="tertiary" ;;
+                8009) MDL_SERVED_NAME[$idx]="quaternary" ;;
+                *)    MDL_SERVED_NAME[$idx]="model${port}" ;;
+            esac
+        fi
     done
 }
 
@@ -1055,15 +708,19 @@ _assign_sequential_ports() {
 # Exits with the catalog listed on any bad entry — never persists a broken spec.
 _validate_spec_or_die() {
     local spec="$1"
-    local -a parts; local part m p
+    local -a parts; local part m p idx
     IFS=',' read -ra parts <<< "$spec"
     for part in "${parts[@]}"; do
         part="${part//[[:space:]]/}"
         [ -z "$part" ] && continue
         m="${part%%:*}"; p=""
         [[ "$part" == *:* ]] && p="${part##*:}"
-        _resolve_model "$m" >/dev/null || { echo "❌ Unknown model '$m' in spec:"; _list_servable_models; exit 1; }
+        idx=$(_resolve_model "$m") || { echo "❌ Unknown model '$m' in spec:"; _list_servable_models; exit 1; }
         [ -n "$p" ] && ! [[ "$p" =~ ^[0-9]+$ ]] && { echo "❌ Invalid port '$p' for '$m'"; exit 1; }
+        if [ -n "$p" ] && [ "${MDL_CAT[$idx]}" = "Embeddings" ] && [ "$p" -lt "$EMBEDDING_BASE_PORT" ]; then
+            echo "❌ Embedding model '$m' must use port ${EMBEDDING_BASE_PORT} or above (got $p)."
+            exit 1
+        fi
     done
 }
 
@@ -1446,11 +1103,14 @@ _checkbox_menu() {
 # Qwen3.8 can skip its vision tower entirely or load exactly one visual input
 # path. Headless runs cannot prompt, so environment variables provide optional
 # overrides while retaining deterministic text/no-thinking defaults:
-#   QWEN38_INPUT_MODE=image QWEN38_THINKING=true ./... --start Qwen3.8-27B
+#   QWEN38_INPUT_MODE=image QWEN38_THINKING=true ./... --start Qwen3.8-27B-FP8
 _configure_qwen38() {
     local idx input_choice thinking_choice input_mode thinking
     for idx in "${RUN_SELECTED[@]+${RUN_SELECTED[@]}}"; do
-        [ "${MDL_HF[$idx]}" = "Qwen/Qwen3.8-27B" ] || continue
+        case "${MDL_HF[$idx]}" in
+            "Qwen/Qwen3.8-27B"|"Qwen/Qwen3.8-27B-FP8") ;;
+            *) continue ;;
+        esac
 
         if [ "$HEADLESS" -eq 1 ]; then
             input_mode="${QWEN38_INPUT_MODE:-text}"
@@ -1494,7 +1154,7 @@ _configure_qwen38() {
 
         MDL_INPUT_MODE[$idx]="$input_mode"
         MDL_THINKING[$idx]="$thinking"
-        echo "  Qwen3.8-27B: input=$input_mode, thinking=$thinking"
+        echo "  ${MDL_DIR[$idx]}: input=$input_mode, thinking=$thinking"
     done
 }
 
@@ -2904,20 +2564,21 @@ fi
 # mode this applies prompt-free defaults (or the documented env overrides).
 _configure_qwen38
 
-# Assign predictable sequential ports (BASE_PORT, +1, …) in launch order.
+# Assign predictable ordinary/embedding ports and stable client-facing aliases.
 _assign_sequential_ports
 
 echo ""
 [ "$SERVE_ONLY" -eq 0 ] && echo "  Download : ${#DL_SELECTED[@]} model(s) selected"
 echo "  Serve    : ${#RUN_SELECTED[@]} model(s) selected"
 if [ "${#RUN_SELECTED[@]}" -gt 0 ]; then
-    echo "  Port map (launch order, base ${BASE_PORT}):"
+    echo "  Port / stable API-name map:"
     _seq_n=1
     for _idx in "${RUN_SELECTED[@]}"; do
         [ "${MDL_PORT[$_idx]}" = "0" ] && continue
         _pin=""
         [ "${MDL_PORT_EXPLICIT[$_idx]:-0}" = "1" ] && _pin="  (pinned)"
-        printf "    %d. %-46s port %s%s\n" "$_seq_n" "${MDL_NAME[$_idx]}" "${MDL_PORT[$_idx]}" "$_pin"
+        printf "    %d. %-40s port %-5s as %-12s%s\n" \
+            "$_seq_n" "${MDL_NAME[$_idx]}" "${MDL_PORT[$_idx]}" "${MDL_SERVED_NAME[$_idx]}" "$_pin"
         _seq_n=$((_seq_n + 1))
     done
 fi
@@ -3330,6 +2991,29 @@ _vllm_launch() {
     local port="${MDL_PORT[$idx]}"
     local model_path="$MODELS_DIR/$dir"
     local log_file="$VLLM_LOGS/vllm-${port}.log"
+    local served_name="${MDL_SERVED_NAME[$idx]:-model${port}}"
+
+    # Serve profiles historically supplied checkpoint-specific names. Strip any
+    # such argument and append the centrally assigned stable role alias. Doing
+    # this here also covers generic/future profiles and every automatic retry.
+    local -a _launch_args=()
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --served-model-name)
+                shift
+                [ "$#" -gt 0 ] && shift
+                ;;
+            --served-model-name=*)
+                shift
+                ;;
+            *)
+                _launch_args+=("$1")
+                shift
+                ;;
+        esac
+    done
+    _launch_args+=(--served-model-name "$served_name")
+    set -- "${_launch_args[@]}"
 
     if [ ! -f "$model_path/config.json" ]; then
         # Not on disk yet — try to fetch it before giving up (AUTO_DOWNLOAD).
@@ -3367,6 +3051,7 @@ _vllm_launch() {
     echo ""
     echo "--- Starting [idx $idx] $name on port $port ---"
     echo "    Model : $model_path"
+    echo "    API ID: $served_name"
     echo "    Log   : $log_file"
     echo "    CMD   : $vllm_label $model_path --host 0.0.0.0 --port $port --enable-sleep-mode $*"
 
@@ -3715,8 +3400,8 @@ else
     echo "  ── Models queued to serve ───────────────────────────────────────"
     for idx in "${RUN_SELECTED[@]}"; do
         [ "${MDL_PORT[$idx]}" = "0" ] && continue
-        printf "    [catalog idx %2d]  %-50s  port %s\n" \
-            "$idx" "${MDL_NAME[$idx]}" "${MDL_PORT[$idx]}"
+        printf "    [catalog idx %2d]  %-44s  port %-5s  as %s\n" \
+            "$idx" "${MDL_NAME[$idx]}" "${MDL_PORT[$idx]}" "${MDL_SERVED_NAME[$idx]}"
     done
     echo "  ─────────────────────────────────────────────────────────────────"
 fi
@@ -3751,15 +3436,17 @@ _serve_model() {
 
     case "${MDL_HF[$idx]}" in
 
-    # Native Qwen3.8 dense vision-language model. The catalog checkpoint is BF16
-    # (~56 GB on disk); 0.62 of a DGX Spark's ~121 GB pool leaves room for the
-    # model, selected encoder path, and a practical 32K KV cache. The model card
-    # advertises 262K native context, available for a solo deployment with:
-    #   QWEN38_MAX_MODEL_LEN=262144 ./install_ai_spark_vllm.sh --start Qwen3.8-27B
+    # Native Qwen3.8 dense vision-language model. BF16 uses 0.62 of a DGX Spark's
+    # ~121 GB pool; the official FP8 build is ~31 GB on disk and uses 0.42. Both
+    # leave room for the selected encoder path and a practical 32K KV cache. The
+    # model card advertises 262K native context, available for a solo deployment:
+    #   QWEN38_MAX_MODEL_LEN=262144 ./install_ai_spark_vllm.sh --start Qwen3.8-27B-FP8
     # Interactive choices were captured by _configure_qwen38. Text-only avoids
     # loading the vision encoder; the visual modes admit only the chosen type.
-    "Qwen/Qwen3.8-27B")
+    "Qwen/Qwen3.8-27B"|"Qwen/Qwen3.8-27B-FP8")
         local -a _qwen38_input_args=() _qwen38_thinking_args=()
+        local _qwen38_gmu=0.62
+        [ "${MDL_HF[$idx]}" = "Qwen/Qwen3.8-27B-FP8" ] && _qwen38_gmu=0.42
         case "${MDL_INPUT_MODE[$idx]:-text}" in
             image)
                 _qwen38_input_args=(--limit-mm-per-prompt '{"image":1,"video":0}')
@@ -3785,7 +3472,7 @@ _serve_model() {
             --served-model-name "Qwen3.8-27B" \
             --dtype auto \
             --tensor-parallel-size 1 \
-            --gpu-memory-utilization 0.62 \
+            --gpu-memory-utilization "$_qwen38_gmu" \
             --max-model-len "${QWEN38_MAX_MODEL_LEN:-32768}" \
             --max-num-seqs 4 \
             --max-num-batched-tokens 8192 \
