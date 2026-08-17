@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Install & run SearXNG via Docker Compose.
-# By: Christopher Gray / https://github.com/c2theg |  Version: 1.0.36  | Updated: 8/17/2026
+# By: Christopher Gray / https://github.com/c2theg |  Version: 1.0.38  | Updated: 8/17/2026
 #
 # ONE-COMMAND INSTALL — installs Docker if missing, fetches every config file
 # from GitHub, generates the compose stack, starts it and verifies the JSON API:
@@ -30,6 +30,10 @@
 #   sudo ./install_searxng.sh --offline        # local files only, never touch the network
 #   sudo ./install_searxng.sh --ca-cert /path/corp-ca.pem   # trust an extra CA (repeatable)
 #   sudo ./install_searxng.sh --brave-key BSA...            # or put it in /opt/searxng/.env
+#
+# /opt/searxng/.env also carries SEARXNG_PROXIES — a comma-separated list of
+# outbound proxies that SearXNG round-robins per request, to spread load across
+# multiple egress points and survive per-IP rate limits and CAPTCHAs.
 #   sudo ./install_searxng.sh --port 8080 --host 0.0.0.0
 #   sudo ./install_searxng.sh --no-validate    # skip the engine preflight check
 #   sudo ./install_searxng.sh --uninstall      # stop & remove the stack
@@ -65,6 +69,8 @@ OFFLINE=0              # --offline: never reach for GitHub, local files only
 CA_CERTS=()            # --ca-cert FILE (repeatable): extra CAs to trust
 ENV_FILE=""            # $INSTALL_DIR/.env — secrets, never committed to the repo
 BRAVE_API_KEY=""       # --brave-key, or BRAVE_API_KEY in .env / the environment
+SEARXNG_PROXIES=""     # .env: comma/semicolon separated outbound proxy URLs
+SEARXNG_LOG_SEARCHES=""  # .env: "true" logs every query to the container log
 
 # ---------------------------------------------------------------------------
 # Engines that need an API key: "<engine name>|<.env variable>|<where to get one>"
@@ -75,12 +81,13 @@ BRAVE_API_KEY=""       # --brave-key, or BRAVE_API_KEY in .env / the environment
 # engine that ships `api_key: ""` in SearXNG's own default settings.
 # ---------------------------------------------------------------------------
 API_KEY_REGISTRY=(
-  "braveapi|BRAVE_API_KEY|https://api.search.brave.com  (free tier ~2k queries/month)"
-  "exaapi|EXA_API_KEY|https://exa.ai"
-  "jina|JINA_API_KEY|https://jina.ai"
-  "springer nature|SPRINGER_API_KEY|https://dev.springernature.com"
-  "core.ac.uk|CORE_API_KEY|https://core.ac.uk/services/api"
-  "astrophysics data system|ADS_API_KEY|https://ui.adsabs.harvard.edu/user/settings/token"
+  "braveapi|BRAVE_API_KEY|api_key||https://api.search.brave.com  (free tier ~2k queries/month)"
+  "sec edgar|SEC_USER_AGENT|User-Agent|Jane Doe jane.doe@example.com|required by SEC: your real name + email, see https://www.sec.gov/os/webmaster-faq"
+  "exaapi|EXA_API_KEY|api_key||https://exa.ai"
+  "jina|JINA_API_KEY|api_key||https://jina.ai"
+  "springer nature|SPRINGER_API_KEY|api_key||https://dev.springernature.com"
+  "core.ac.uk|CORE_API_KEY|api_key||https://core.ac.uk/services/api"
+  "astrophysics data system|ADS_API_KEY|api_key||https://ui.adsabs.harvard.edu/user/settings/token"
 )
 
 # ---------------------------------------------------------------------------
@@ -274,10 +281,12 @@ load_env_file() {
     v="${v%$'\r'}"                                                   # strip CRLF
     v="${v#\"}"; v="${v%\"}"; v="${v#\'}"; v="${v%\'}"               # unquote
 
-    # Only variables named in the registry are honoured.
+    # Only variables named in the registry — plus the global settings below —
+    # are honoured.
     known=0
+    [[ "$k" == "SEARXNG_PROXIES" || "$k" == "SEARXNG_LOG_SEARCHES" ]] && known=1
     for entry in "${API_KEY_REGISTRY[@]}"; do
-      IFS='|' read -r _ var _ <<< "$entry"
+      IFS='|' read -r _ var _ _ _ <<< "$entry"
       [[ "$k" == "$var" ]] && known=1 && break
     done
     [[ $known -eq 1 ]] || continue
@@ -288,7 +297,7 @@ load_env_file() {
 }
 
 # ---------------------------------------------------------------------------
-# apply_api_key <settings-file> <engine-name> <api-key>
+# apply_api_key <settings-file> <engine-name> <value> [yaml-field]
 #
 # Rewrites ONLY that engine's block: fills in the key and flips both `inactive`
 # and `disabled` to false. Both matter — braveapi.init() raises "No API key
@@ -296,13 +305,13 @@ load_env_file() {
 # flipping inactive without supplying a key breaks the boot.
 # ---------------------------------------------------------------------------
 apply_api_key() {
-  local file="$1" engine="$2" tmp
+  local file="$1" engine="$2" tmp   # $3 = value, $4 = field (default api_key)
   tmp="$(mktemp)"
   # Key and engine name travel via the environment, not `awk -v`, because -v
   # applies backslash-escape processing to the value.
-  API_KEY_FOR_AWK="$3" API_ENGINE_FOR_AWK="$engine" awk '
+  API_KEY_FOR_AWK="$3" API_ENGINE_FOR_AWK="$engine" API_FIELD_FOR_AWK="${4:-api_key}" awk '
     BEGIN {
-      inblk = 0; key = ENVIRON["API_KEY_FOR_AWK"]
+      inblk = 0; key = ENVIRON["API_KEY_FOR_AWK"]; field = ENVIRON["API_FIELD_FOR_AWK"]
       want = "- name: " ENVIRON["API_ENGINE_FOR_AWK"]; touched = 0
     }
     {
@@ -314,10 +323,60 @@ apply_api_key() {
     inblk && /^[^[:space:]]/                   { inblk = 0 }   # back to top level
     inblk && /^[[:space:]]+inactive:/ { print "    inactive: false"; next }
     inblk && /^[[:space:]]+disabled:/ { print "    disabled: false"; next }
-    inblk && /^[[:space:]]+api_key:/  { print "    api_key: \"" key "\""; next }
+    inblk && $0 ~ ("^[[:space:]]+" field ":") {
+      # Preserve the original indentation: api_key sits at 4 spaces, but
+      # User-Agent is nested under `headers:` at 6.
+      match($0, /^[[:space:]]+/)
+      print substr($0, 1, RLENGTH) field ": \"" key "\""
+      next
+    }
     { print }
     END { if (!touched) exit 3 }
   ' "$file" > "$tmp" || { rm -f "$tmp"; return 3; }
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
+}
+
+
+# ---------------------------------------------------------------------------
+# apply_proxy_pool <settings-file> <proxy-list>
+#
+# Rewrites the MANAGED BLOCK inside `outgoing:` with a round-robin proxy pool.
+# Accepts comma- or semicolon-separated URLs. An empty list restores the block
+# to its inert commented form, so removing SEARXNG_PROXIES cleanly reverts to
+# direct egress on the next run.
+# ---------------------------------------------------------------------------
+apply_proxy_pool() {
+  local file="$1" raw="$2" tmp body="" url
+  local NL=$'\n'
+  tmp="$(mktemp)"
+
+  if [[ -n "$raw" ]]; then
+    body="  proxies:${NL}    all://:${NL}"
+    while IFS= read -r url || [[ -n "$url" ]]; do
+      url="${url#"${url%%[![:space:]]*}"}"; url="${url%"${url##*[![:space:]]}"}"
+      [[ -n "$url" ]] || continue
+      case "$url" in
+        http://*|https://*|socks4://*|socks5://*|socks5h://*) ;;
+        *) rm -f "$tmp"
+           die "SEARXNG_PROXIES entry is not a proxy URL: '$url'
+    Expected http://, https://, socks4://, socks5:// or socks5h://" ;;
+      esac
+      body+="      - ${url}${NL}"
+    done < <(printf '%s' "$raw" | tr ',;' '\n\n')
+  fi
+
+  PROXY_BODY_FOR_AWK="$body" awk '
+    BEGIN { skip = 0; body = ENVIRON["PROXY_BODY_FOR_AWK"] }
+    /^[[:space:]]*# >>> MANAGED BLOCK: outbound proxy pool/ {
+      print
+      if (length(body) > 0) printf "%s", body
+      skip = 1; next
+    }
+    /^[[:space:]]*# <<< MANAGED BLOCK: outbound proxy pool/ { skip = 0; print; next }
+    skip == 1 { next }
+    { print }
+  ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
   cat "$tmp" > "$file"
   rm -f "$tmp"
 }
@@ -468,13 +527,17 @@ fi
 # environ_name, and engine api_key fields are not among them — so substitution
 # is the only route.
 # ---------------------------------------------------------------------------
+# --- outbound proxy pool ---------------------------------------------------
+# Applied before the engine keys so a failure here aborts before anything else.
+PROXY_STATE="direct (no SEARXNG_PROXIES set)"
+
 # Which key-requiring engines are actually present in the deployed config?
 KEYED_ENGINES=()        # "engine|VAR|url" for engines present in settings.yml
 KEYS_CONFIGURED=()      # "engine|VAR" that got a key applied
 KEYS_MISSING=()         # "engine|VAR|url" still waiting for a key
 
 for _entry in "${API_KEY_REGISTRY[@]}"; do
-  IFS='|' read -r _eng _var _url <<< "$_entry"
+  IFS='|' read -r _eng _var _field _placeholder _url <<< "$_entry"
   if grep -qE "^[[:space:]]*-[[:space:]]*name:[[:space:]]*${_eng}[[:space:]]*$" "$INSTALL_DIR/settings.yml"; then
     KEYED_ENGINES+=("$_entry")
   fi
@@ -491,11 +554,26 @@ if [[ ! -f "$ENV_FILE" ]]; then
       echo
       for _entry in "${KEYED_ENGINES[@]:-}"; do
         [[ -n "$_entry" ]] || continue
-        IFS='|' read -r _eng _var _url <<< "$_entry"
-        echo "# ${_eng} — get a key at ${_url}"
-        echo "${_var}="
+        IFS='|' read -r _eng _var _field _placeholder _url <<< "$_entry"
+        echo "# ${_eng} — ${_url}"
+        echo "${_var}=${_placeholder}"
         echo
       done
+      echo "# Outbound proxy pool — comma or semicolon separated."
+      echo "# SearXNG round-robins these per request, spreading load across"
+      echo "# egress points. This is what makes rate-limited engines (yahoo"
+      echo "# finance, sec edgar) and CAPTCHA-blocked ones workable again."
+      echo "# Example: SEARXNG_PROXIES=http://10.0.0.5:8080,socks5://10.0.0.6:1080"
+      echo "SEARXNG_PROXIES="
+      echo
+      echo "# Log every search query to the container log (docker logs searxng)."
+      echo "# SearXNG has no query-logging setting of its own — it is privacy-first"
+      echo "# and deliberately never records queries. This turns on the granian web"
+      echo "# server's access log with the query string included, which is the only"
+      echo "# supported way to capture them without writing a plugin."
+      echo "# PRIVACY: this records what every user searches for, in plain text."
+      echo "SEARXNG_LOG_SEARCHES=false"
+      echo
     } > "$ENV_FILE"
   )
   log "Created $ENV_FILE"
@@ -504,15 +582,38 @@ chmod 0600 "$ENV_FILE"
 
 load_env_file
 
+if grep -q "MANAGED BLOCK: outbound proxy pool" "$INSTALL_DIR/settings.yml"; then
+  apply_proxy_pool "$INSTALL_DIR/settings.yml" "$SEARXNG_PROXIES"
+  if [[ -n "$SEARXNG_PROXIES" ]]; then
+    _n="$(printf '%s' "$SEARXNG_PROXIES" | tr ',;' '\n\n' | grep -c '[^[:space:]]' || true)"
+    log "Outbound proxy pool: $_n endpoint(s), round-robined per request."
+    PROXY_STATE="$_n proxy endpoint(s)"
+  fi
+elif [[ -n "$SEARXNG_PROXIES" ]]; then
+  warn "SEARXNG_PROXIES is set but settings.yml has no managed proxy block — ignored."
+fi
+
 for _entry in "${KEYED_ENGINES[@]:-}"; do
   [[ -n "$_entry" ]] || continue
-  IFS='|' read -r _eng _var _url <<< "$_entry"
+  IFS='|' read -r _eng _var _field _placeholder _url <<< "$_entry"
   _key="${!_var:-}"
+
+  # A value left at the shipped example counts as NOT set. This matters most
+  # for SEC_USER_AGENT: sending their example contact string to the SEC would
+  # be worse than not querying them at all, so the engine stays off until the
+  # operator puts their own name and address in.
+  if [[ -n "$_placeholder" && "$_key" == "$_placeholder" ]]; then
+    warn "$_var is still the example value — '$_eng' left disabled."
+    warn "  edit $ENV_FILE and re-run to enable it."
+    KEYS_MISSING+=("$_entry")
+    continue
+  fi
+
   if [[ -z "$_key" ]]; then
     KEYS_MISSING+=("$_entry")
     continue
   fi
-  if apply_api_key "$INSTALL_DIR/settings.yml" "$_eng" "$_key"; then
+  if apply_api_key "$INSTALL_DIR/settings.yml" "$_eng" "$_key" "$_field"; then
     grep -qF "$_key" "$INSTALL_DIR/settings.yml" \
       || die "Failed to inject $_var into settings.yml for engine '$_eng'."
     log "$_var applied — '$_eng' engine enabled."
@@ -592,6 +693,20 @@ fi
 # ---------------------------------------------------------------------------
 # docker-compose.yml (SearXNG + Valkey cache)
 # ---------------------------------------------------------------------------
+# Query logging is off unless SEARXNG_LOG_SEARCHES is truthy. The default
+# granian access-log format omits the query string, so the format is overridden
+# to include %(query_string)s — that is what actually records the search terms.
+ACCESS_LOG_ENV=""
+LOG_STATE="off (searches not logged)"
+# ${VAR,,} needs bash 4+; tr keeps this working on older shells too.
+case "$(printf '%s' "$SEARXNG_LOG_SEARCHES" | tr '[:upper:]' '[:lower:]')" in
+  true|yes|1|on)
+    ACCESS_LOG_ENV=$'      - GRANIAN_LOG_ACCESS_ENABLED=true\n      - GRANIAN_LOG_ACCESS_FMT=[%(time)s] %(addr)s "%(method)s %(path)s?%(query_string)s" %(status)d %(dt_ms).1fms'
+    LOG_STATE="ON — every query is written to the container log"
+    warn "Search logging is ON: every query will be recorded in plain text."
+    ;;
+esac
+
 log "Writing $INSTALL_DIR/docker-compose.yml ..."
 cat > "$INSTALL_DIR/docker-compose.yml" <<COMPOSE
 services:
@@ -625,6 +740,7 @@ services:
       # SEARXNG_REDIS_URL is deprecated upstream (logs a DeprecationWarning from
       # valkeydb.py); SearXNG reads valkey.url now.
       - SEARXNG_VALKEY_URL=valkey://redis:6379/0
+${ACCESS_LOG_ENV}
     cap_drop: [ALL]
     cap_add: [CHOWN, SETGID, SETUID]
     logging:
@@ -823,7 +939,9 @@ cat <<EOF
     settings.yml       <- ${SETTINGS_ORIGIN:-unknown}
     limiter.toml       <- ${LIMITER_ORIGIN:-unknown}
     ca-certificates/     ${CA_COUNT:-0} extra CA(s) trusted by the container
-    .env                 API keys (mode 0600, not in the repo)
+    .env                 API keys + proxy pool (mode 0600, not in the repo)
+    egress               ${PROXY_STATE:-direct}
+    search logging       ${LOG_STATE:-off}
     docker-compose.yml   generated
     .secret_key          generated, preserved across re-runs
     .install-manifest    what was deployed, and from where
@@ -842,12 +960,16 @@ if [[ -n "${KEYED_ENGINES[*]:-}" ]]; then
   echo "  API keys — set these in $ENV_FILE (mode 0600, never committed):"
   echo
   for _entry in "${KEYED_ENGINES[@]}"; do
-    IFS='|' read -r _eng _var _url <<< "$_entry"
-    if [[ -n "${!_var:-}" ]]; then
+    IFS='|' read -r _eng _var _field _placeholder _url <<< "$_entry"
+    _v="${!_var:-}"
+    if [[ -n "$_v" && ( -z "$_placeholder" || "$_v" != "$_placeholder" ) ]]; then
       printf '    [set]     %-24s %s\n' "$_var" "-> '$_eng' enabled"
+    elif [[ -n "$_placeholder" && "$_v" == "$_placeholder" ]]; then
+      printf '    [example] %-24s %s\n' "$_var" "-> '$_eng' OFF (still the sample value)"
+      printf '              %s\n' "$_url"
     else
       printf '    [not set] %-24s %s\n' "$_var" "-> '$_eng' stays off"
-      printf '              get a key: %s\n' "$_url"
+      printf '              %s\n' "$_url"
     fi
   done
   if [[ -n "${KEYS_MISSING[*]:-}" ]]; then
@@ -945,11 +1067,49 @@ PYSMOKE
   echo "    http://${HOST}:${PORT}/stats/errors"
 fi
 
+# ---------------------------------------------------------------------------
+# Five copy-paste checks covering the endpoints that actually matter.
+# ---------------------------------------------------------------------------
+cat <<TESTS
+
+  Five ways to test it:
+
+  1) Liveness — answers from SearXNG itself, touches no upstream engine:
+     curl -fsS http://127.0.0.1:${PORT}/healthz && echo OK
+
+  2) JSON API — the exact call OpenWebUI makes; prints the result count:
+     curl -fsS 'http://127.0.0.1:${PORT}/search?q=test&format=json' \\
+       | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["results"]), "results")'
+
+  3) Which engines answered, and which failed (the useful one):
+     curl -fsS 'http://127.0.0.1:${PORT}/search?q=anthropic+claude&format=json' | python3 -c '
+     import json,sys
+     from collections import Counter
+     d=json.load(sys.stdin)
+     c=Counter(e for r in d["results"] for e in (r.get("engines") or []))
+     print("answered :", ", ".join(f"{k}({v})" for k,v in c.most_common()) or "NONE")
+     for e in (d.get("unresponsive_engines") or []): print("  failed :", e[0], "-", e[1])'
+
+  4) A specific category (swap crypto for finance/tech/news/sports/blogs):
+     curl -fsS 'http://127.0.0.1:${PORT}/search?q=bitcoin&categories=crypto&format=json' \\
+       | python3 -c 'import json,sys; d=json.load(sys.stdin); [print(" -", r["title"][:60], r["url"][:50]) for r in d["results"][:5]]'
+
+  5) One engine on its own, using its bang shortcut — proves an engine works
+     in isolation (!yf yahoo finance, !cg coingecko, !sec edgar, !mwm mwmbl):
+     curl -fsS --get --data-urlencode 'q=!cg ethereum' --data-urlencode 'format=json' \\
+       http://127.0.0.1:${PORT}/search \\
+       | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d["results"]),"results"); print(d.get("unresponsive_engines") or "no errors")'
+
+  Engine health over time:  http://${HOST}:${PORT}/stats/errors
+TESTS
+
+
 if [[ $ok -ne 1 ]]; then
   echo
   warn "Check the logs:  cd $INSTALL_DIR && docker compose logs -f searxng"
   exit 1
 fi
+
 
 cat <<EOF
 
