@@ -1,4 +1,4 @@
-# By: Christopher Gray  |  Version: 1.0.0  |  Updated: 8/11/2026
+# By: Christopher Gray  |  Version: 1.0.21  |  Updated: 8/17/2026
 #
 # Rewritten against SearXNG 2026.8.x. See NOTES at the bottom of this file for
 # what changed and why the previous revision (0.0.28) threw ~100 engine errors.
@@ -31,7 +31,13 @@ use_default_settings:
       - qwant
       - google
       - wikipedia
-      - wikidata
+      - mwmbl        # independent index, keyless — the workhorse now
+      - braveapi     # official Brave Search API, needs a key; off by default
+      # `wikidata` is deliberately absent. Its init() calls the SPARQL endpoint
+      # at query.wikidata.org, which 403s this host. An init failure is not
+      # recoverable the way a query failure is — the engine never registers, and
+      # it re-throws a full traceback on every boot. `disabled: true` would not
+      # help: init runs regardless. Removing it from keep_only is the only fix.
 
       # --- news ----------------------------------------------------------
       - google news
@@ -160,18 +166,92 @@ plugins:
 # engines on and re-file them into the custom `ai` / `security` tabs; the engine
 # definitions themselves stay upstream's, so they can't drift out of sync.
 engines:
-  # Google ships as `inactive: true` upstream because Google frequently serves
-  # SearXNG a CAPTCHA. Re-enabled here, but expect intermittent errors from it.
+  # Google is OFF. It does not error — it returns an empty result set and
+  # reports nothing at all (`!go <query>` -> results: 0, unresponsive: []),
+  # which is worse than a visible failure because it looks like it works.
+  # That silent-nothing behaviour is why upstream ships it `inactive: true`.
+  # Kept registered (inactive: false) so it still appears in Preferences and
+  # can be re-tested by flipping `disabled`, but never queried by default.
   - name: google
     inactive: false
-    disabled: false
+    disabled: true
 
+  # Bing is the one scraping-based general engine still answering reliably.
   - name: bing
     disabled: false
-  - name: mojeek
+
+  # mwmbl — independent crawler/index, no API key, no bot challenge. Measured
+  # on 2026-08-17 it returned more results than every other general engine
+  # combined (36-42 per query vs 9-11 for bing). Different corpus to the big
+  # engines, so treat it as added coverage rather than a Google replacement.
+  - name: mwmbl
     disabled: false
+
+  # braveapi — the OFFICIAL Brave Search API, as opposed to the `brave` engine
+  # which scrapes search.brave.com and is now refused with HTTP 429 from every
+  # IP tested. Authenticated API calls are not bot-challenged, so this is the
+  # durable way to get Brave results back.
+  #
+  # Held with `inactive: true`, NOT `disabled: true`. braveapi.py raises
+  # SearxEngineAPIException("No API key provided") from its init() when api_key
+  # is empty, and init runs even for a disabled engine — so `disabled: true`
+  # alone prints a full traceback on every single boot. `inactive: true` stops
+  # the engine loading at all, which is silent. (Same trap as wikidata.)
+  #
+  # To enable:
+  #   1. get a key at https://api.search.brave.com  (free tier ~2k queries/mo)
+  #   2. set api_key below
+  #   3. set inactive: false AND disabled: false
+  #   4. docker compose restart searxng
+  #
+  # Do not commit a real key to the repo — this file is public. Either edit
+  # /opt/searxng/settings.yml on the host after install, or keep the key in a
+  # private overlay.
+  - name: braveapi
+    inactive: true
+    disabled: true
+    api_key: ""
+
+  # -------------------------------------------------------------------------
+  # Engines blocked from this host, switched off on 2026-08-17.
+  #
+  # These are NOT config errors — each engine loads and registers fine, then
+  # gets refused at query time because the server's IP is treated as a bot:
+  #
+  #   duckduckgo  CAPTCHA (us-en)
+  #   brave       Too many requests (HTTP 429, suspended 180s)
+  #   startpage   redirected to /sp/captcha (suspended 3600s — the worst offender)
+  #   qwant       CAPTCHA
+  #   mojeek      HTTP 503 Service Not Available
+  #
+  # Left in keep_only rather than removed, so they still appear in Preferences
+  # and can be re-enabled per-user, and so flipping them back is a one-line
+  # change once the IP reputation clears. A disabled engine is never queried,
+  # so it produces no log noise and costs no search latency.
+  #
+  # To re-test one: set disabled: false, `docker compose restart searxng`, then
+  # watch http://<host>:7042/stats/errors for a few searches.
+  # -------------------------------------------------------------------------
+  - name: duckduckgo
+    disabled: true
+  - name: brave
+    disabled: true
+  - name: startpage
+    disabled: true
   - name: qwant
-    disabled: false
+    disabled: true
+  - name: mojeek
+    disabled: true
+
+  # Same upstream hosts as the engines above, so they will be refused for the
+  # same reason. Not individually observed failing only because the test query
+  # was in the `general` category.
+  - name: duckduckgo news
+    disabled: true
+  - name: brave.news
+    disabled: true
+  - name: startpage news
+    disabled: true
 
   - name: hackernews
     disabled: false
@@ -266,12 +346,24 @@ outgoing:
 #    either (the sole finance-adjacent engine is the `currency` converter,
 #    which is filed under general).
 #
-# 6. Harmless log lines you will still see and can ignore:
+# 6. Blocked-by-IP engines (2026-08-17): duckduckgo, brave, startpage, qwant and
+#    mojeek all refuse this host with CAPTCHAs / 429 / 503, and wikidata 403s
+#    during init. They are disabled above (wikidata removed outright). General
+#    web search now rests on google + bing + wikipedia, which were the only
+#    general engines NOT erroring in the logs. If those two start CAPTCHAing as
+#    well, the practical options are an outbound proxy/VPN with a residential
+#    IP, or leaning on the API-based engines (arxiv, github, stackoverflow,
+#    pubmed, hackernews, nvd), which authenticate normally and never CAPTCHA.
+#
+# 7. Harmless log lines you will still see and can ignore:
 #      - "ahmia / torch: can't register engine" — both are `categories: onions`
 #        in the shipped defaults and are skipped whenever no Tor proxy is
 #        configured. Add them to `use_default_settings.engines.remove` to silence.
 #      - "TRACKER_PATTERNS: HTTPError (rules1.clearurls.xyz)" — startup fetch of
 #        the tracker-stripping rule set; retried later.
-#      - "wikidata: engine INIT failed, HTTP 403" — query.wikidata.org rate-limits
-#        the SPARQL endpoint by source IP. Transient; drop `wikidata` from
-#        keep_only if it stays noisy.
+#      - "X-Forwarded-For nor X-Real-IP header is set!" — cosmetic, and logged
+#        exactly once per worker. searx/botdetection/trusted_proxies.py emits it
+#        unconditionally when neither header is present; it is NOT gated on the
+#        trusted_proxies setting, so limiter.toml cannot silence it. The only
+#        way to make it stop is to put a reverse proxy in front that sets the
+#        header. Ignore it while the container is published directly.
