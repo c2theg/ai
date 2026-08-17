@@ -1,4 +1,4 @@
-# By: Christopher Gray  |  Version: 1.0.21  |  Updated: 8/17/2026
+# By: Christopher Gray  |  Version: 1.0.30  |  Updated: 8/17/2026
 #
 # Rewritten against SearXNG 2026.8.x. See NOTES at the bottom of this file for
 # what changed and why the previous revision (0.0.28) threw ~100 engine errors.
@@ -95,6 +95,24 @@ use_default_settings:
       - duckduckgo weather
       - openmeteo
 
+      # --- social media --------------------------------------------------
+      - lemmy posts
+      - lemmy communities
+      - lemmy comments
+      - mastodon users
+      - mastodon hashtags
+      - tootfinder
+      - boardreader
+
+      # --- blogs ---------------------------------------------------------
+      - wiby
+      - searchmysite
+
+      # --- forums / Q&A --------------------------------------------------
+      # stackoverflow / askubuntu / superuser are listed under IT above and
+      # also carry the `q&a` category, so they populate the forums tab too.
+      - discuss.python
+
       # --- utility -------------------------------------------------------
       - currency
 
@@ -119,6 +137,13 @@ ui:
 categories_as_tabs:
   general:
   news:
+  tech:
+  finance:
+  crypto:
+  sports:
+  social media:
+  blogs:
+  q&a:
   it:
   science:
   ai:
@@ -128,7 +153,7 @@ categories_as_tabs:
 
 search:
   safe_search: 0
-  autocomplete: ""
+  autocomplete: "wikipedia"
   default_lang: "en"
   formats:
     - html
@@ -253,12 +278,15 @@ engines:
   - name: startpage news
     disabled: true
 
+  # Hacker News and Lobsters are the two genuine tech-news sources available:
+  # SearXNG ships no TechCrunch/Ars/Verge engine, and those sites have no
+  # keyless search API, so they are only reachable via general web search.
   - name: hackernews
     disabled: false
-    categories: [it, news]
+    categories: [it, news, tech]
   - name: lobste.rs
     disabled: false
-    categories: [it, news]
+    categories: [it, news, tech]
   - name: pypi
     disabled: false
   - name: npm
@@ -269,6 +297,11 @@ engines:
     disabled: false
   - name: microsoft learn
     disabled: false
+
+  # scholar.google.com refuses the connection outright (httpx.ConnectError, not
+  # a CAPTCHA) — same Google-blocking family as the `google` engine above.
+  - name: google scholar
+    disabled: true
 
   - name: crossref
     disabled: false
@@ -312,12 +345,206 @@ engines:
   - name: wttr.in
     categories: [weather]
 
+  # =========================================================================
+  # FINANCE  (custom engines — SearXNG ships none)
+  #
+  # SearXNG has no finance engine of any kind: a full catalogue of the 272
+  # active engines in the image contains zero finance/stock entries (the only
+  # "stock" matches are stock *photography*). These are built on `json_engine`,
+  # the generic JSON-API engine, against endpoints verified to answer without
+  # an API key on 2026-08-17.
+  #
+  # READ THIS BEFORE USING FOR STOCK PREDICTION: these return *search results*
+  # — links to tickers and articles. They do not return prices, OHLCV bars,
+  # fundamentals or any numeric series, and SearXNG has no way to. Prediction
+  # work needs a real market-data API (yfinance, Alpha Vantage, Finnhub,
+  # Polygon) wired into the Ollama/OpenWebUI tool layer. Use these to *find*
+  # tickers and news; use a data API to model them.
+  # =========================================================================
+  # Rate-limits hard by source IP: ~15 queries inside a few minutes earns a
+  # sustained HTTP 429, while human-paced queries return 200. SearXNG then
+  # suspends the engine for a cool-off period, so a burst costs you more than
+  # the burst itself. Fine for interactive use; if you drive SearXNG from an
+  # agent loop, expect this one to drop out and lean on coingecko + bing news.
+  - name: yahoo finance
+    engine: json_engine
+    shortcut: yf
+    categories: [finance]
+    paging: false
+    search_url: https://query2.finance.yahoo.com/v1/finance/search?q={query}&quotesCount=10&newsCount=0
+    results_query: quotes
+    url_query: symbol
+    url_prefix: https://finance.yahoo.com/quote/
+    title_query: shortname
+    content_query: exchDisp
+    about:
+      website: https://finance.yahoo.com
+      use_official_api: false
+      require_api_key: false
+      results: JSON
+
+  # DISABLED ON PURPOSE — not because it is broken. It hits the exact same
+  # endpoint as `yahoo finance` above, so leaving both on doubles the requests
+  # to an endpoint that rate-limits hard by IP (measured 2026-08-17: rapid
+  # back-to-back calls return HTTP 429, calls 10s apart all return 200).
+  # Reach it on demand with the bang syntax instead:  !yfn tesla earnings
+  - name: yahoo finance news
+    engine: json_engine
+    shortcut: yfn
+    categories: [finance, news]
+    disabled: true
+    paging: false
+    search_url: https://query2.finance.yahoo.com/v1/finance/search?q={query}&quotesCount=0&newsCount=15
+    results_query: news
+    url_query: link
+    title_query: title
+    content_query: publisher
+    about:
+      website: https://finance.yahoo.com
+      require_api_key: false
+      results: JSON
+
+  - name: coingecko
+    engine: json_engine
+    shortcut: cg
+    categories: [finance, crypto]
+    paging: false
+    search_url: https://api.coingecko.com/api/v3/search?query={query}
+    results_query: coins
+    url_query: id
+    url_prefix: https://www.coingecko.com/en/coins/
+    title_query: name
+    content_query: symbol
+    thumbnail_query: thumb
+    about:
+      website: https://www.coingecko.com
+      require_api_key: false
+      results: JSON
+
+  - name: coinpaprika
+    engine: json_engine
+    shortcut: cp
+    categories: [finance, crypto]
+    paging: false
+    search_url: https://api.coinpaprika.com/v1/search/?q={query}&c=currencies&limit=15
+    results_query: currencies
+    url_query: id
+    url_prefix: https://coinpaprika.com/coin/
+    title_query: name
+    content_query: symbol
+    about:
+      website: https://coinpaprika.com
+      require_api_key: false
+      results: JSON
+
+  # SEC EDGAR full-text filing search — the best free fundamentals source.
+  #
+  # Held `inactive: true`. The SEC requires every automated request to carry a
+  # User-Agent identifying a real person and contact address, and blocks
+  # traffic that does not. install_searxng.sh enables this engine only once
+  # SEC_USER_AGENT in /opt/searxng/.env has been changed from the shipped
+  # example — sending the example value would be worse than not running at all.
+  #
+  # Result URLs are per-COMPANY filing browsers, not per-filing: a filing URL
+  # has to be assembled from cik + accession + filename, and json_engine can
+  # only prefix a single field.
+  - name: sec edgar
+    engine: json_engine
+    shortcut: sec
+    categories: [finance]
+    inactive: true
+    disabled: true
+    paging: false
+    search_url: https://efts.sec.gov/LATEST/search-index?q={query}&forms=10-K,10-Q,8-K
+    results_query: hits/hits
+    url_query: _source/ciks/0
+    url_prefix: https://www.sec.gov/edgar/browse/?CIK=
+    title_query: _source/display_names/0
+    content_query: _source/file_type
+    headers:
+      User-Agent: "Jane Doe jane.doe@example.com"
+    about:
+      website: https://www.sec.gov/edgar
+      require_api_key: false
+      results: JSON
+
+  # =========================================================================
+  # SPORTS  (custom engine — SearXNG ships none)
+  #
+  # TheSportsDB team lookup. Narrow by nature: it matches team names, not
+  # arbitrary sports questions, so a general query returns nothing rather than
+  # something irrelevant. Scores and fixtures need their v2 API and a key.
+  # =========================================================================
+  - name: thesportsdb
+    engine: json_engine
+    shortcut: tsdb
+    categories: [sports]
+    paging: false
+    search_url: https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t={query}
+    results_query: teams
+    url_query: idTeam
+    url_prefix: https://www.thesportsdb.com/team/
+    title_query: strTeam
+    content_query: strDescriptionEN
+    thumbnail_query: strBadge
+    about:
+      website: https://www.thesportsdb.com
+      require_api_key: false
+      results: JSON
+
+  # =========================================================================
+  # SOCIAL MEDIA / BLOGS / FORUMS — all shipped engines, just switched on
+  # =========================================================================
+  - name: lemmy posts
+    disabled: false
+  - name: lemmy communities
+    disabled: false
+  - name: lemmy comments
+    disabled: false
+  - name: mastodon users
+    disabled: false
+  - name: mastodon hashtags
+    disabled: false
+  - name: tootfinder
+    disabled: false
+  - name: boardreader
+    disabled: false
+
+  - name: wiby
+    disabled: false
+  # searchmysite returns "access denied" — same bot-blocking pattern as the big
+  # engines. Left registered so it can be re-tested by flipping this line.
+  - name: searchmysite
+    disabled: true
+
+  - name: discuss.python
+    disabled: false
+
 outgoing:
   request_timeout: 15.0
   max_request_timeout: 30.0
   pool_connections: 100
   pool_maxsize: 20
   enable_http2: true
+  # Retry once through the next proxy in the pool before giving up. Harmless
+  # without proxies configured (it just retries the same direct route).
+  retries: 1
+
+  # >>> MANAGED BLOCK: outbound proxy pool — do not edit by hand.
+  # install_searxng.sh rewrites everything between these two markers from
+  # SEARXNG_PROXIES in /opt/searxng/.env. Empty means direct egress.
+  #
+  # SearXNG round-robins a proxy list per request (searx/network/network.py
+  # builds `cycle(proxy_urls)`), so listing several egress points spreads load
+  # across them automatically — which is what makes the rate-limited engines
+  # (yahoo finance, sec edgar) and the CAPTCHA-blocked ones survivable.
+  #
+  # If the host itself has several public IPs rather than proxies, use
+  # `source_ips:` instead — it is cycled the same way:
+  #   source_ips:
+  #     - 203.0.113.10
+  #     - 203.0.113.11
+  # <<< MANAGED BLOCK: outbound proxy pool
 
 # ===========================================================================
 # NOTES — why revision 0.0.28 failed, and what is intentionally gone
@@ -339,12 +566,34 @@ outgoing:
 # 3. `engine: yahoo_finance`, `tradingview`, `phind` — never existed in SearXNG.
 #
 # 4. `name: espn` used `url:` where the xpath engine requires `search_url:` plus
-#    `results_xpath` / `url_xpath` / `title_xpath` / `content_xpath`. Removed;
-#    SearXNG ships no sports engine.
+#    `results_xpath` / `url_xpath` / `title_xpath` / `content_xpath`. Removed.
 #
-# 5. Dropped categories: `finance` and `sports`. SearXNG has no engine for
-#    either (the sole finance-adjacent engine is the `currency` converter,
-#    which is filed under general).
+# 5. FINANCE + SPORTS (added 2026-08-17). SearXNG ships no engine for either —
+#    a full catalogue of the 272 active engines in the image returns zero
+#    finance and zero sports entries. They are built here on `json_engine`,
+#    the generic JSON-API engine, against endpoints verified keyless:
+#      yahoo finance  quotes    query2.finance.yahoo.com/v1/finance/search
+#      yahoo finance  news      (same endpoint; disabled to halve request rate)
+#      coingecko                api.coingecko.com/api/v3/search
+#      thesportsdb              thesportsdb.com/api/v1/json/3/searchteams.php
+#
+#    These return LINKS, not numbers. For actual price/fundamental data to
+#    model against, use these keyless sources from the Ollama/OpenWebUI tool
+#    layer — none of them fit SearXNG's result shape, which is why they are
+#    documented here rather than configured as engines:
+#
+#      Yahoo chart (OHLCV)  https://query1.finance.yahoo.com/v8/finance/chart/NVDA?range=1y&interval=1d
+#      yfinance (python)    wraps the above; the pragmatic default
+#      SEC EDGAR full text  https://efts.sec.gov/LATEST/search-index?q=%22nvidia%22&forms=10-K
+#      SEC company facts    https://data.sec.gov/api/xbrl/companyfacts/CIK0001045810.json
+#      SEC submissions      https://data.sec.gov/submissions/CIK0001045810.json
+#      Frankfurter (FX)     https://api.frankfurter.app/latest?from=USD
+#      CoinGecko markets    https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd
+#
+#    SEC EDGAR is the highest-value one for fundamentals and it is genuinely
+#    free, but it needs a descriptive User-Agent header and its filing URLs
+#    must be composed from several JSON fields, which json_engine cannot do.
+#    All SEC endpoints require: User-Agent: "Your Name your@email".
 #
 # 6. Blocked-by-IP engines (2026-08-17): duckduckgo, brave, startpage, qwant and
 #    mojeek all refuse this host with CAPTCHAs / 429 / 503, and wikidata 403s
