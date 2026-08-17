@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Install & run SearXNG via Docker Compose.
-# By: Christopher Gray / https://github.com/c2theg |  Version: 1.0.32  | Updated: 8/17/2026
+# By: Christopher Gray / https://github.com/c2theg |  Version: 1.0.36  | Updated: 8/17/2026
 #
 # ONE-COMMAND INSTALL — installs Docker if missing, fetches every config file
 # from GitHub, generates the compose stack, starts it and verifies the JSON API:
@@ -14,6 +14,8 @@
 #   searxng_limiter.toml -> /opt/searxng/limiter.toml         (optional, built-in default)
 #   install_searxng.sh   -> /opt/searxng/install_searxng.sh   (copy of this script)
 #   generated            -> docker-compose.yml, .secret_key, .install-manifest
+#   ca-certificates/     -> extra CAs trusted by the container (see --ca-cert)
+#   .env                 -> API keys (BRAVE_API_KEY=...), mode 0600, never committed
 #
 # When run from a file, a copy of an asset sitting next to this script wins over
 # the download. When piped, sibling lookup is disabled and everything comes from
@@ -26,6 +28,8 @@
 #   sudo ./install_searxng.sh --settings ./searxng_settings.yml  # use a local file
 #   sudo ./install_searxng.sh --url <raw-url>  # settings from an arbitrary URL
 #   sudo ./install_searxng.sh --offline        # local files only, never touch the network
+#   sudo ./install_searxng.sh --ca-cert /path/corp-ca.pem   # trust an extra CA (repeatable)
+#   sudo ./install_searxng.sh --brave-key BSA...            # or put it in /opt/searxng/.env
 #   sudo ./install_searxng.sh --port 8080 --host 0.0.0.0
 #   sudo ./install_searxng.sh --no-validate    # skip the engine preflight check
 #   sudo ./install_searxng.sh --uninstall      # stop & remove the stack
@@ -49,6 +53,7 @@ RAW_BASE=""            # derived from REPO/REF below unless --raw-base is given
 SETTINGS_ASSET="searxng_settings.yml"
 LIMITER_ASSET="searxng_limiter.toml"
 
+CA_DIR=""              # set from INSTALL_DIR after arg parsing
 SETTINGS_URL=""        # full override for just the settings file (--url)
 SETTINGS_SRC=""        # local settings file (--settings); wins over downloading
 PORT="7042"
@@ -57,6 +62,26 @@ IMAGE="searxng/searxng:latest"
 UNINSTALL=0
 VALIDATE=1
 OFFLINE=0              # --offline: never reach for GitHub, local files only
+CA_CERTS=()            # --ca-cert FILE (repeatable): extra CAs to trust
+ENV_FILE=""            # $INSTALL_DIR/.env — secrets, never committed to the repo
+BRAVE_API_KEY=""       # --brave-key, or BRAVE_API_KEY in .env / the environment
+
+# ---------------------------------------------------------------------------
+# Engines that need an API key: "<engine name>|<.env variable>|<where to get one>"
+#
+# The engine names match `- name:` in settings.yml. Only engines actually
+# present in the deployed settings.yml are ever reported, so this table can
+# safely list more than the config currently uses. Every entry here is an
+# engine that ships `api_key: ""` in SearXNG's own default settings.
+# ---------------------------------------------------------------------------
+API_KEY_REGISTRY=(
+  "braveapi|BRAVE_API_KEY|https://api.search.brave.com  (free tier ~2k queries/month)"
+  "exaapi|EXA_API_KEY|https://exa.ai"
+  "jina|JINA_API_KEY|https://jina.ai"
+  "springer nature|SPRINGER_API_KEY|https://dev.springernature.com"
+  "core.ac.uk|CORE_API_KEY|https://core.ac.uk/services/api"
+  "astrophysics data system|ADS_API_KEY|https://ui.adsabs.harvard.edu/user/settings/token"
+)
 
 # ---------------------------------------------------------------------------
 # Arg parsing
@@ -75,6 +100,8 @@ while [[ $# -gt 0 ]]; do
     --uninstall)  UNINSTALL=1;       shift   ;;
     --no-validate) VALIDATE=0;       shift   ;;
     --offline)    OFFLINE=1;         shift   ;;
+    --ca-cert)    CA_CERTS+=("$2");  shift 2 ;;
+    --brave-key)  BRAVE_API_KEY="$2"; BRAVE_KEY_SOURCE="--brave-key"; shift 2 ;;
     -h|--help)
       # Print the comment header verbatim, up to the first line of code, so the
       # help text can never drift out of sync with a hard-coded line count.
@@ -95,6 +122,8 @@ warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 [[ -n "$RAW_BASE" ]] || RAW_BASE="https://raw.githubusercontent.com/${REPO}/${REF}"
+CA_DIR="$INSTALL_DIR/ca-certificates"
+ENV_FILE="$INSTALL_DIR/.env"
 
 # When the script is piped (curl ... | sudo bash) there is no directory to look
 # in: $0 is "bash" and dirname resolves to $PWD, which is wherever the user
@@ -164,6 +193,133 @@ fetch_asset() {
   rm -f "$tmp"
   ASSET_ORIGIN="$url"
   return 0
+}
+
+# ---------------------------------------------------------------------------
+# install_ca_cert <file>
+#
+# Normalises a CA certificate into $CA_DIR so the container's
+# `update-ca-certificates` will actually pick it up. Two traps make this fail
+# silently if you just copy a file in:
+#
+#   1. update-ca-certificates ONLY reads files matching *.crt. A perfectly good
+#      "corp-ca.pem" is ignored without a word.
+#   2. It expects ONE certificate per file. Hand it a bundle and the extra
+#      certificates after the first are dropped.
+#
+# So: convert DER->PEM if needed, split bundles, and write one .crt per cert.
+# ---------------------------------------------------------------------------
+install_ca_cert() {
+  local src="$1" stem pem tmpd count=0 out
+
+  [[ -f "$src" ]] || die "CA certificate not found: $src"
+  stem="$(basename -- "$src")"; stem="${stem%.*}"
+  stem="$(printf '%s' "$stem" | tr -c 'A-Za-z0-9._-' '_')"
+
+  tmpd="$(mktemp -d)"
+  pem="$tmpd/in.pem"
+
+  # Detect the encoding by looking for the PEM armour, NOT by letting openssl
+  # guess: OpenSSL 3.x auto-detects DER even without -inform, so `openssl x509
+  # -in cert.der -noout` succeeds and a naive PEM-first check misroutes every
+  # DER file into the PEM branch.
+  if LC_ALL=C grep -qa -- '-----BEGIN CERTIFICATE-----' "$src"; then
+    cp "$src" "$pem"                                        # already PEM
+  elif openssl x509 -in "$src" -inform DER -noout 2>/dev/null; then
+    log "  $stem: DER encoded, converting to PEM"
+    openssl x509 -in "$src" -inform DER -outform PEM -out "$pem"
+  else
+    rm -rf "$tmpd"
+    die "Not a readable X.509 certificate: $src
+    Expected PEM ('-----BEGIN CERTIFICATE-----') or DER."
+  fi
+
+  # Split into one file per certificate. LC_ALL=C keeps awk from choking on
+  # multibyte sequences if anything non-UTF8 sneaks through.
+  LC_ALL=C awk -v dir="$tmpd" '
+    /-----BEGIN CERTIFICATE-----/ { n++ }
+    n > 0 { print > sprintf("%s/cert-%02d.pem", dir, n) }
+  ' "$pem"
+
+  for f in "$tmpd"/cert-*.pem; do
+    [[ -e "$f" ]] || break
+    if ! openssl x509 -in "$f" -noout 2>/dev/null; then
+      warn "  skipping an unparseable certificate block in $src"
+      continue
+    fi
+    count=$((count + 1))
+    if [[ $count -eq 1 ]]; then out="$CA_DIR/${stem}.crt"
+    else                        out="$CA_DIR/${stem}-${count}.crt"; fi
+    install -m 0644 "$f" "$out"
+    log "  + $(basename "$out"): $(openssl x509 -in "$out" -noout -subject 2>/dev/null | sed 's/^subject=//' | cut -c1-70)"
+  done
+
+  rm -rf "$tmpd"
+  [[ $count -gt 0 ]] || die "No certificates found in $src"
+}
+
+# ---------------------------------------------------------------------------
+# load_env_file — read KEY=value pairs from $INSTALL_DIR/.env
+#
+# Parsed line by line rather than `source`d: this file holds secrets, and
+# sourcing it would execute whatever is in it as shell. Only names we know
+# about are picked up, and a value already given on the command line wins.
+# ---------------------------------------------------------------------------
+load_env_file() {
+  local k v entry var known
+  [[ -f "$ENV_FILE" ]] || return 0
+  while IFS='=' read -r k v; do
+    k="${k#"${k%%[![:space:]]*}"}"; k="${k%"${k##*[![:space:]]}"}"   # trim
+    [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    v="${v%$'\r'}"                                                   # strip CRLF
+    v="${v#\"}"; v="${v%\"}"; v="${v#\'}"; v="${v%\'}"               # unquote
+
+    # Only variables named in the registry are honoured.
+    known=0
+    for entry in "${API_KEY_REGISTRY[@]}"; do
+      IFS='|' read -r _ var _ <<< "$entry"
+      [[ "$k" == "$var" ]] && known=1 && break
+    done
+    [[ $known -eq 1 ]] || continue
+
+    # A value already set (e.g. via --brave-key) wins over the file.
+    [[ -n "${!k:-}" ]] || printf -v "$k" '%s' "$v"
+  done < <(grep -vE '^[[:space:]]*(#|$)' "$ENV_FILE" || true)
+}
+
+# ---------------------------------------------------------------------------
+# apply_api_key <settings-file> <engine-name> <api-key>
+#
+# Rewrites ONLY that engine's block: fills in the key and flips both `inactive`
+# and `disabled` to false. Both matter — braveapi.init() raises "No API key
+# provided" when the key is empty, and init runs even for a disabled engine, so
+# flipping inactive without supplying a key breaks the boot.
+# ---------------------------------------------------------------------------
+apply_api_key() {
+  local file="$1" engine="$2" tmp
+  tmp="$(mktemp)"
+  # Key and engine name travel via the environment, not `awk -v`, because -v
+  # applies backslash-escape processing to the value.
+  API_KEY_FOR_AWK="$3" API_ENGINE_FOR_AWK="$engine" awk '
+    BEGIN {
+      inblk = 0; key = ENVIRON["API_KEY_FOR_AWK"]
+      want = "- name: " ENVIRON["API_ENGINE_FOR_AWK"]; touched = 0
+    }
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line)
+    }
+    line == want { inblk = 1; touched = 1; print; next }
+    inblk && /^[[:space:]]*-[[:space:]]*name:/ { inblk = 0 }   # next engine
+    inblk && /^[^[:space:]]/                   { inblk = 0 }   # back to top level
+    inblk && /^[[:space:]]+inactive:/ { print "    inactive: false"; next }
+    inblk && /^[[:space:]]+disabled:/ { print "    disabled: false"; next }
+    inblk && /^[[:space:]]+api_key:/  { print "    api_key: \"" key "\""; next }
+    { print }
+    END { if (!touched) exit 3 }
+  ' "$file" > "$tmp" || { rm -f "$tmp"; return 3; }
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
 }
 
 # ---------------------------------------------------------------------------
@@ -304,6 +460,69 @@ if grep -q 'CHANGE_ME_AT_INSTALL_TIME' "$INSTALL_DIR/settings.yml"; then
 fi
 
 # ---------------------------------------------------------------------------
+# API keys from .env
+#
+# settings.yml is public (it lives in the git repo), so engine API keys are held
+# in $INSTALL_DIR/.env and injected here at install time. SearXNG has no generic
+# ${ENV_VAR} interpolation in settings.yml — only a handful of settings carry an
+# environ_name, and engine api_key fields are not among them — so substitution
+# is the only route.
+# ---------------------------------------------------------------------------
+# Which key-requiring engines are actually present in the deployed config?
+KEYED_ENGINES=()        # "engine|VAR|url" for engines present in settings.yml
+KEYS_CONFIGURED=()      # "engine|VAR" that got a key applied
+KEYS_MISSING=()         # "engine|VAR|url" still waiting for a key
+
+for _entry in "${API_KEY_REGISTRY[@]}"; do
+  IFS='|' read -r _eng _var _url <<< "$_entry"
+  if grep -qE "^[[:space:]]*-[[:space:]]*name:[[:space:]]*${_eng}[[:space:]]*$" "$INSTALL_DIR/settings.yml"; then
+    KEYED_ENGINES+=("$_entry")
+  fi
+done
+
+# Seed .env with an entry for every keyed engine in this config.
+if [[ ! -f "$ENV_FILE" ]]; then
+  ( umask 077
+    {
+      echo "# SearXNG API keys. This file is NOT in the git repo — keep it that way."
+      echo "# Re-run install_searxng.sh after editing to apply changes."
+      echo "#"
+      echo "# Leave a value empty to keep that engine switched off."
+      echo
+      for _entry in "${KEYED_ENGINES[@]:-}"; do
+        [[ -n "$_entry" ]] || continue
+        IFS='|' read -r _eng _var _url <<< "$_entry"
+        echo "# ${_eng} — get a key at ${_url}"
+        echo "${_var}="
+        echo
+      done
+    } > "$ENV_FILE"
+  )
+  log "Created $ENV_FILE"
+fi
+chmod 0600 "$ENV_FILE"
+
+load_env_file
+
+for _entry in "${KEYED_ENGINES[@]:-}"; do
+  [[ -n "$_entry" ]] || continue
+  IFS='|' read -r _eng _var _url <<< "$_entry"
+  _key="${!_var:-}"
+  if [[ -z "$_key" ]]; then
+    KEYS_MISSING+=("$_entry")
+    continue
+  fi
+  if apply_api_key "$INSTALL_DIR/settings.yml" "$_eng" "$_key"; then
+    grep -qF "$_key" "$INSTALL_DIR/settings.yml" \
+      || die "Failed to inject $_var into settings.yml for engine '$_eng'."
+    log "$_var applied — '$_eng' engine enabled."
+    KEYS_CONFIGURED+=("${_eng}|${_var}")
+  else
+    warn "No '$_eng' entry in settings.yml — $_var not applied."
+  fi
+done
+
+# ---------------------------------------------------------------------------
 # limiter.toml — fallback only; used when the repo has no searxng_limiter.toml
 #
 # Without this file SearXNG warns "missing config file: /etc/searxng/limiter.toml"
@@ -314,6 +533,42 @@ fi
 # is set!" error. If you later front this with nginx/Traefik, put that proxy's
 # network back in the list.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Extra CA certificates
+#
+# $CA_DIR is bind-mounted at /usr/local/share/ca-certificates, which the image's
+# entrypoint feeds to `update-ca-certificates` on every boot (that is the
+# "Updating certificates in /etc/ssl/certs ... N added" line in the logs). This
+# fixes TLS for the whole container — httpx, curl, everything — rather than just
+# SearXNG, and it keeps certificate verification ON, unlike `outgoing.verify:
+# false`. The directory persists across runs: drop a cert in and re-run.
+# ---------------------------------------------------------------------------
+mkdir -p "$CA_DIR"
+chmod 0755 "$CA_DIR"
+
+for _cert in "${CA_CERTS[@]:-}"; do
+  [[ -n "$_cert" ]] || continue
+  log "Installing CA certificate from $_cert ..."
+  install_ca_cert "$_cert"
+done
+
+# Rescue anything dropped into the directory by hand with the wrong extension —
+# update-ca-certificates would ignore it silently otherwise.
+shopt -s nullglob
+for _stray in "$CA_DIR"/*; do
+  case "$_stray" in
+    *.crt) continue ;;
+  esac
+  warn "$(basename "$_stray") will be ignored by update-ca-certificates (needs a .crt extension) — converting"
+  install_ca_cert "$_stray" && rm -f "$_stray"
+done
+shopt -u nullglob
+
+CA_COUNT="$(find "$CA_DIR" -maxdepth 1 -name '*.crt' 2>/dev/null | wc -l | tr -d ' ')"
+if [[ "$CA_COUNT" -gt 0 ]]; then
+  log "$CA_COUNT extra CA certificate(s) will be trusted by the container."
+fi
+
 if [[ "${WRITE_DEFAULT_LIMITER:-0}" -eq 1 ]]; then
   log "Writing default $INSTALL_DIR/limiter.toml ..."
   cat > "$INSTALL_DIR/limiter.toml" <<'LIMITER'
@@ -362,6 +617,9 @@ services:
     volumes:
       - ./settings.yml:/etc/searxng/settings.yml:rw
       - ./limiter.toml:/etc/searxng/limiter.toml:ro
+      # Extra trusted CAs; the entrypoint runs update-ca-certificates over this
+      # directory at boot. Empty is fine (reports "0 added").
+      - ./ca-certificates:/usr/local/share/ca-certificates:ro
     environment:
       - SEARXNG_BASE_URL=http://localhost:${PORT}/
       # SEARXNG_REDIS_URL is deprecated upstream (logs a DeprecationWarning from
@@ -564,6 +822,8 @@ cat <<EOF
   Install dir    $INSTALL_DIR
     settings.yml       <- ${SETTINGS_ORIGIN:-unknown}
     limiter.toml       <- ${LIMITER_ORIGIN:-unknown}
+    ca-certificates/     ${CA_COUNT:-0} extra CA(s) trusted by the container
+    .env                 API keys (mode 0600, not in the repo)
     docker-compose.yml   generated
     .secret_key          generated, preserved across re-runs
     .install-manifest    what was deployed, and from where
@@ -572,6 +832,40 @@ cat <<EOF
     Engine: searxng
     Query URL: http://${HOST}:${PORT}/search?q=<query>&format=json
 EOF
+
+# ---------------------------------------------------------------------------
+# API key guidance — always tell the operator exactly how to set any key this
+# config can use, whether or not it is already set.
+# ---------------------------------------------------------------------------
+if [[ -n "${KEYED_ENGINES[*]:-}" ]]; then
+  echo
+  echo "  API keys — set these in $ENV_FILE (mode 0600, never committed):"
+  echo
+  for _entry in "${KEYED_ENGINES[@]}"; do
+    IFS='|' read -r _eng _var _url <<< "$_entry"
+    if [[ -n "${!_var:-}" ]]; then
+      printf '    [set]     %-24s %s\n' "$_var" "-> '$_eng' enabled"
+    else
+      printf '    [not set] %-24s %s\n' "$_var" "-> '$_eng' stays off"
+      printf '              get a key: %s\n' "$_url"
+    fi
+  done
+  if [[ -n "${KEYS_MISSING[*]:-}" ]]; then
+    cat <<KEYHELP
+
+    To enable one:
+      sudo nano $ENV_FILE          # set VAR=your-key
+      sudo $INSTALL_DIR/install_searxng.sh   # re-run to apply
+
+    Or in a single command:
+      sudo $INSTALL_DIR/install_searxng.sh --brave-key <key>
+
+    The key is written into $INSTALL_DIR/settings.yml at install time and is
+    never stored in the git repo. Re-running always re-applies it from .env.
+KEYHELP
+  fi
+fi
+
 
 if [[ -n "${failed_engines// /}" ]]; then
   echo
