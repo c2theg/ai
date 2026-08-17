@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Install & run SearXNG via Docker Compose.
-# By: Christopher Gray / https://github.com/c2theg |  Version: 1.0.31  | Updated: 8/11/2026
+# By: Christopher Gray / https://github.com/c2theg |  Version: 1.0.32  | Updated: 8/17/2026
 #
 # ONE-COMMAND INSTALL — installs Docker if missing, fetches every config file
 # from GitHub, generates the compose stack, starts it and verifies the JSON API:
@@ -524,12 +524,18 @@ fi
 chmod 0644 "$INSTALL_DIR/.install-manifest"
 
 # ---------------------------------------------------------------------------
-# Health check — poll the JSON API, since that is what OpenWebUI actually calls
+# Health check — poll /healthz, NOT /search.
+#
+# Polling the search endpoint means every install fires a real metasearch query
+# at every upstream engine, repeatedly, in a tight loop. That is a good way to
+# earn a CAPTCHA from DuckDuckGo/Startpage/Qwant and a 429 from Brave, which
+# then look like config faults. /healthz answers from SearXNG itself and touches
+# no upstream. The single real query happens once, in the smoke test below.
 # ---------------------------------------------------------------------------
 log "Waiting for SearXNG to answer ..."
 ok=0
 for _ in $(seq 1 30); do
-  if curl -fsS "http://127.0.0.1:${PORT}/search?q=test&format=json" >/dev/null 2>&1; then
+  if curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; then
     ok=1; break
   fi
   sleep 2
@@ -640,8 +646,9 @@ PYSMOKE
 
   echo
   echo "  Test it yourself any time:"
-  echo "    curl -s 'http://127.0.0.1:${PORT}/search?q=test&format=json' | python3 -m json.tool | head -40"
   echo "    curl -s 'http://127.0.0.1:${PORT}/search?q=test&format=json' | python3 -c 'import json,sys; print(len(json.load(sys.stdin)[\"results\"]), \"results\")'"
+  echo "  Which engines are erroring, and why:"
+  echo "    http://${HOST}:${PORT}/stats/errors"
 fi
 
 if [[ $ok -ne 1 ]]; then
