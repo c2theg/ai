@@ -1,15 +1,11 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.3.31  |  Update: 8/14/2026
+# Christopher Gray  |  Version: 0.3.32  |  Update: 8/18/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
 #   curl -fsSL -o 'install_ai_spark_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark_vllm.sh' && chmod u+x install_ai_spark_vllm.sh
 #   ./install_ai_spark_vllm.sh --start "Qwen3.8-27B-FP8,Qwen3-Embedding-4B"
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3-Embedding-4B"
-#   ./install_ai_spark_vllm.sh --start "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16,Qwen3-Reranker-4B"
-#
-#   ./install_ai_spark_vllm.sh --start "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8,Qwen3-Reranker-4B"
-#   ./install_ai_spark_vllm.sh --start "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4,Qwen3-Reranker-4B"
 
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-FP8,Qwen3-Reranker-4B"
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3-Reranker-4B"
@@ -60,7 +56,44 @@
 #   whether a port is already in use, shows what holds it, and offers to kill it
 #   (interactive) or reclaims it only from a prior vLLM process (headless).
 #
+#   Generation defaults (chat models only — not Embeddings/Reranking/ASR):
+#   asked once per run, Enter accepts the default — max-model-len 65536,
+#   reasoning_effort "low" (low/medium/xhigh), thinking_token_budget 1024,
+#   temperature 0.2. Headless/--start runs use these directly unless overridden
+#   with SERVE_MAX_MODEL_LEN / SERVE_REASONING / SERVE_REASONING_EFFORT /
+#   SERVE_THINKING_BUDGET / SERVE_TEMPERATURE env vars. Test a served model:
+#     curl http://localhost:8007/v1/chat/completions \
+#       -H "Content-Type: application/json" \
+#       -d '{
+#             "model": "secondary",
+#             "messages": [{"role": "user", "content": "Explain why BGP route flapping is bad."}],
+#             "chat_template_kwargs": {"reasoning_effort": "low"},
+#             "temperature": 1.0,
+#             "top_p": 0.95,
+#             "max_tokens": 4096
+#           }'
+#
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.3.32  8/18/2026
+#   - Added global generation defaults for every chat model: --max-model-len
+#     65536, reasoning_effort "low" (low/medium/xhigh), thinking_token_budget
+#     1024, and temperature 0.2. Asked ONCE per run via the new
+#     _configure_serve_defaults() (right after the Qwen3.8 prompt), Enter
+#     accepts the default at each prompt; headless/--start runs use the
+#     defaults directly unless overridden with SERVE_MAX_MODEL_LEN /
+#     SERVE_REASONING / SERVE_REASONING_EFFORT / SERVE_THINKING_BUDGET /
+#     SERVE_TEMPERATURE env vars. reasoning_effort + thinking_token_budget ride
+#     along as a --default-chat-template-kwargs default (client requests can
+#     still override them, same as the reasoning_effort example in the header);
+#     temperature rides along as --override-generation-config. Embeddings,
+#     Reranking, and ASR models are exempt (task types where these don't apply,
+#     and their --max-model-len is deliberately small for VRAM); the four
+#     "Super Large" 120B+ profiles keep their own tuned --max-model-len since
+#     they already run at 0.75-0.93 gpu-memory-utilization with essentially no
+#     headroom, but still get the reasoning/temperature defaults. Every
+#     --served-model-name alias is unchanged — _vllm_launch still strips and
+#     re-applies the stable port-role alias exactly as before.
 #
 # v0.3.31  8/14/2026
 #   - Added Qwen/Qwen3.8-27B-FP8 (official fine-grained 128x128 block-FP8
@@ -125,33 +158,6 @@
 #     _install_boot_cron) into _validate_spec_or_die, used by both
 #     _install_boot_cron and the new _set_boot_model.
 #
-# v0.3.26  8/8/2026
-#   - Replaced nvidia/Qwen3.6-35B-A3B-NVFP4's serve profile with a fuller DGX
-#     Spark config: dropped the explicit --quantization modelopt_fp4 (now
-#     auto-detected, needed for --moe-backend marlin to apply), added
-#     --attention-backend flashinfer, --moe-backend marlin, --async-scheduling,
-#     --load-format fastsafetensors, MTP --speculative-config (3 draft tokens,
-#     triton MoE backend), and switched the tool/reasoning parsers from hermes
-#     to qwen3_xml/qwen3. gpu-memory-utilization raised 0.30 → 0.4 and
-#     max-model-len raised 32768 → 262144 (full context) — this profile is no
-#     longer sized to co-run with the 27B NVFP4 model at the same time; catalog
-#     VRAM estimate bumped 22 → 49 GB to match. Also added
-#     sjug/Qwen3.5-122B-A10B-NVFP4-resharded (catalog idx new, port 8034,
-#     ~71 GB disk / ~72 GB VRAM, "Qwen3.5-122B-A10B-NVFP4-spark" local dir,
-#     "Super Large") — same weights as RedHatAI's Qwen3.5-122B-A10B NVFP4
-#     quantization, resharded by the uploader into 16 x ~4.7GB shards
-#     specifically to avoid memory-allocation failures on DGX Spark's 128GB
-#     unified pool. Serve profile pulled from the model card's DGX-Spark-
-#     optimized command: --load-format fastsafetensors, --kv-cache-dtype fp8,
-#     0.7 gpu-memory-utilization, full 262144 max-model-len, qwen3_coder
-#     tool-call parser + qwen3 reasoning parser, and three VLLM_* env vars
-#     (NVFP4_GEMM_BACKEND=marlin, TEST_FORCE_FP8_MARLIN=1,
-#     MARLIN_USE_ATOMIC_ADD=1) that pin the Marlin GEMM backend the card
-#     benchmarked ~2% faster than CUTLASS on GB10 — exported only around this
-#     model's _vllm_launch call (prefix-assignment on the call, not a global
-#     export), so it can't leak into any other model's launch.
-#
-
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ─── strict mode ──────────────────────────────────────────────────────────────
@@ -355,6 +361,25 @@ MAX_JOBS=4
 VLLM_READY_TIMEOUT=1800
 
 # =============================================
+# GENERATION DEFAULTS — reasoning, context length, temperature
+# =============================================
+# Applied to every CHAT model served this run (Embeddings/Reranking/ASR are
+# excluded — reasoning_effort/temperature don't apply to those task types, and
+# their --max-model-len is deliberately small to fit a tiny VRAM fraction; the
+# four "Super Large" 120B+ profiles also keep their own tuned --max-model-len
+# since they already run at 0.9+ gpu-memory-utilization with almost no VRAM
+# headroom left to grow the KV cache into).
+# Asked once per run — see _configure_serve_defaults(). Headless/--start runs
+# use these values directly unless overridden with the matching SERVE_* env var:
+#   SERVE_MAX_MODEL_LEN=131072 SERVE_REASONING=false ./... --start <spec>
+#   SERVE_REASONING_EFFORT=xhigh SERVE_THINKING_BUDGET=4096 SERVE_TEMPERATURE=0.7 ./...
+DEFAULT_MAX_MODEL_LEN=65536          # --max-model-len for in-scope chat models
+DEFAULT_REASONING_ENABLED=true       # send reasoning_effort/thinking_token_budget by default
+DEFAULT_REASONING_EFFORT="low"       # low | medium | xhigh
+DEFAULT_THINKING_TOKEN_BUDGET=1024
+DEFAULT_TEMPERATURE=0.2
+
+# =============================================
 # OPTIONAL FEATURES — toggle on/off
 # =============================================
 ENABLE_SEARXNG=true          # SearXNG web search engine for OpenWebUI (runs on port 4040)
@@ -474,7 +499,6 @@ _add "google/gemma-4-26B-A4B-it"                                 "gemma-4-26B-A4
 _add "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"        "Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16" "Nemotron-3-Nano-Omni-30B (BF16)"  60   65   8008  "MoE Models"
 _add "BAAI/bge-m3"                                               "bge-m3"                                "BGE-M3 (Embeddings)"                     3    4   8011  "Embeddings"
 _add "Qwen/Qwen3-Embedding-4B"                                   "Qwen3-Embedding-4B"                    "Qwen3-Embedding-4B (Embeddings)"         8   10   8010  "Embeddings"
-_add "BAAI/bge-reranker-v2-m3"                                   "bge-reranker-v2-m3"                    "BGE-Reranker-v2-m3 (Reranking)"          2    3   8020  "Reranking"
 _add "Qwen/Qwen3-Reranker-4B"                                    "Qwen3-Reranker-4B"                     "Qwen3-Reranker-4B (Reranking)"            8    9   8021  "Reranking"
 _add "nvidia/parakeet-tdt-0.6b-v3"                               "parakeet-tdt-0.6b-v3"                  "Parakeet-TDT-0.6B v3 (ASR / NeMo)"       1    0      0  "ASR"
 _add "nvidia/nemotron-speech-streaming-en-0.6b"                  "nemotron-speech-streaming-en-0.6b"     "Nemotron-Speech-Streaming-0.6B (ASR)"    1    0      0  "ASR"
@@ -500,7 +524,7 @@ _add "openai/gpt-oss-120b"                                       "gpt-oss-120b" 
 # ~71 GB disk / ~72 GB actual VRAM (smallest of the three 122B-A10B profiles
 # here, and the only one that supports the full 262144 context — see the
 # _serve_model entry below for why).
-_add "sjug/Qwen3.5-122B-A10B-NVFP4-resharded"                    "Qwen3.5-122B-A10B-NVFP4-spark"         "Qwen3.5-122B-A10B-NVFP4 (Spark resharded) [SUPER]" 71 72   8034  "Super Large"
+#_add "sjug/Qwen3.5-122B-A10B-NVFP4-resharded"                    "Qwen3.5-122B-A10B-NVFP4-spark"         "Qwen3.5-122B-A10B-NVFP4 (Spark resharded) [SUPER]" 71 72   8034  "Super Large"
 
 # ── Small models with a custom idle-sleep timeout ─────────────────────────────
 # These pass the optional 8th _add field (SLEEP_MIN) = 60, so the sleep watchdog
@@ -1156,6 +1180,87 @@ _configure_qwen38() {
         MDL_THINKING[$idx]="$thinking"
         echo "  ${MDL_DIR[$idx]}: input=$input_mode, thinking=$thinking"
     done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Global generation defaults — max context length, reasoning effort, thinking
+# token budget, temperature. Asked ONCE per run and applied to every in-scope
+# chat model (see the DEFAULT_* vars above and the exclusions noted there).
+# Headless runs cannot prompt, so environment variables provide the override —
+# see the comment above DEFAULT_MAX_MODEL_LEN for the exact var names.
+# ─────────────────────────────────────────────────────────────────────────────
+_configure_serve_defaults() {
+    if [ "$HEADLESS" -eq 1 ]; then
+        SERVE_MAX_MODEL_LEN="${SERVE_MAX_MODEL_LEN:-$DEFAULT_MAX_MODEL_LEN}"
+        SERVE_REASONING_ENABLED="${SERVE_REASONING:-$DEFAULT_REASONING_ENABLED}"
+        SERVE_REASONING_EFFORT="${SERVE_REASONING_EFFORT:-$DEFAULT_REASONING_EFFORT}"
+        SERVE_THINKING_BUDGET="${SERVE_THINKING_BUDGET:-$DEFAULT_THINKING_TOKEN_BUDGET}"
+        SERVE_TEMPERATURE="${SERVE_TEMPERATURE:-$DEFAULT_TEMPERATURE}"
+    else
+        echo ""
+        echo "  ── Generation defaults (chat models only) ──────────────────────────"
+        local _ans
+
+        printf "  Max context length --max-model-len [%s]: " "$DEFAULT_MAX_MODEL_LEN"
+        read -r _ans
+        SERVE_MAX_MODEL_LEN="${_ans:-$DEFAULT_MAX_MODEL_LEN}"
+        [[ "$SERVE_MAX_MODEL_LEN" =~ ^[0-9]+$ ]] || {
+            echo "  ⚠️  Invalid value; using $DEFAULT_MAX_MODEL_LEN."
+            SERVE_MAX_MODEL_LEN="$DEFAULT_MAX_MODEL_LEN"
+        }
+
+        printf "  Enable reasoning by default (reasoning_effort / thinking budget) [Y/n]: "
+        read -r _ans
+        if [[ "$_ans" =~ ^[Nn]$ ]]; then SERVE_REASONING_ENABLED=false; else SERVE_REASONING_ENABLED=true; fi
+
+        if [ "$SERVE_REASONING_ENABLED" = "true" ]; then
+            while true; do
+                printf "  Reasoning effort (low/medium/xhigh) [%s]: " "$DEFAULT_REASONING_EFFORT"
+                read -r _ans
+                _ans="${_ans:-$DEFAULT_REASONING_EFFORT}"
+                case "$_ans" in
+                    low|medium|xhigh) SERVE_REASONING_EFFORT="$_ans"; break ;;
+                    *) echo "  ⚠️  Enter low, medium, or xhigh." ;;
+                esac
+            done
+
+            printf "  Thinking token budget [%s]: " "$DEFAULT_THINKING_TOKEN_BUDGET"
+            read -r _ans
+            SERVE_THINKING_BUDGET="${_ans:-$DEFAULT_THINKING_TOKEN_BUDGET}"
+            [[ "$SERVE_THINKING_BUDGET" =~ ^[0-9]+$ ]] || {
+                echo "  ⚠️  Invalid value; using $DEFAULT_THINKING_TOKEN_BUDGET."
+                SERVE_THINKING_BUDGET="$DEFAULT_THINKING_TOKEN_BUDGET"
+            }
+        else
+            SERVE_REASONING_EFFORT="$DEFAULT_REASONING_EFFORT"
+            SERVE_THINKING_BUDGET="$DEFAULT_THINKING_TOKEN_BUDGET"
+        fi
+
+        printf "  Temperature [%s]: " "$DEFAULT_TEMPERATURE"
+        read -r _ans
+        SERVE_TEMPERATURE="${_ans:-$DEFAULT_TEMPERATURE}"
+        [[ "$SERVE_TEMPERATURE" =~ ^[0-9]+(\.[0-9]+)?$ ]] || {
+            echo "  ⚠️  Invalid value; using $DEFAULT_TEMPERATURE."
+            SERVE_TEMPERATURE="$DEFAULT_TEMPERATURE"
+        }
+    fi
+
+    if [ "$SERVE_REASONING_ENABLED" = "true" ]; then
+        echo "  → max-model-len=$SERVE_MAX_MODEL_LEN  reasoning=on (effort=$SERVE_REASONING_EFFORT, budget=$SERVE_THINKING_BUDGET)  temperature=$SERVE_TEMPERATURE"
+    else
+        echo "  → max-model-len=$SERVE_MAX_MODEL_LEN  reasoning=off  temperature=$SERVE_TEMPERATURE"
+    fi
+
+    # Extra args appended to every in-scope chat model's _vllm_launch call below.
+    # Kept as two separate arrays so a profile that builds its own
+    # --default-chat-template-kwargs (Qwen3.8) can merge the reasoning keys into
+    # its own JSON instead of passing the --default-chat-template-kwargs flag
+    # twice (vLLM only honors the last occurrence of a repeated flag).
+    _SERVE_CHAT_KWARGS_ARGS=()
+    if [ "$SERVE_REASONING_ENABLED" = "true" ]; then
+        _SERVE_CHAT_KWARGS_ARGS=(--default-chat-template-kwargs "{\"reasoning_effort\":\"$SERVE_REASONING_EFFORT\",\"thinking_token_budget\":$SERVE_THINKING_BUDGET}")
+    fi
+    _SERVE_TEMP_ARGS=(--override-generation-config "{\"temperature\":$SERVE_TEMPERATURE}")
 }
 
 # VRAM PRE-FLIGHT CHECK
@@ -2564,6 +2669,10 @@ fi
 # mode this applies prompt-free defaults (or the documented env overrides).
 _configure_qwen38
 
+# Global generation defaults (max context, reasoning effort/budget, temperature)
+# — asked once per run and applied to every in-scope chat model in _serve_model.
+_configure_serve_defaults
+
 # Assign predictable ordinary/embedding ports and stable client-facing aliases.
 _assign_sequential_ports
 
@@ -3459,10 +3568,17 @@ _serve_model() {
                 ;;
         esac
         if [ "${MDL_THINKING[$idx]:-false}" = "true" ]; then
-            _qwen38_thinking_args=(
-                --reasoning-parser qwen3
-                --default-chat-template-kwargs '{"enable_thinking":true}'
-            )
+            if [ "$SERVE_REASONING_ENABLED" = "true" ]; then
+                _qwen38_thinking_args=(
+                    --reasoning-parser qwen3
+                    --default-chat-template-kwargs "{\"enable_thinking\":true,\"reasoning_effort\":\"$SERVE_REASONING_EFFORT\",\"thinking_token_budget\":$SERVE_THINKING_BUDGET}"
+                )
+            else
+                _qwen38_thinking_args=(
+                    --reasoning-parser qwen3
+                    --default-chat-template-kwargs '{"enable_thinking":true}'
+                )
+            fi
         else
             _qwen38_thinking_args=(
                 --default-chat-template-kwargs '{"enable_thinking":false}'
@@ -3473,7 +3589,7 @@ _serve_model() {
             --dtype auto \
             --tensor-parallel-size 1 \
             --gpu-memory-utilization "$_qwen38_gmu" \
-            --max-model-len "${QWEN38_MAX_MODEL_LEN:-32768}" \
+            --max-model-len "${QWEN38_MAX_MODEL_LEN:-$SERVE_MAX_MODEL_LEN}" \
             --max-num-seqs 4 \
             --max-num-batched-tokens 8192 \
             --kv-cache-dtype fp8 \
@@ -3483,7 +3599,8 @@ _serve_model() {
             --tool-call-parser qwen3_coder \
             --trust-remote-code \
             "${_qwen38_input_args[@]+"${_qwen38_input_args[@]}"}" \
-            "${_qwen38_thinking_args[@]+"${_qwen38_thinking_args[@]}"}"
+            "${_qwen38_thinking_args[@]+"${_qwen38_thinking_args[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
     "Qwen/Qwen3.6-35B-A3B-FP8")
@@ -3491,11 +3608,13 @@ _serve_model() {
             --served-model-name "Qwen3.6-35B-A3B" \
             --dtype auto \
             --gpu-memory-utilization 0.40 \
-            --max-model-len 32768 \
+            --max-model-len "$SERVE_MAX_MODEL_LEN" \
             --enable-prefix-caching \
             --trust-remote-code \
             --enable-auto-tool-choice \
-            --tool-call-parser hermes
+            --tool-call-parser hermes \
+            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
     # Full DGX Spark profile (v0.3.26) — replaces the earlier 0.30-gmu/32768-
@@ -3528,7 +3647,9 @@ _serve_model() {
             --load-format fastsafetensors \
             --reasoning-parser qwen3 \
             --tool-call-parser qwen3_xml \
-            --enable-auto-tool-choice
+            --enable-auto-tool-choice \
+            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
     # Current HF card (nvidia-modelopt v0.45.0 / NVFP4 1.0) recommends:
@@ -3543,14 +3664,16 @@ _serve_model() {
             --dtype auto \
             --quantization modelopt \
             --gpu-memory-utilization 0.25 \
-            --max-model-len "${QWEN36_27B_MAX_MODEL_LEN:-32768}" \
+            --max-model-len "${QWEN36_27B_MAX_MODEL_LEN:-$SERVE_MAX_MODEL_LEN}" \
             --kv-cache-dtype fp8 \
             --max-num-seqs 4 \
             --max-num-batched-tokens 8192 \
             --enable-chunked-prefill \
             --enable-prefix-caching \
             --trust-remote-code \
-            --reasoning-parser qwen3
+            --reasoning-parser qwen3 \
+            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
     # Unsloth's "Fast" repack of the same NVFP4 checkpoint — same footprint.
@@ -3560,29 +3683,38 @@ _serve_model() {
             --dtype auto \
             --quantization modelopt_fp4 \
             --gpu-memory-utilization 0.30 \
-            --max-model-len 32768 \
+            --max-model-len "$SERVE_MAX_MODEL_LEN" \
             --enable-prefix-caching \
             --trust-remote-code \
             --enable-auto-tool-choice \
-            --tool-call-parser hermes
+            --tool-call-parser hermes \
+            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
     # Nemotron-3-Nano is a hybrid Mamba/attention model — see the comment above
     # the Nemotron-Omni block for why --max-num-batched-tokens is required
     # whenever --enable-prefix-caching is on (Mamba cache "align" mode).
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4")
+        # --max-num-batched-tokens bumped 4096→8192 alongside the larger default
+        # context: this is a Mamba/attention hybrid, and --enable-prefix-caching
+        # runs Mamba cache in "align" mode, whose required block_size grows with
+        # --max-model-len (see the comment above the Nemotron-Omni blocks below
+        # for the exact failure this avoids).
         _vllm_launch "$idx" \
             --served-model-name "Nemotron-3-Nano-30B-NVFP4" \
             --dtype auto \
             --quantization modelopt_fp4 \
             --gpu-memory-utilization 0.20 \
-            --max-model-len 32768 \
-            --max-num-batched-tokens 4096 \
+            --max-model-len "$SERVE_MAX_MODEL_LEN" \
+            --max-num-batched-tokens 8192 \
             --max-num-seqs 178 \
             --enable-prefix-caching \
             --trust-remote-code \
             --enable-auto-tool-choice \
-            --tool-call-parser hermes
+            --tool-call-parser hermes \
+            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
     "Qwen/Qwen3-Coder-30B-A3B-Instruct")
@@ -3590,9 +3722,11 @@ _serve_model() {
             --served-model-name "Qwen3-Coder-30B" \
             --dtype auto \
             --gpu-memory-utilization 0.62 \
-            --max-model-len 32768 \
+            --max-model-len "$SERVE_MAX_MODEL_LEN" \
             --enable-prefix-caching \
-            --trust-remote-code
+            --trust-remote-code \
+            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
     "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B")
@@ -3600,9 +3734,11 @@ _serve_model() {
             --served-model-name "DeepSeek-R1-Distill-Qwen-32B" \
             --dtype auto \
             --gpu-memory-utilization 0.65 \
-            --max-model-len 32768 \
+            --max-model-len "$SERVE_MAX_MODEL_LEN" \
             --enable-prefix-caching \
-            --trust-remote-code
+            --trust-remote-code \
+            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
     "google/gemma-4-31B-it")
@@ -3610,13 +3746,20 @@ _serve_model() {
             --served-model-name "gemma-4-31B" \
             --dtype auto \
             --gpu-memory-utilization 0.60 \
-            --max-model-len 32768 \
+            --max-model-len "$SERVE_MAX_MODEL_LEN" \
             --enable-prefix-caching \
             --trust-remote-code \
             --enable-auto-tool-choice \
-            --tool-call-parser hermes
+            --tool-call-parser hermes \
+            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
+    # ⚠️  Tight profile: 0.46 gmu was sized specifically for 32768 context. At the
+    # new 65536 default this may not leave enough headroom for the KV cache to
+    # allocate — if it fails to start, override just this run with a smaller
+    # value at the "Max context length" prompt (or SERVE_MAX_MODEL_LEN=32768 in
+    # headless mode), or raise --gpu-memory-utilization below if memory allows.
     "nvidia/Gemma-4-31B-IT-NVFP4")
         _vllm_launch "$idx" \
             --served-model-name "gemma4-31b" \
@@ -3625,12 +3768,14 @@ _serve_model() {
             --tensor-parallel-size 1 \
             --language-model-only \
             --gpu-memory-utilization 0.46 \
-            --max-model-len 32768 \
+            --max-model-len "$SERVE_MAX_MODEL_LEN" \
             --max-num-seqs 1 \
             --kv-cache-dtype fp8 \
             --calculate-kv-scales \
             --enable-prefix-caching \
-            --enable-chunked-prefill
+            --enable-chunked-prefill \
+            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
     "google/gemma-4-26B-A4B-it")
@@ -3638,12 +3783,14 @@ _serve_model() {
             --served-model-name "gemma-4-26B-A4B" \
             --dtype auto \
             --gpu-memory-utilization 0.55 \
-            --max-model-len 16384 \
+            --max-model-len "$SERVE_MAX_MODEL_LEN" \
             --max-num-batched-tokens 4096 \
             --enable-prefix-caching \
             --trust-remote-code \
             --enable-auto-tool-choice \
-            --tool-call-parser hermes
+            --tool-call-parser hermes \
+            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
     # All three Omni variants below are hybrid Mamba/attention models. With
@@ -3657,14 +3804,18 @@ _serve_model() {
     # 4096 clears the observed 2128 with headroom. See also _diagnose_and_repair,
     # which auto-retries any model that hits this with a computed safe value.
     "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16")
+        # --max-num-batched-tokens bumped 4096→8192 to clear the larger Mamba
+        # align-mode block_size at the new default context (see comment above).
         _vllm_launch "$idx" \
             --served-model-name "Nemotron-3-Nano-Omni-30B-A3B" \
             --dtype bfloat16 \
             --gpu-memory-utilization 0.62 \
-            --max-model-len 32768 \
-            --max-num-batched-tokens 4096 \
+            --max-model-len "$SERVE_MAX_MODEL_LEN" \
+            --max-num-batched-tokens 8192 \
             --enable-prefix-caching \
-            --trust-remote-code
+            --trust-remote-code \
+            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
     # FP8 (modelopt) build of the Omni reasoning model above — ~half the BF16
@@ -3672,29 +3823,37 @@ _serve_model() {
     # + KV. vLLM auto-detects modelopt FP8 from the checkpoint config; the explicit
     # flag makes it deterministic — drop it if your vLLM build errors on it.
     "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8")
+        # --max-num-batched-tokens bumped 4096→8192 to clear the larger Mamba
+        # align-mode block_size at the new default context (see comment above).
         _vllm_launch "$idx" \
             --served-model-name "Nemotron-3-Nano-Omni-30B-A3B-FP8" \
             --dtype auto \
             --quantization modelopt \
             --gpu-memory-utilization 0.35 \
-            --max-model-len 32768 \
-            --max-num-batched-tokens 4096 \
+            --max-model-len "$SERVE_MAX_MODEL_LEN" \
+            --max-num-batched-tokens 8192 \
             --enable-prefix-caching \
-            --trust-remote-code
+            --trust-remote-code \
+            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
     # NVFP4 (~4-bit) build — ~a quarter of the BF16 footprint. 0.20 × 121 ≈ 24 GB
     # budget. Same modelopt_fp4 path as the other Nemotron/Qwen NVFP4 entries.
     "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4")
+        # --max-num-batched-tokens bumped 4096→8192 to clear the larger Mamba
+        # align-mode block_size at the new default context (see comment above).
         _vllm_launch "$idx" \
             --served-model-name "Nemotron-3-Nano-Omni-30B-A3B-NVFP4" \
             --dtype auto \
             --quantization modelopt_fp4 \
             --gpu-memory-utilization 0.20 \
-            --max-model-len 32768 \
-            --max-num-batched-tokens 4096 \
+            --max-model-len "$SERVE_MAX_MODEL_LEN" \
+            --max-num-batched-tokens 8192 \
             --enable-prefix-caching \
-            --trust-remote-code
+            --trust-remote-code \
+            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
     # --gpu-memory-utilization is a FRACTION OF THE WHOLE ~121.7 GB pool that THIS
@@ -3746,6 +3905,10 @@ _serve_model() {
         ;;
 
     # ── SUPER LARGE (120B+): need nearly the whole GPU — don't co-run others ──
+    # These already run at 0.75-0.93 gpu-memory-utilization with almost no VRAM
+    # headroom left, so — unlike every other chat profile above — they keep
+    # their own tuned --max-model-len instead of the new global default; the
+    # reasoning/temperature defaults still apply since those don't cost VRAM.
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16")
         echo "   ℹ️  Model info: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard"
         echo "   ⚠️  SUPER LARGE — needs ~115 GB VRAM. Ensure no other large models are running."
@@ -3757,7 +3920,9 @@ _serve_model() {
             --enable-prefix-caching \
             --trust-remote-code \
             --enable-auto-tool-choice \
-            --tool-call-parser hermes
+            --tool-call-parser hermes \
+            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
     "Qwen/Qwen3.5-122B-A10B")
@@ -3770,7 +3935,9 @@ _serve_model() {
             --enable-prefix-caching \
             --trust-remote-code \
             --enable-auto-tool-choice \
-            --tool-call-parser hermes
+            --tool-call-parser hermes \
+            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
     # FP8 uses ~62 GB VRAM vs ~120 GB for BF16 — fits easily, longer context.
@@ -3784,7 +3951,9 @@ _serve_model() {
             --enable-prefix-caching \
             --trust-remote-code \
             --enable-auto-tool-choice \
-            --tool-call-parser hermes
+            --tool-call-parser hermes \
+            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
     "openai/gpt-oss-120b")
@@ -3795,7 +3964,9 @@ _serve_model() {
             --gpu-memory-utilization 0.93 \
             --max-model-len 8192 \
             --enable-prefix-caching \
-            --trust-remote-code
+            --trust-remote-code \
+            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
     # DGX-Spark-optimized profile from the model card (the plain "vllm serve"
@@ -3826,46 +3997,57 @@ _serve_model() {
             --enable-auto-tool-choice \
             --tool-call-parser qwen3_coder \
             --reasoning-parser qwen3 \
-            --trust-remote-code
+            --trust-remote-code \
+            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
     # ── Small models (1-hour idle-sleep via catalog SLEEP_MIN=60) ─────────────
     # Fractions sized to each model's own footprint (weights + KV), not the pool.
-    "Qwen/Qwen3.5-4B")   # ~8 GB weights; 0.12≈15 GB
+    "Qwen/Qwen3.5-4B")   # ~8 GB weights; 0.12≈15 GB — may need a higher gmu at 65536 context
         _vllm_launch "$idx" \
             --served-model-name "Qwen3.5-4B" \
             --dtype auto \
             --gpu-memory-utilization 0.12 \
-            --max-model-len 32768 \
+            --max-model-len "$SERVE_MAX_MODEL_LEN" \
             --enable-prefix-caching \
             --trust-remote-code \
             --enable-auto-tool-choice \
-            --tool-call-parser hermes
+            --tool-call-parser hermes \
+            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
-    "Qwen/Qwen3.5-2B")   # ~4 GB weights; 0.08≈10 GB
+    "Qwen/Qwen3.5-2B")   # ~4 GB weights; 0.08≈10 GB — may need a higher gmu at 65536 context
         _vllm_launch "$idx" \
             --served-model-name "Qwen3.5-2B" \
             --dtype auto \
             --gpu-memory-utilization 0.08 \
-            --max-model-len 32768 \
+            --max-model-len "$SERVE_MAX_MODEL_LEN" \
             --enable-prefix-caching \
             --trust-remote-code \
             --enable-auto-tool-choice \
-            --tool-call-parser hermes
+            --tool-call-parser hermes \
+            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
-    # ~18 GB weights; 0.20≈24 GB leaves ~6 GB for KV at max-model-len 16384.
+    # ⚠️  ~18 GB weights; 0.20≈24 GB left only ~6 GB of KV headroom at the old
+    # 16384 default. The new 65536 default is a 4x jump — if this fails to start,
+    # override just this run (smaller value at the "Max context length" prompt,
+    # or SERVE_MAX_MODEL_LEN=16384 in headless mode) or raise gmu below.
     "Qwen/Qwen3.5-9B")
         _vllm_launch "$idx" \
             --served-model-name "Qwen3.5-9B" \
             --dtype auto \
             --gpu-memory-utilization 0.20 \
-            --max-model-len 16384 \
+            --max-model-len "$SERVE_MAX_MODEL_LEN" \
             --enable-prefix-caching \
             --trust-remote-code \
             --enable-auto-tool-choice \
-            --tool-call-parser hermes
+            --tool-call-parser hermes \
+            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
     # Served via vLLM's transcription task — POST /v1/audio/transcriptions.
@@ -3885,8 +4067,10 @@ _serve_model() {
             --served-model-name "${MDL_DIR[$idx]}" \
             --dtype auto \
             --gpu-memory-utilization 0.50 \
-            --max-model-len 16384 \
-            --trust-remote-code
+            --max-model-len "$SERVE_MAX_MODEL_LEN" \
+            --trust-remote-code \
+            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
         ;;
     esac
 }
