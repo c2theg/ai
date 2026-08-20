@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.3.34  |  Update: 8/20/2026
+# Christopher Gray  |  Version: 0.3.36  |  Update: 8/20/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
@@ -13,10 +13,10 @@
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3.6-27B-NVFP4"
 #   ./install_ai_spark_vllm.sh --start "Gemma-4-31B-IT-NVFP4"
 #   ./install_ai_spark_vllm.sh --start "Qwen3.5-35B-A3B-NVFP4,Qwen3.8-27B-FP8"
+#   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3.8-27B-FP8"
 #
-# QWEN38_GMU override example:
-#   QWEN38_GMU=0.30 ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3.8-27B-FP8"
-#   QWEN38_GMU=0.25 SERVE_MAX_MODEL_LEN=32768 ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3.8-27B-FP8"
+# Full 262144-context Qwen3.6-35B-A3B-NVFP4 (solo only — see its case block):
+#   QWEN36_35B_MAX_MODEL_LEN=262144 ./install_ai_spark_vllm.sh --start Qwen3.6-35B-A3B-NVFP4
 #
 #
 # Move to DGX Spark / GB10:
@@ -80,6 +80,37 @@
 #           }'
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.3.36  8/20/2026
+#   - BEHAVIOR CHANGE: nvidia/Qwen3.6-35B-A3B-NVFP4's DEFAULT serve profile is
+#     now a lighter 32768-context/0.34-gmu one — identical settings to
+#     Sehyo/Qwen3.5-35B-A3B-NVFP4 (fp8 KV cache, prefix caching, qwen3_coder
+#     tool parsing, qwen3 reasoning parsing, no speculative decoding) — so
+#     --start "Qwen3.6-35B-A3B-NVFP4,Qwen3.8-27B-FP8" now co-runs cleanly with
+#     no env overrides (0.34 + Qwen3.8-27B-FP8's 0.45 default = 0.79 of the pool).
+#     The previous v0.3.26 full 262144-context profile (marlin MoE backend, MTP
+#     speculative decoding, async scheduling, fastsafetensors loader,
+#     qwen3_xml tool parser) is preserved as an opt-in via
+#     QWEN36_35B_MAX_MODEL_LEN=262144, for SOLO use only. Prompted by real
+#     on-box telemetry: that profile's nominal 0.4 gmu implied ~48 GB, but
+#     nvidia-smi showed it actually holding ~79 GB resident — leaving only
+#     ~21 GB free, not enough for Qwen3.8-27B-FP8's ~31 GB of weights even at a
+#     heavily reduced QWEN38_GMU. Catalog VRAM_GB for this entry updated 49→44
+#     to match the new default. This also changes the existing solo/pair
+#     examples in the header (--start Qwen3.6-35B-A3B-NVFP4 and
+#     --start "Qwen3.6-35B-A3B-NVFP4,Qwen3.6-27B-NVFP4") to the smaller context
+#     by default; add QWEN36_35B_MAX_MODEL_LEN=262144 to restore the old behavior.
+#
+# v0.3.35  8/20/2026
+#   - Headless/--start/--start-saved (cron) runs now kill any already-running
+#     vLLM processes before launching, same as interactive runs. Previously only
+#     interactive runs did this ("headless is additive" — so a second --start
+#     wouldn't kill a first), but that let orphaned/previous-run EngineCore
+#     processes sit on the box indefinitely: observed a stale VLLM::EngineCore
+#     still holding 82+ GB with only ~4 GB free system-wide (free -m), starving
+#     every subsequent launch. Docker containers (OpenWebUI/SearXNG/Qdrant)
+#     remain interactive-only — headless never starts those, so there's nothing
+#     of theirs to stop.
 #
 # v0.3.34  8/20/2026
 #   - Added QWEN38_GMU env var to override Qwen3.8's --gpu-memory-utilization
@@ -581,15 +612,17 @@ _add "nvidia/nemotron-3.5-asr-streaming-0.6b" "nemotron-3.5-asr-streaming-0.6b" 
 _add "Qwen/Qwen3-ASR-1.7B"           "Qwen3-ASR-1.7B"       "Qwen3-ASR-1.7B (ASR, served)"            4    5   8014  "ASR"
 
 # ── Qwen3.6 NVFP4 quantizations ───────────────────────────────────────────────
-# NVFP4 is ~4-bit. The 27B dense checkpoint is sized to co-run with the 35B-A3B
-# MoE at ITS old, smaller profile — that no longer holds since v0.3.26 moved
-# 35B-A3B to the full 262144-context profile below (0.4 gmu, fp8 KV cache), so
-# don't launch both together without checking free memory first.
+# NVFP4 is ~4-bit. 35B-A3B's DEFAULT serve profile (see _serve_model) is now the
+# lighter 32768-context/0.34-gmu one — same settings as Sehyo/Qwen3.5-35B-A3B-
+# NVFP4 — sized to co-run with the 27B dense checkpoint or with Qwen3.8-27B-FP8.
+# The old full 262144-context/0.4-gmu/MTP-speculative-decoding profile is still
+# available opt-in (QWEN36_35B_MAX_MODEL_LEN=262144) but is SOLO USE ONLY — its
+# real on-box footprint (~79 GB) badly exceeds its nominal 0.4 gmu budget.
 # https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4
 # https://huggingface.co/unsloth/Qwen3.6-35B-A3B-NVFP4-Fast
 # https://huggingface.co/nvidia/Qwen3.6-27B-NVFP4
 #        HF Repo                                Local Dir                       Display Name                              Disk VRAM  Port  Category
-_add "nvidia/Qwen3.6-35B-A3B-NVFP4"          "Qwen3.6-35B-A3B-NVFP4"        "Qwen3.6-35B-A3B (NVFP4, nvidia)"         20   49   8016  "MoE Models"
+_add "nvidia/Qwen3.6-35B-A3B-NVFP4"          "Qwen3.6-35B-A3B-NVFP4"        "Qwen3.6-35B-A3B (NVFP4, nvidia)"         20   44   8016  "MoE Models"
 _add "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast"    "Qwen3.6-35B-A3B-NVFP4-Fast"   "Qwen3.6-35B-A3B (NVFP4-Fast, unsloth)"   20   22   8017  "MoE Models"
 _add "nvidia/Qwen3.6-27B-NVFP4"               "Qwen3.6-27B-NVFP4"            "Qwen3.6-27B (NVFP4, nvidia)"             18   24   8022  "Dense Models"
 
@@ -3499,16 +3532,21 @@ QDRANT_MAINT_EOF
     echo "   Maintain: $QDRANT_DATA_DIR/qdrant_maintain.sh"
 }
 
-# Headless mode is additive: it must not kill models/containers another run (or
-# another cron entry) already started, so the clean start only runs interactively.
+# Every run — interactive AND headless/--start/cron — kills any already-running
+# vLLM processes first. Headless used to skip this ("additive", so a second
+# --start wouldn't kill a first), but that let orphaned/previous-run EngineCore
+# processes sit on the box indefinitely, starving headroom for the next launch
+# (observed: 82+ GB held by a stale VLLM::EngineCore with only ~4 GB free system-
+# wide). Docker containers (OpenWebUI/SearXNG/Qdrant) stay interactive-only —
+# headless mode never starts those either, so there is nothing of theirs to stop.
+echo "--- Clean start: killing all vLLM processes and removing old logs ---"
+_kill_vllm_processes
+sleep 3
+rm -f "$VLLM_LOGS"/vllm-*.log
+echo "✅ Old vLLM processes killed and logs cleared"
 if [ "$HEADLESS" -eq 0 ]; then
-    echo "--- Clean start: killing all vLLM processes and removing old logs ---"
     docker stop open-webui searxng qdrant 2>/dev/null || true
     docker rm   open-webui searxng qdrant 2>/dev/null || true
-    _kill_vllm_processes
-    sleep 3
-    rm -f "$VLLM_LOGS"/vllm-*.log
-    echo "✅ Old vLLM processes killed and logs cleared"
 fi
 
 export TORCH_FLOAT32_MATMUL_PRECISION=high
@@ -3587,15 +3625,19 @@ _serve_model() {
     # Interactive choices were captured by _configure_qwen38. Text-only avoids
     # loading the vision encoder; the visual modes admit only the chosen type.
     # QWEN38_GMU overrides --gpu-memory-utilization outright — use it to shrink
-    # Qwen3.8's share when co-running it alongside a heavier "primary" model,
-    # e.g. nvidia/Qwen3.6-35B-A3B-NVFP4's 262144-context profile (0.4 gmu, no
-    # env override of its own):
-    #   QWEN38_GMU=0.30 ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3.8-27B-FP8"
+    # Qwen3.8's share when co-running it alongside a heavier "primary" model
+    # than the two below were tuned for. Note nvidia/Qwen3.6-35B-A3B-NVFP4's
+    # QWEN36_35B_MAX_MODEL_LEN=262144 opt-in profile leaves only ~21 GB free in
+    # practice (0.4 gmu nominal, ~79 GB real — see that case block's comment) —
+    # too little for even Qwen3.8-27B-FP8's ~31 GB of weights, so that specific
+    # pairing isn't expected to fit regardless of QWEN38_GMU; use the default
+    # (32768-context) Qwen3.6 profile for co-running instead.
     "Qwen/Qwen3.8-27B"|"Qwen/Qwen3.8-27B-FP8")
         local -a _qwen38_input_args=() _qwen38_thinking_args=()
         local _qwen38_gmu_default=0.62
         # 0.45 (was 0.42) — sized to co-run as "secondary" (port 8007) alongside
-        # Sehyo/Qwen3.5-35B-A3B-NVFP4 as "primary" (port 8006, 0.34 gmu): 0.79
+        # either Sehyo/Qwen3.5-35B-A3B-NVFP4 or nvidia/Qwen3.6-35B-A3B-NVFP4's
+        # default lighter profile as "primary" (port 8006, both 0.34 gmu): 0.79
         # combined, leaving headroom for the OS on the shared unified-memory pool.
         # QWEN38_GMU (see above) overrides this for other pairings.
         [ "${MDL_HF[$idx]}" = "Qwen/Qwen3.8-27B-FP8" ] && _qwen38_gmu_default=0.45
@@ -3679,39 +3721,68 @@ _serve_model() {
             "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
-    # Full DGX Spark profile (v0.3.26) — replaces the earlier 0.30-gmu/32768-
-    # context/hermes-parser profile. No --quantization flag: vLLM auto-detects
-    # NVFP4 from the checkpoint config, and --moe-backend marlin needs that
-    # auto-detected path (an explicit --quantization modelopt_fp4 alongside it
-    # was observed to conflict). --async-scheduling overlaps CPU scheduling with
-    # GPU execution; --speculative-config enables MTP self-speculative decoding
-    # (3 draft tokens/step, its own triton MoE backend, separate from the main
-    # model's marlin backend). --load-format fastsafetensors is the faster
-    # DGX Spark loader. 0.4 gmu is sized for the full 262144 context's KV cache
-    # at fp8 — no longer the 0.30 co-run-with-27B profile (see the catalog
-    # comment above), so check free memory before also starting the 27B model.
+    # Two profiles, selected by QWEN36_35B_MAX_MODEL_LEN:
+    #
+    # DEFAULT (unset, or any value other than 262144) — lighter "primary" co-run
+    # profile with the SAME settings as Sehyo/Qwen3.5-35B-A3B-NVFP4 below: 32768
+    # context, 0.34 gmu, fp8 KV cache, prefix caching, qwen3_coder tool parsing,
+    # qwen3 reasoning parsing, no speculative decoding. Combined with
+    # Qwen3.8-27B-FP8's 0.45-gmu default as "secondary", that's 0.79 of the pool
+    # — no QWEN38_GMU override needed for this pairing:
+    #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3.8-27B-FP8"
+    #
+    # QWEN36_35B_MAX_MODEL_LEN=262144 — the original v0.3.26 full DGX Spark
+    # profile: no --quantization flag (vLLM auto-detects NVFP4 from the
+    # checkpoint, which --moe-backend marlin needs — an explicit --quantization
+    # modelopt_fp4 alongside it was observed to conflict); --async-scheduling
+    # overlaps CPU scheduling with GPU execution; --speculative-config enables
+    # MTP self-speculative decoding (3 draft tokens/step, its own triton MoE
+    # backend, separate from the main model's marlin backend); --load-format
+    # fastsafetensors is the faster DGX Spark loader. Its nominal 0.4 gmu budget
+    # undercounts its real footprint badly — observed on-box at ~79 GB resident
+    # (nvidia-smi), not the ~48 GB that 0.4 × 121 GB implies, almost certainly
+    # the MTP draft model + the 262144-context KV cache reservation landing
+    # outside the profiled budget. SOLO USE ONLY — it does not leave room to
+    # co-run anything else:
+    #   QWEN36_35B_MAX_MODEL_LEN=262144 ./install_ai_spark_vllm.sh --start Qwen3.6-35B-A3B-NVFP4
     "nvidia/Qwen3.6-35B-A3B-NVFP4")
-        _vllm_launch "$idx" \
-            --served-model-name "Qwen3.6-35B-A3B-NVFP4" \
-            --tensor-parallel-size 1 \
-            --trust-remote-code \
-            --kv-cache-dtype fp8 \
-            --attention-backend flashinfer \
-            --moe-backend marlin \
-            --gpu-memory-utilization 0.4 \
-            --max-model-len 262144 \
-            --max-num-seqs 4 \
-            --max-num-batched-tokens 8192 \
-            --enable-chunked-prefill \
-            --async-scheduling \
-            --enable-prefix-caching \
-            --speculative-config '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}' \
-            --load-format fastsafetensors \
-            --reasoning-parser qwen3 \
-            --tool-call-parser qwen3_xml \
-            --enable-auto-tool-choice \
-            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
-            "${_SERVE_TEMP_ARGS[@]}"
+        if [ "${QWEN36_35B_MAX_MODEL_LEN:-32768}" = "262144" ]; then
+            _vllm_launch "$idx" \
+                --served-model-name "Qwen3.6-35B-A3B-NVFP4" \
+                --tensor-parallel-size 1 \
+                --trust-remote-code \
+                --kv-cache-dtype fp8 \
+                --attention-backend flashinfer \
+                --moe-backend marlin \
+                --gpu-memory-utilization 0.4 \
+                --max-model-len 262144 \
+                --max-num-seqs 4 \
+                --max-num-batched-tokens 8192 \
+                --enable-chunked-prefill \
+                --async-scheduling \
+                --enable-prefix-caching \
+                --speculative-config '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}' \
+                --load-format fastsafetensors \
+                --reasoning-parser qwen3 \
+                --tool-call-parser qwen3_xml \
+                --enable-auto-tool-choice \
+                "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
+                "${_SERVE_TEMP_ARGS[@]}"
+        else
+            _vllm_launch "$idx" \
+                --served-model-name "Qwen3.6-35B-A3B-NVFP4" \
+                --dtype auto \
+                --trust-remote-code \
+                --gpu-memory-utilization 0.34 \
+                --max-model-len "${QWEN36_35B_MAX_MODEL_LEN:-32768}" \
+                --kv-cache-dtype fp8 \
+                --enable-prefix-caching \
+                --enable-auto-tool-choice \
+                --tool-call-parser qwen3_coder \
+                --reasoning-parser qwen3 \
+                "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
+                "${_SERVE_TEMP_ARGS[@]}"
+        fi
         ;;
 
     # Current HF card (nvidia-modelopt v0.45.0 / NVFP4 1.0) recommends:
