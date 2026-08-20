@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.3.33  |  Update: 8/20/2026
+# Christopher Gray  |  Version: 0.3.34  |  Update: 8/20/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
@@ -13,6 +13,11 @@
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3.6-27B-NVFP4"
 #   ./install_ai_spark_vllm.sh --start "Gemma-4-31B-IT-NVFP4"
 #   ./install_ai_spark_vllm.sh --start "Qwen3.5-35B-A3B-NVFP4,Qwen3.8-27B-FP8"
+#
+# QWEN38_GMU override example:
+#   QWEN38_GMU=0.30 ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3.8-27B-FP8"
+#   QWEN38_GMU=0.25 SERVE_MAX_MODEL_LEN=32768 ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3.8-27B-FP8"
+#
 #
 # Move to DGX Spark / GB10:
 #   scp install_ai_spark_vllm.sh root@<dgx-ip>:/home/user/install_ai_spark_vllm.sh
@@ -75,6 +80,14 @@
 #           }'
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.3.34  8/20/2026
+#   - Added QWEN38_GMU env var to override Qwen3.8's --gpu-memory-utilization
+#     outright (was only settable by editing the hardcoded 0.62/0.45 default in
+#     the case block). Lets Qwen3.8-27B-FP8 be shrunk to co-run alongside a
+#     different "primary" than the Sehyo/Qwen3.5-35B-A3B-NVFP4 pairing it's
+#     tuned for by default — e.g. nvidia/Qwen3.6-35B-A3B-NVFP4's fixed 0.4 gmu
+#     262144-context profile, which has no gmu override of its own.
 #
 # v0.3.33  8/20/2026
 #   - Added Sehyo/Qwen3.5-35B-A3B-NVFP4 as a new catalog entry ("MoE Models",
@@ -3566,19 +3579,27 @@ _serve_model() {
     case "${MDL_HF[$idx]}" in
 
     # Native Qwen3.8 dense vision-language model. BF16 uses 0.62 of a DGX Spark's
-    # ~121 GB pool; the official FP8 build is ~31 GB on disk and uses 0.42. Both
-    # leave room for the selected encoder path and a practical 32K KV cache. The
-    # model card advertises 262K native context, available for a solo deployment:
+    # ~121 GB pool; the official FP8 build is ~31 GB on disk and uses 0.45 by
+    # default. Both leave room for the selected encoder path and a practical 32K
+    # KV cache. The model card advertises 262K native context, available for a
+    # solo deployment:
     #   QWEN38_MAX_MODEL_LEN=262144 ./install_ai_spark_vllm.sh --start Qwen3.8-27B-FP8
     # Interactive choices were captured by _configure_qwen38. Text-only avoids
     # loading the vision encoder; the visual modes admit only the chosen type.
+    # QWEN38_GMU overrides --gpu-memory-utilization outright — use it to shrink
+    # Qwen3.8's share when co-running it alongside a heavier "primary" model,
+    # e.g. nvidia/Qwen3.6-35B-A3B-NVFP4's 262144-context profile (0.4 gmu, no
+    # env override of its own):
+    #   QWEN38_GMU=0.30 ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3.8-27B-FP8"
     "Qwen/Qwen3.8-27B"|"Qwen/Qwen3.8-27B-FP8")
         local -a _qwen38_input_args=() _qwen38_thinking_args=()
-        local _qwen38_gmu=0.62
+        local _qwen38_gmu_default=0.62
         # 0.45 (was 0.42) — sized to co-run as "secondary" (port 8007) alongside
         # Sehyo/Qwen3.5-35B-A3B-NVFP4 as "primary" (port 8006, 0.34 gmu): 0.79
         # combined, leaving headroom for the OS on the shared unified-memory pool.
-        [ "${MDL_HF[$idx]}" = "Qwen/Qwen3.8-27B-FP8" ] && _qwen38_gmu=0.45
+        # QWEN38_GMU (see above) overrides this for other pairings.
+        [ "${MDL_HF[$idx]}" = "Qwen/Qwen3.8-27B-FP8" ] && _qwen38_gmu_default=0.45
+        local _qwen38_gmu="${QWEN38_GMU:-$_qwen38_gmu_default}"
         case "${MDL_INPUT_MODE[$idx]:-text}" in
             image)
                 _qwen38_input_args=(--limit-mm-per-prompt '{"image":1,"video":0}')
