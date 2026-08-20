@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.3.32  |  Update: 8/18/2026
+# Christopher Gray  |  Version: 0.3.33  |  Update: 8/20/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
@@ -12,6 +12,7 @@
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4"
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3.6-27B-NVFP4"
 #   ./install_ai_spark_vllm.sh --start "Gemma-4-31B-IT-NVFP4"
+#   ./install_ai_spark_vllm.sh --start "Qwen3.5-35B-A3B-NVFP4,Qwen3.8-27B-FP8"
 #
 # Move to DGX Spark / GB10:
 #   scp install_ai_spark_vllm.sh root@<dgx-ip>:/home/user/install_ai_spark_vllm.sh
@@ -75,12 +76,26 @@
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
 #
+# v0.3.33  8/20/2026
+#   - Added Sehyo/Qwen3.5-35B-A3B-NVFP4 as a new catalog entry ("MoE Models",
+#     port 8025 default), sized to co-run as "primary" (port 8006) alongside
+#     Qwen/Qwen3.8-27B-FP8 as "secondary" (port 8007) — the two together are
+#     the standard dual-model boot: --start "Qwen3.5-35B-A3B-NVFP4,Qwen3.8-27B-FP8".
+#     Its serve profile is --gpu-memory-utilization 0.34, --max-model-len 32768
+#     (overridable via QWEN35_35B_MAX_MODEL_LEN for a standalone run), fp8 KV
+#     cache, prefix caching, qwen3_coder tool parsing, and qwen3 reasoning
+#     parsing — no explicit --quantization flag, matching the existing
+#     nvidia/Qwen3.6-35B-A3B-NVFP4 profile's auto-detection from the checkpoint.
+#   - Bumped Qwen3.8-27B-FP8's --gpu-memory-utilization 0.42 → 0.45 to match the
+#     new co-run pairing above (0.34 + 0.45 = 0.79 of the shared unified-memory
+#     pool, leaving headroom for the OS).
+#
 # v0.3.32  8/18/2026
 #   - Added global generation defaults for every chat model: --max-model-len
 #     65536, reasoning_effort "low" (low/medium/xhigh), thinking_token_budget
 #     1024, and temperature 0.2. Asked ONCE per run via the new
-#     _configure_serve_defaults() (right after the Qwen3.8 prompt), Enter
-#     accepts the default at each prompt; headless/--start runs use the
+#     _configure_serve_defaults(), which now runs BEFORE _configure_qwen38,
+#     Enter accepts the default at each prompt; headless/--start runs use the
 #     defaults directly unless overridden with SERVE_MAX_MODEL_LEN /
 #     SERVE_REASONING / SERVE_REASONING_EFFORT / SERVE_THINKING_BUDGET /
 #     SERVE_TEMPERATURE env vars. reasoning_effort + thinking_token_budget ride
@@ -91,9 +106,13 @@
 #     and their --max-model-len is deliberately small for VRAM); the four
 #     "Super Large" 120B+ profiles keep their own tuned --max-model-len since
 #     they already run at 0.75-0.93 gpu-memory-utilization with essentially no
-#     headroom, but still get the reasoning/temperature defaults. Every
-#     --served-model-name alias is unchanged — _vllm_launch still strips and
-#     re-applies the stable port-role alias exactly as before.
+#     headroom, but still get the reasoning/temperature defaults.
+#   - Removed Qwen3.8's standalone "Thinking [y/N]" prompt and QWEN38_THINKING
+#     env var — thinking and reasoning are the same toggle, so Qwen3.8 now just
+#     follows the global reasoning setting above (MDL_THINKING mirrors
+#     SERVE_REASONING_ENABLED). _configure_qwen38 only asks input modality now.
+#     Every --served-model-name alias is unchanged — _vllm_launch still strips
+#     and re-applies the stable port-role alias exactly as before.
 #
 # v0.3.31  8/14/2026
 #   - Added Qwen/Qwen3.8-27B-FP8 (official fine-grained 128x128 block-FP8
@@ -588,6 +607,16 @@ _add "nvidia/Gemma-4-31B-IT-NVFP4"            "Gemma-4-31B-IT-NVFP4"         "Ge
 #        HF Repo                  Local Dir             Display Name                    Disk VRAM  Port  Category
 _add "Qwen/Qwen3.8-27B"         "Qwen3.8-27B"         "Qwen3.8-27B (BF16, multimodal)"  56   75   8023  "Dense Models"
 _add "Qwen/Qwen3.8-27B-FP8"     "Qwen3.8-27B-FP8"     "Qwen3.8-27B (FP8, multimodal)"   31   51   8024  "Dense Models"
+
+# ── Sehyo Qwen3.5-35B-A3B NVFP4 (co-run "primary" alongside Qwen3.8-27B-FP8
+# "secondary" on ports 8006/8007) ─────────────────────────────────────────────
+# Community NVFP4 (~4-bit) requantization of Qwen3.5-35B-A3B for Blackwell/DGX
+# Spark. Its 0.34 gpu-memory-utilization is sized to co-run with
+# Qwen3.8-27B-FP8's 0.45 (see that serve block) — 0.79 of the shared
+# unified-memory pool combined, leaving headroom for the OS.
+# https://huggingface.co/Sehyo/Qwen3.5-35B-A3B-NVFP4
+#        HF Repo                            Local Dir                  Display Name                       Disk VRAM  Port  Category
+_add "Sehyo/Qwen3.5-35B-A3B-NVFP4"       "Qwen3.5-35B-A3B-NVFP4"    "Qwen3.5-35B-A3B (NVFP4, Sehyo)"    20   44   8025  "MoE Models"
 
 MODEL_TOTAL=${#MDL_HF[@]}
 
@@ -1125,11 +1154,14 @@ _checkbox_menu() {
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Qwen3.8 can skip its vision tower entirely or load exactly one visual input
-# path. Headless runs cannot prompt, so environment variables provide optional
-# overrides while retaining deterministic text/no-thinking defaults:
-#   QWEN38_INPUT_MODE=image QWEN38_THINKING=true ./... --start Qwen3.8-27B-FP8
+# path. Headless runs cannot prompt, so an environment variable provides an
+# optional override while retaining the deterministic text default:
+#   QWEN38_INPUT_MODE=image ./... --start Qwen3.8-27B-FP8
+# Thinking is no longer asked here — "thinking" and "reasoning" are the same
+# thing, so Qwen3.8 just follows the global reasoning toggle from
+# _configure_serve_defaults (SERVE_REASONING_ENABLED), which MUST run first.
 _configure_qwen38() {
-    local idx input_choice thinking_choice input_mode thinking
+    local idx input_choice input_mode
     for idx in "${RUN_SELECTED[@]+${RUN_SELECTED[@]}}"; do
         case "${MDL_HF[$idx]}" in
             "Qwen/Qwen3.8-27B"|"Qwen/Qwen3.8-27B-FP8") ;;
@@ -1138,16 +1170,9 @@ _configure_qwen38() {
 
         if [ "$HEADLESS" -eq 1 ]; then
             input_mode="${QWEN38_INPUT_MODE:-text}"
-            thinking="${QWEN38_THINKING:-false}"
             case "$input_mode" in
                 text|image|video) ;;
                 *) echo "⚠️  Invalid QWEN38_INPUT_MODE='$input_mode'; using text."; input_mode=text ;;
-            esac
-            case "$thinking" in
-                true|false) ;;
-                1|yes|y|Y|TRUE|True) thinking=true ;;
-                0|no|n|N|FALSE|False) thinking=false ;;
-                *) echo "⚠️  Invalid QWEN38_THINKING='$thinking'; using false."; thinking=false ;;
             esac
         else
             echo ""
@@ -1166,19 +1191,11 @@ _configure_qwen38() {
                     *) echo "  ⚠️  Enter 1, 2, or 3." ;;
                 esac
             done
-
-            printf "  Thinking [y/N]: "
-            read -r thinking_choice
-            if [[ "$thinking_choice" =~ ^[Yy]$ ]]; then
-                thinking=true
-            else
-                thinking=false
-            fi
         fi
 
         MDL_INPUT_MODE[$idx]="$input_mode"
-        MDL_THINKING[$idx]="$thinking"
-        echo "  ${MDL_DIR[$idx]}: input=$input_mode, thinking=$thinking"
+        MDL_THINKING[$idx]="$SERVE_REASONING_ENABLED"
+        echo "  ${MDL_DIR[$idx]}: input=$input_mode, thinking=$SERVE_REASONING_ENABLED (from global reasoning setting)"
     done
 }
 
@@ -2665,13 +2682,16 @@ else
     _check_vram
 fi
 
-# Ask Qwen3.8-specific questions only when that model was selected. In headless
-# mode this applies prompt-free defaults (or the documented env overrides).
-_configure_qwen38
-
 # Global generation defaults (max context, reasoning effort/budget, temperature)
 # — asked once per run and applied to every in-scope chat model in _serve_model.
+# Must run BEFORE _configure_qwen38: Qwen3.8's thinking toggle now just follows
+# SERVE_REASONING_ENABLED set here (thinking and reasoning are the same thing).
 _configure_serve_defaults
+
+# Ask Qwen3.8-specific questions (input modality only) when that model was
+# selected. In headless mode this applies a prompt-free default (or the
+# documented QWEN38_INPUT_MODE override).
+_configure_qwen38
 
 # Assign predictable ordinary/embedding ports and stable client-facing aliases.
 _assign_sequential_ports
@@ -3555,7 +3575,10 @@ _serve_model() {
     "Qwen/Qwen3.8-27B"|"Qwen/Qwen3.8-27B-FP8")
         local -a _qwen38_input_args=() _qwen38_thinking_args=()
         local _qwen38_gmu=0.62
-        [ "${MDL_HF[$idx]}" = "Qwen/Qwen3.8-27B-FP8" ] && _qwen38_gmu=0.42
+        # 0.45 (was 0.42) — sized to co-run as "secondary" (port 8007) alongside
+        # Sehyo/Qwen3.5-35B-A3B-NVFP4 as "primary" (port 8006, 0.34 gmu): 0.79
+        # combined, leaving headroom for the OS on the shared unified-memory pool.
+        [ "${MDL_HF[$idx]}" = "Qwen/Qwen3.8-27B-FP8" ] && _qwen38_gmu=0.45
         case "${MDL_INPUT_MODE[$idx]:-text}" in
             image)
                 _qwen38_input_args=(--limit-mm-per-prompt '{"image":1,"video":0}')
@@ -3567,18 +3590,14 @@ _serve_model() {
                 _qwen38_input_args=(--language-model-only)
                 ;;
         esac
+        # MDL_THINKING is set from the global SERVE_REASONING_ENABLED in
+        # _configure_qwen38 (thinking and reasoning are the same toggle), so
+        # this only ever has the two "in sync" states below.
         if [ "${MDL_THINKING[$idx]:-false}" = "true" ]; then
-            if [ "$SERVE_REASONING_ENABLED" = "true" ]; then
-                _qwen38_thinking_args=(
-                    --reasoning-parser qwen3
-                    --default-chat-template-kwargs "{\"enable_thinking\":true,\"reasoning_effort\":\"$SERVE_REASONING_EFFORT\",\"thinking_token_budget\":$SERVE_THINKING_BUDGET}"
-                )
-            else
-                _qwen38_thinking_args=(
-                    --reasoning-parser qwen3
-                    --default-chat-template-kwargs '{"enable_thinking":true}'
-                )
-            fi
+            _qwen38_thinking_args=(
+                --reasoning-parser qwen3
+                --default-chat-template-kwargs "{\"enable_thinking\":true,\"reasoning_effort\":\"$SERVE_REASONING_EFFORT\",\"thinking_token_budget\":$SERVE_THINKING_BUDGET}"
+            )
         else
             _qwen38_thinking_args=(
                 --default-chat-template-kwargs '{"enable_thinking":false}'
@@ -3600,6 +3619,28 @@ _serve_model() {
             --trust-remote-code \
             "${_qwen38_input_args[@]+"${_qwen38_input_args[@]}"}" \
             "${_qwen38_thinking_args[@]+"${_qwen38_thinking_args[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
+        ;;
+
+    # Sized to co-run as "primary" (port 8006) alongside Qwen/Qwen3.8-27B-FP8 as
+    # "secondary" (port 8007, 0.45 gmu) — see that serve block's comment. No
+    # explicit --quantization flag: vLLM auto-detects NVFP4 from the checkpoint
+    # config, matching the nvidia/Qwen3.6-35B-A3B-NVFP4 profile below. For a
+    # standalone run at a larger context:
+    #   QWEN35_35B_MAX_MODEL_LEN=131072 ./install_ai_spark_vllm.sh --start Qwen3.5-35B-A3B-NVFP4
+    "Sehyo/Qwen3.5-35B-A3B-NVFP4")
+        _vllm_launch "$idx" \
+            --served-model-name "Qwen3.5-35B-A3B-NVFP4" \
+            --dtype auto \
+            --trust-remote-code \
+            --gpu-memory-utilization 0.34 \
+            --max-model-len "${QWEN35_35B_MAX_MODEL_LEN:-32768}" \
+            --kv-cache-dtype fp8 \
+            --enable-prefix-caching \
+            --enable-auto-tool-choice \
+            --tool-call-parser qwen3_coder \
+            --reasoning-parser qwen3 \
+            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
             "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
