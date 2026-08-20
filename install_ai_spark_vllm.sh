@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.3.36  |  Update: 8/20/2026
+# Christopher Gray  |  Version: 0.3.37  |  Update: 8/20/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
@@ -80,6 +80,20 @@
 #           }'
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.3.37  8/20/2026
+#   - Added --max-num-batched-tokens 3072 to both lighter 32768-context NVFP4
+#     "primary" profiles (nvidia/Qwen3.6-35B-A3B-NVFP4's default branch and
+#     Sehyo/Qwen3.5-35B-A3B-NVFP4). On-box, launching nvidia/Qwen3.6-35B-A3B-
+#     NVFP4 with --enable-prefix-caching hit vLLM's own block_size (2096)
+#     exceeding the 2048 default max-num-batched-tokens ("In Mamba cache align
+#     mode, block_size (2096) must be <= max_num_batched_tokens (2048)") —
+#     _diagnose_and_repair's existing generic handler caught it and auto-
+#     retried successfully with 3072, but setting it directly here skips that
+#     ~3-4 min wasted first attempt on every fresh launch. Same fix applied to
+#     Sehyo/Qwen3.5-35B-A3B-NVFP4 since it shares identical settings and is the
+#     same 35B-A3B architecture family — not yet observed failing there, but
+#     expected to hit the same block_size math.
 #
 # v0.3.36  8/20/2026
 #   - BEHAVIOR CHANGE: nvidia/Qwen3.6-35B-A3B-NVFP4's DEFAULT serve profile is
@@ -3691,6 +3705,12 @@ _serve_model() {
     # config, matching the nvidia/Qwen3.6-35B-A3B-NVFP4 profile below. For a
     # standalone run at a larger context:
     #   QWEN35_35B_MAX_MODEL_LEN=131072 ./install_ai_spark_vllm.sh --start Qwen3.5-35B-A3B-NVFP4
+    # --max-num-batched-tokens 3072: with --enable-prefix-caching on, vLLM's
+    # block_size for this architecture at this context landed at 2096 in
+    # practice (observed on the identically-configured nvidia/Qwen3.6-35B-A3B-
+    # NVFP4 lighter profile below — "block_size (2096) must be <=
+    # max_num_batched_tokens"), above the 2048 default. Set explicitly to skip
+    # the automatic diagnose-and-retry cycle _vllm_launch would otherwise run.
     "Sehyo/Qwen3.5-35B-A3B-NVFP4")
         _vllm_launch "$idx" \
             --served-model-name "Qwen3.5-35B-A3B-NVFP4" \
@@ -3699,6 +3719,7 @@ _serve_model() {
             --gpu-memory-utilization 0.34 \
             --max-model-len "${QWEN35_35B_MAX_MODEL_LEN:-32768}" \
             --kv-cache-dtype fp8 \
+            --max-num-batched-tokens 3072 \
             --enable-prefix-caching \
             --enable-auto-tool-choice \
             --tool-call-parser qwen3_coder \
@@ -3769,6 +3790,12 @@ _serve_model() {
                 "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
                 "${_SERVE_TEMP_ARGS[@]}"
         else
+            # --max-num-batched-tokens 3072: with --enable-prefix-caching on,
+            # vLLM's own block_size at this context landed at 2096 on-box,
+            # above the 2048 default — "AssertionError: In Mamba cache align
+            # mode, block_size (2096) must be <= max_num_batched_tokens (2048)"
+            # (see _diagnose_and_repair, which auto-retried and fixed this the
+            # first time it happened; set explicitly here to skip that retry).
             _vllm_launch "$idx" \
                 --served-model-name "Qwen3.6-35B-A3B-NVFP4" \
                 --dtype auto \
@@ -3776,6 +3803,7 @@ _serve_model() {
                 --gpu-memory-utilization 0.34 \
                 --max-model-len "${QWEN36_35B_MAX_MODEL_LEN:-32768}" \
                 --kv-cache-dtype fp8 \
+                --max-num-batched-tokens 3072 \
                 --enable-prefix-caching \
                 --enable-auto-tool-choice \
                 --tool-call-parser qwen3_coder \
