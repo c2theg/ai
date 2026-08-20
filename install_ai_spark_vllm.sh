@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.3.37  |  Update: 8/20/2026
+# Christopher Gray  |  Version: 0.3.38  |  Update: 8/20/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
 #   curl -fsSL -o 'install_ai_spark_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark_vllm.sh' && chmod u+x install_ai_spark_vllm.sh
+#       QWEN38_GMU=0.40 ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3.8-27B-FP8"
+
+
+# ---- other examples ---
 #   ./install_ai_spark_vllm.sh --start "Qwen3.8-27B-FP8,Qwen3-Embedding-4B"
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3-Embedding-4B"
 
@@ -215,25 +219,6 @@
 #     labels. No catalog indices moved (still cosmetic-only — see the comment
 #     above _checkbox_menu's sort block); only MDL_CAT values and the menu's
 #     sort-rank case statement changed.
-#
-# v0.3.27  8/8/2026
-#   - Decoupled the @reboot boot model from the crontab entry itself. Previously
-#     --install-cron <spec> baked the spec directly into the crontab line, so
-#     changing which model starts at boot meant re-running --install-cron with
-#     a new spec (editing crontab) every time. Now: --set-boot-model <spec>
-#     validates and writes the spec to BOOT_MODEL_SPEC_FILE
-#     ($BASE_DIR/.boot-model-spec) — a plain file write, no crontab touched, safe
-#     to call repeatedly. --install-cron installs a STABLE @reboot line that
-#     always runs the new --start-saved (reads BOOT_MODEL_SPEC_FILE and heads
-#     into the normal --start flow) — that line never needs to change again.
-#     --install-cron [spec] still accepts an optional spec as a shorthand for
-#     --set-boot-model + --install-cron in one step; called with no args it
-#     (re)installs using whatever is already saved, erroring if nothing is.
-#     --remove-cron is unchanged (removes the crontab entry only; the saved
-#     spec file is left alone so re-running --install-cron later needs no spec).
-#     Extracted the shared spec-validation logic (was duplicated inline in
-#     _install_boot_cron) into _validate_spec_or_die, used by both
-#     _install_boot_cron and the new _set_boot_model.
 #
 # ──────────────────────────────────────────────────────────────────────────────
 
