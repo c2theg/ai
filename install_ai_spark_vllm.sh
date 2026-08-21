@@ -21,6 +21,7 @@
 #
 # Full 262144-context Qwen3.6-35B-A3B-NVFP4 (solo only — see its case block):
 #   QWEN36_35B_MAX_MODEL_LEN=262144 ./install_ai_spark_vllm.sh --start Qwen3.6-35B-A3B-NVFP4
+#   QWEN36_35B_MAX_MODEL_LEN=65536 QWEN36_35B_GMU=0.40 QWEN38_GMU=0.40 ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3.8-27B-FP8"
 #
 #
 # Move to DGX Spark / GB10:
