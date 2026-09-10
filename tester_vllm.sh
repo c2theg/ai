@@ -11,7 +11,7 @@
 #
 #
 # Update Yourself:
-#  curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' -o 'tester_vllm.py' "https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/tester_vllm.py?nocache=$(date +%s)" && chmod u+x tester_vllm.py
+#  curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' -o 'tester_vllm.py' "https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/tester_vllm.sh?nocache=$(date +%s)" && chmod u+x tester_vllm.py
 #
 #
 # Usage: ./tester_llm.py [HOST] [PORT]
