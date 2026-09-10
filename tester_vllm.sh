@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Christopher Gray - @c2theg/ai  |  Version: 1.0.0  |  Update: 8/9/2026
+# Christopher Gray - @c2theg/ai  |  Version: 1.1.0  |  Update: 9/10/2026
 # vLLM smoke test — auto-discovers every running vLLM instance (ports + models)
 #                   and runs the full smoke test against each one.
 # Includes 21 auto-graded model-quality tests (reasoning, math, summarization,
@@ -79,8 +79,8 @@ except ImportError:
     sys.exit(1)
 
 SCRIPT_AUTHOR = "Christopher Gray - @c2theg/ai"
-SCRIPT_VERSION = "1.0.0"
-SCRIPT_UPDATED = "8/9/2026"
+SCRIPT_VERSION = "1.1.0"
+SCRIPT_UPDATED = "9/10/2026"
 
 TOTAL_TEST_STEPS = 40  # 1,2,3,3b,4,5,5b,6,7,7b,8,9 (12) + 10-30 (21) + 31-37 (7)
 
@@ -519,6 +519,27 @@ def print_system_hardware() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Instance discovery
 # ─────────────────────────────────────────────────────────────────────────────
+VLLM_PROC_RE = re.compile(r"vllm serve|vllm[._]entrypoints[._]openai|[Vv]llm.*api_server")
+
+
+def find_vllm_processes() -> list[dict]:
+    ps_out = run_cmd(["ps", "aux"], timeout=5)
+    procs = []
+    for line in ps_out.splitlines():
+        if not VLLM_PROC_RE.search(line) or "grep" in line:
+            continue
+        cols = line.split()
+        if len(cols) < 2:
+            continue
+        model_m = re.search(r"--served-model-name[= ](\S+)", line) or re.search(r"vllm serve (\S+)", line)
+        procs.append({
+            "pid": cols[1],
+            "model": model_m.group(1) if model_m else "(from /v1/models)",
+            "line": line,
+        })
+    return procs
+
+
 def listen_ports_for_pid(pid: str) -> list[str]:
     if shutil.which("lsof"):
         out = run_cmd(["lsof", "-Pan", "-p", pid, "-iTCP", "-sTCP:LISTEN"], timeout=5)
@@ -535,27 +556,17 @@ def listen_ports_for_pid(pid: str) -> list[str]:
 
 
 def discover_instances(host: str) -> list[str]:
-    ps_out = run_cmd(["ps", "aux"], timeout=5)
-    proc_lines = [
-        ln
-        for ln in ps_out.splitlines()
-        if re.search(r"vllm serve|vllm[._]entrypoints[._]openai|[Vv]llm.*api_server", ln)
-        and "grep" not in ln
-    ]
+    procs = find_vllm_processes()
 
-    if not proc_lines:
+    if not procs:
         cwarn("No running vLLM processes found on this host")
         return []
 
-    cinfo(f"Found {len(proc_lines)} vLLM-related process(es); resolving ports...")
+    cinfo(f"Found {len(procs)} vLLM-related process(es); resolving ports...")
     target_ports: list[str] = []
-    for line in proc_lines:
-        cols = line.split()
-        if len(cols) < 2:
-            continue
-        pid = cols[1]
+    for proc in procs:
+        pid, line, model_name = proc["pid"], proc["line"], proc["model"]
         host_bind_m = re.search(r"--host[= ](\S+)", line)
-        model_m = re.search(r"--served-model-name[= ](\S+)", line) or re.search(r"vllm serve (\S+)", line)
         port_flag_m = re.search(r"--port[= ](\d+)", line)
 
         ports_found: list[str] = []
@@ -565,7 +576,6 @@ def discover_instances(host: str) -> list[str]:
             ports_found = listen_ports_for_pid(pid) or ["8000"]
 
         host_bind = host_bind_m.group(1) if host_bind_m else "0.0.0.0"
-        model_name = model_m.group(1) if model_m else "(from /v1/models)"
 
         for p in ports_found:
             console.print(f"  PID {pid}  |  port={p}  host={host_bind}  model={model_name}")
@@ -574,6 +584,328 @@ def discover_instances(host: str) -> list[str]:
     # Dedup while preserving numeric order.
     unique_ports = sorted(set(target_ports), key=lambda p: int(p))
     return unique_ports
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Performance degradation check — runs once, before any instance is tested.
+# Diagnoses the "gets slow / stops responding after a few days" pattern by
+# checking the usual suspects (GPU memory/thermal pressure, orphaned CUDA
+# contexts, host swap, file-descriptor exhaustion, disk space) and comparing
+# today's snapshot against a small local history file to catch slow leaks.
+# ─────────────────────────────────────────────────────────────────────────────
+HISTORY_PATH = os.path.expanduser("~/.cache/tester_llm_history.json")
+
+
+def load_history() -> dict:
+    try:
+        with open(HISTORY_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_history(history: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(HISTORY_PATH), exist_ok=True)
+        with open(HISTORY_PATH, "w") as f:
+            json.dump(history, f, indent=2)
+    except Exception:
+        pass
+
+
+def process_uptime_hours(pid: str) -> Optional[float]:
+    # macOS ps has no `etimes` (seconds elapsed) keyword like Linux procps does,
+    # so start time (`lstart`, supported on both) plus wall clock is the
+    # portable way to get uptime.
+    out = run_cmd(["ps", "-o", "lstart=", "-p", pid], timeout=5).strip()
+    if not out:
+        return None
+    try:
+        started = time.mktime(time.strptime(out, "%a %b %d %H:%M:%S %Y"))
+        return (time.time() - started) / 3600
+    except ValueError:
+        return None
+
+
+def find_process_log_paths(pid: str) -> list[str]:
+    if not shutil.which("lsof"):
+        return []
+    out = run_cmd(["lsof", "-a", "-p", pid, "-d", "0,1,2", "-Fn"], timeout=5)
+    paths = []
+    for line in out.splitlines():
+        if not line.startswith("n"):
+            continue
+        path = line[1:].strip()
+        if not path or path == "/dev/null" or path.startswith("/dev/tty"):
+            continue
+        if path.startswith("socket:") or path.startswith("pipe:") or path.startswith("|"):
+            continue
+        paths.append(path)
+    return sorted(set(paths))
+
+
+def open_fd_count(pid: str) -> Optional[int]:
+    proc_fd = f"/proc/{pid}/fd"
+    if os.path.isdir(proc_fd):
+        try:
+            return len(os.listdir(proc_fd))
+        except Exception:
+            pass
+    if shutil.which("lsof"):
+        out = run_cmd(["lsof", "-p", pid], timeout=10)
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        return max(len(lines) - 1, 0) if lines else None
+    return None
+
+
+def fd_soft_limit() -> Optional[int]:
+    try:
+        import resource
+        return resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    except Exception:
+        return None
+
+
+def swap_usage_pct(os_type: str) -> Optional[float]:
+    if os_type == "Linux":
+        try:
+            info = {}
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    k, v = line.split(":", 1)
+                    info[k.strip()] = v.strip()
+            total = float(info["SwapTotal"].split()[0])
+            free = float(info["SwapFree"].split()[0])
+            return 100 * (1 - free / total) if total > 0 else 0.0
+        except Exception:
+            return None
+    elif os_type == "Darwin":
+        out = run_cmd(["sysctl", "-n", "vm.swapusage"], timeout=5)
+        used_m = re.search(r"used\s*=\s*([\d.]+)M", out)
+        total_m = re.search(r"total\s*=\s*([\d.]+)M", out)
+        if used_m and total_m:
+            try:
+                used, total = float(used_m.group(1)), float(total_m.group(1))
+                return 100 * used / total if total > 0 else 0.0
+            except ValueError:
+                return None
+    return None
+
+
+def disk_free_pct(path: str = "/") -> Optional[float]:
+    try:
+        st = os.statvfs(path)
+        total = st.f_blocks * st.f_frsize
+        free = st.f_bavail * st.f_frsize
+        return 100 * free / total if total else None
+    except Exception:
+        return None
+
+
+def gpu_snapshot() -> list[dict]:
+    if not shutil.which("nvidia-smi"):
+        return []
+    out = run_cmd(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,memory.total,memory.used,utilization.gpu,temperature.gpu",
+            "--format=csv,noheader,nounits",
+        ],
+        timeout=5,
+    )
+    gpus = []
+    for line in out.splitlines():
+        cols = [c.strip() for c in line.split(",")]
+        if len(cols) != 5:
+            continue
+        try:
+            gpus.append({
+                "index": cols[0],
+                "mem_total": float(cols[1]),
+                "mem_used": float(cols[2]),
+                "util": float(cols[3]),
+                "temp": float(cols[4]),
+            })
+        except ValueError:
+            continue
+    return gpus
+
+
+def gpu_orphan_processes(known_pids: set[str]) -> list[str]:
+    if not shutil.which("nvidia-smi"):
+        return []
+    out = run_cmd(
+        ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"], timeout=5
+    )
+    orphans = []
+    for line in out.splitlines():
+        cols = [c.strip() for c in line.split(",")]
+        if len(cols) != 2:
+            continue
+        pid, mem = cols
+        if pid and pid not in known_pids:
+            orphans.append(f"PID {pid} holding {mem} MiB")
+    return orphans
+
+
+def run_performance_health_check(host: str) -> None:
+    section("Performance Degradation Check", "bright_red")
+    os_type = os.uname().sysname if hasattr(os, "uname") else "Unknown"
+
+    procs = find_vllm_processes()
+    if not procs:
+        cwarn("No running vLLM process found — skipping degradation check")
+        return
+
+    pids = {p["pid"] for p in procs}
+    findings: list[str] = []
+    snapshot: dict = {"timestamp": time.time()}
+
+    # ── Per-process identity + log location, so a slowdown can be traced ────
+    cinfo(f"Found {len(procs)} vLLM process(es):")
+    for p in procs:
+        uptime_h = process_uptime_hours(p["pid"])
+        uptime_s = f"{uptime_h:.1f}h uptime" if uptime_h is not None else "uptime unknown"
+        console.print(f"  • PID {p['pid']}  |  model={p['model']}  |  {uptime_s}")
+        log_paths = find_process_log_paths(p["pid"])
+        if log_paths:
+            for lp in log_paths:
+                console.print(f"      log: {lp}")
+        else:
+            console.print(
+                f"      log: stdout/stderr not attached to a file (likely systemd/journald or a live "
+                f"terminal) — try `journalctl _PID={p['pid']} -f` or check your process supervisor"
+            )
+        if uptime_h is not None:
+            snapshot.setdefault("uptime_h", {})[p["pid"]] = round(uptime_h, 1)
+            if uptime_h > 72:
+                findings.append(
+                    f"PID {p['pid']} ({p['model']}) has been running for {uptime_h:.1f}h (>3 days). vLLM's "
+                    "GPU allocator and KV cache can accumulate fragmentation over long uptimes on some "
+                    "versions, which shows up as gradual slowdowns or stalls that only clear on restart."
+                )
+
+    # ── GPU memory/thermal pressure ──────────────────────────────────────────
+    gpus = gpu_snapshot()
+    for g in gpus:
+        pct = 100 * g["mem_used"] / g["mem_total"] if g["mem_total"] else 0
+        cinfo(
+            f"GPU {g['index']}: {g['mem_used']:.0f}/{g['mem_total']:.0f} MiB used ({pct:.0f}%), "
+            f"util={g['util']:.0f}%, temp={g['temp']:.0f}°C"
+        )
+        snapshot.setdefault("gpu", []).append(
+            {"index": g["index"], "mem_pct": round(pct, 1), "util": g["util"], "temp": g["temp"]}
+        )
+        if pct > 95:
+            findings.append(
+                f"GPU {g['index']} memory is at {pct:.0f}% — very little headroom left for KV cache growth "
+                "under load, which causes request queuing/timeouts that look like the server 'stopped responding'."
+            )
+        if g["temp"] > 85:
+            findings.append(
+                f"GPU {g['index']} temperature is {g['temp']:.0f}°C — thermal throttling reduces clocks and "
+                "silently slows generation speed without any errors."
+            )
+
+    orphans = gpu_orphan_processes(pids)
+    if orphans:
+        findings.append(
+            "Found GPU compute process(es) NOT matching the running vLLM PID(s): " + "; ".join(orphans) + ". "
+            "These are leaked/orphaned CUDA contexts (e.g. from a prior crashed worker or an OOM-killed "
+            "process) that permanently hold GPU memory until killed, shrinking what's available to the live server."
+        )
+
+    # ── Host memory pressure ─────────────────────────────────────────────────
+    swap_pct = swap_usage_pct(os_type)
+    if swap_pct is not None:
+        snapshot["swap_pct"] = round(swap_pct, 1)
+        cinfo(f"Swap usage: {swap_pct:.1f}%")
+        if swap_pct > 20:
+            findings.append(
+                f"System swap usage is {swap_pct:.1f}%. Once the host starts swapping, any CPU-side work "
+                "vLLM does (tokenization, request scheduling, HTTP handling) slows down dramatically."
+            )
+
+    # ── File-descriptor exhaustion ───────────────────────────────────────────
+    fd_limit = fd_soft_limit()
+    for p in procs:
+        fd_count = open_fd_count(p["pid"])
+        if fd_count is not None:
+            snapshot.setdefault("fd_count", {})[p["pid"]] = fd_count
+            cinfo(f"PID {p['pid']}: {fd_count} open file descriptors" + (f" (soft limit {fd_limit})" if fd_limit else ""))
+            if fd_limit and fd_count > 0.85 * fd_limit:
+                findings.append(
+                    f"PID {p['pid']} has {fd_count} open file descriptors, close to the soft limit of "
+                    f"{fd_limit}. A slow client, reverse proxy, or connection leak that never closes sockets "
+                    "will eventually exhaust this and the server will stop accepting new requests."
+                )
+
+    # ── Disk space ────────────────────────────────────────────────────────────
+    free_pct = disk_free_pct("/")
+    if free_pct is not None:
+        snapshot["disk_free_pct"] = round(free_pct, 1)
+        cinfo(f"Root filesystem free space: {free_pct:.1f}%")
+        if free_pct < 5:
+            findings.append(
+                f"Root filesystem is at {free_pct:.1f}% free space. When disks fill up, log writes and any "
+                "on-disk caching (prefix cache, model weights swap) start failing or blocking, which can "
+                "freeze the server instead of erroring cleanly."
+            )
+
+    # ── Trend vs. history (catches slow leaks a single snapshot can't) ──────
+    history = load_history()
+    prev_runs = history.get(host, [])
+    if prev_runs:
+        last = prev_runs[-1]
+        if "gpu" in last and "gpu" in snapshot:
+            for cur_g, prev_g in zip(snapshot["gpu"], last["gpu"]):
+                delta = cur_g["mem_pct"] - prev_g["mem_pct"]
+                if delta > 15:
+                    last_ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(last["timestamp"]))
+                    findings.append(
+                        f"GPU {cur_g['index']} memory usage climbed from {prev_g['mem_pct']:.0f}% to "
+                        f"{cur_g['mem_pct']:.0f}% since the last run on {last_ts} with no corresponding rise "
+                        "in utilization — consistent with a slow memory leak rather than normal load."
+                    )
+
+    if findings:
+        cfail(f"Detected {len(findings)} potential cause(s) of performance degradation:")
+        for i, f in enumerate(findings, 1):
+            console.print(f"  [bold red]{i}.[/bold red] {f}")
+        console.print()
+        console.print("[bold]Suggested fixes:[/bold]")
+        console.print(
+            "  • Schedule a periodic vLLM restart (systemd timer or cron, every 24-48h) as a stopgap "
+            "against long-uptime fragmentation until the root cause is confirmed."
+        )
+        console.print(
+            "  • Kill any orphaned GPU compute processes reported above (`kill <pid>`) — they hold memory "
+            "permanently and are never released without one."
+        )
+        console.print(
+            "  • Lower vLLM's `--gpu-memory-utilization` slightly (e.g. 0.90 -> 0.85) to leave headroom for "
+            "fragmentation and avoid OOM-triggered stalls under sustained load."
+        )
+        console.print(
+            "  • If FD counts are climbing, look for a client/load-balancer/reverse-proxy that isn't closing "
+            "connections, and check its keep-alive/timeout settings."
+        )
+        console.print(
+            "  • Check GPU cooling/airflow if temperatures are consistently high — thermal throttling "
+            "silently cuts generation speed long before the server looks 'down'."
+        )
+        console.print("  • Free up disk space or move logs to a larger volume if the root filesystem is near full.")
+        console.print(
+            f"  • Check the log paths printed above for OOM/CUDA errors around the time it slowed down. "
+            f"Re-run this script periodically (e.g. via cron) so {HISTORY_PATH} builds a trend and future "
+            "runs catch slow leaks earlier."
+        )
+    else:
+        cpass("No signs of performance degradation detected")
+
+    prev_runs.append(snapshot)
+    history[host] = prev_runs[-20:]  # rolling window
+    save_history(history)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1371,6 +1703,7 @@ def main() -> int:
     cinfo(f"Updated : {SCRIPT_UPDATED}")
 
     print_system_hardware()
+    run_performance_health_check(args.host)
 
     section("0. vLLM Instance Discovery")
     if args.port:
