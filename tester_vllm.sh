@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Christopher Gray - @c2theg/ai  |  Version: 1.1.0  |  Update: 9/10/2026
+# Christopher Gray - @c2theg/ai  |  Version: 1.2.0  |  Update: 9/10/2026
 # vLLM smoke test — auto-discovers every running vLLM instance (ports + models)
 #                   and runs the full smoke test against each one.
 # Includes 21 auto-graded model-quality tests (reasoning, math, summarization,
@@ -11,7 +11,7 @@
 #
 #
 # Update Yourself:
-#  curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' -o 'tester_vllm.sh' "https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/tester_vllm.sh?nocache=$(date +%s)" && chmod u+x tester_vllm.sh
+#  curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' -o 'tester_vllm.py' "https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/tester_vllm.py?nocache=$(date +%s)" && chmod u+x tester_vllm.py
 #
 #
 # Usage: ./tester_llm.py [HOST] [PORT]
@@ -79,7 +79,7 @@ except ImportError:
     sys.exit(1)
 
 SCRIPT_AUTHOR = "Christopher Gray - @c2theg/ai"
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.2.0"
 SCRIPT_UPDATED = "9/10/2026"
 
 TOTAL_TEST_STEPS = 40  # 1,2,3,3b,4,5,5b,6,7,7b,8,9 (12) + 10-30 (21) + 31-37 (7)
@@ -731,6 +731,31 @@ def gpu_snapshot() -> list[dict]:
     return gpus
 
 
+def descendant_pids(root_pids: set[str]) -> set[str]:
+    # vLLM's V1 engine (and any tensor-parallel config) runs the actual CUDA
+    # context in separate engine-core/worker subprocesses, not the "vllm serve"
+    # PID found via ps aux — so orphan detection must walk the whole process
+    # tree under each known PID, or it flags vLLM's own workers as "leaked".
+    out = run_cmd(["ps", "-A", "-o", "pid,ppid"], timeout=5)
+    children: dict[str, list[str]] = {}
+    for line in out.splitlines()[1:]:
+        cols = line.split()
+        if len(cols) != 2:
+            continue
+        pid, ppid = cols
+        children.setdefault(ppid, []).append(pid)
+
+    all_pids = set(root_pids)
+    frontier = list(root_pids)
+    while frontier:
+        pid = frontier.pop()
+        for child in children.get(pid, []):
+            if child not in all_pids:
+                all_pids.add(child)
+                frontier.append(child)
+    return all_pids
+
+
 def gpu_orphan_processes(known_pids: set[str]) -> list[str]:
     if not shutil.which("nvidia-smi"):
         return []
@@ -748,14 +773,15 @@ def gpu_orphan_processes(known_pids: set[str]) -> list[str]:
     return orphans
 
 
-def run_performance_health_check(host: str) -> None:
+def run_performance_health_check(host: str) -> bool:
+    """Returns True if the full instance test suite should proceed."""
     section("Performance Degradation Check", "bright_red")
     os_type = os.uname().sysname if hasattr(os, "uname") else "Unknown"
 
     procs = find_vllm_processes()
     if not procs:
         cwarn("No running vLLM process found — skipping degradation check")
-        return
+        return True
 
     pids = {p["pid"] for p in procs}
     findings: list[str] = []
@@ -807,7 +833,7 @@ def run_performance_health_check(host: str) -> None:
                 "silently slows generation speed without any errors."
             )
 
-    orphans = gpu_orphan_processes(pids)
+    orphans = gpu_orphan_processes(descendant_pids(pids))
     if orphans:
         findings.append(
             "Found GPU compute process(es) NOT matching the running vLLM PID(s): " + "; ".join(orphans) + ". "
@@ -906,6 +932,29 @@ def run_performance_health_check(host: str) -> None:
     prev_runs.append(snapshot)
     history[host] = prev_runs[-20:]  # rolling window
     save_history(history)
+
+    if not findings:
+        return True
+
+    # Instance tests below run up to 40 live model requests (some with 300s
+    # timeouts) per instance — under the conditions just flagged, that suite
+    # may hang or take far longer than usual instead of completing normally.
+    console.print()
+    if not sys.stdin.isatty():
+        cwarn("Non-interactive session — proceeding with the full test suite despite the issues above.")
+        return True
+    try:
+        resp = input(
+            "Given the issues above, the full test suite (40 live model requests per instance) may hang "
+            "or fail to complete. Continue anyway? [y/N]: "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        resp = "n"
+        console.print()
+    if resp in ("y", "yes"):
+        return True
+    cwarn("Skipping instance tests — resolve the issues above, or re-run and choose to continue anyway.")
+    return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1703,7 +1752,10 @@ def main() -> int:
     cinfo(f"Updated : {SCRIPT_UPDATED}")
 
     print_system_hardware()
-    run_performance_health_check(args.host)
+    if not run_performance_health_check(args.host):
+        section("Summary")
+        cwarn("Testing aborted after the performance degradation check.")
+        return 1
 
     section("0. vLLM Instance Discovery")
     if args.port:
