@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.3.38  |  Update: 8/20/2026
+# Christopher Gray  |  Version: 0.3.39  |  Update: 9/13/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
 #   curl -fsSL -o 'install_ai_spark_vllm.sh' 'https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_ai_spark_vllm.sh' && chmod u+x install_ai_spark_vllm.sh
-#       QWEN38_GMU=0.40 ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3.8-27B-FP8"
-
-
+#       QWEN38_GMU=0.40 ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3.8-27B-FP8" * DOESNT WORK on 1 spark
+#       QWEN38_GMU=0.38 ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3.8-27B-FP8"  * WORKS on spark
+#       QWEN38_GMU=0.35 ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3.8-27B-NVFP4"  * NOT YET CONFIRMED on spark
+#
+#
 # ---- other examples ---
 #   ./install_ai_spark_vllm.sh --start "Qwen3.8-27B-FP8,Qwen3-Embedding-4B"
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3-Embedding-4B"
@@ -21,7 +23,6 @@
 #
 # Full 262144-context Qwen3.6-35B-A3B-NVFP4 (solo only — see its case block):
 #   QWEN36_35B_MAX_MODEL_LEN=262144 ./install_ai_spark_vllm.sh --start Qwen3.6-35B-A3B-NVFP4
-#   QWEN36_35B_MAX_MODEL_LEN=65536 QWEN36_35B_GMU=0.40 QWEN38_GMU=0.40 ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3.8-27B-FP8"
 #
 #
 # Move to DGX Spark / GB10:
@@ -85,6 +86,19 @@
 #           }'
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.3.39  9/13/2026
+#   - Added nvidia/Qwen3.8-27B-NVFP4 (catalog port 8026, "Dense Models"). Fixed
+#     to --language-model-only (text-only, no image/video toggle like its
+#     BF16/FP8 siblings), --tensor-parallel-size 1 (the HF card's own example
+#     command uses --tensor-parallel-size 4 for a multi-GPU box; a DGX Spark
+#     is one GPU), --kv-cache-dtype fp8_e4m3, --seed 0. Default
+#     gpu-memory-utilization 0.35 is sized to co-run as "secondary" alongside
+#     nvidia/Qwen3.6-35B-A3B-NVFP4's 0.34 "primary" default (0.69 combined) —
+#     unlike the QWEN38_GMU=0.38 FP8 pairing already in this header, this
+#     starting point has not been confirmed on real hardware yet. QWEN38_GMU
+#     and QWEN38_MAX_MODEL_LEN are shared with the BF16/FP8 siblings (same
+#     model family, same knobs) for a solo/full-262144-context run.
 #
 # v0.3.37  8/20/2026
 #   - Added --max-num-batched-tokens 3072 to both lighter 32768-context NVFP4
@@ -653,6 +667,25 @@ _add "nvidia/Gemma-4-31B-IT-NVFP4"            "Gemma-4-31B-IT-NVFP4"         "Ge
 #        HF Repo                  Local Dir             Display Name                    Disk VRAM  Port  Category
 _add "Qwen/Qwen3.8-27B"         "Qwen3.8-27B"         "Qwen3.8-27B (BF16, multimodal)"  56   75   8023  "Dense Models"
 _add "Qwen/Qwen3.8-27B-FP8"     "Qwen3.8-27B-FP8"     "Qwen3.8-27B (FP8, multimodal)"   31   51   8024  "Dense Models"
+
+# ── Qwen3.8-27B NVFP4 (nvidia) — text-only, sized to co-run as "secondary"
+# alongside nvidia/Qwen3.6-35B-A3B-NVFP4's default "primary" profile ───────────
+# NVFP4 (~4-bit) requantization — the lightest of the three Qwen3.8-27B builds
+# above. This profile is fixed to --language-model-only (no image/video
+# toggle like its BF16/FP8 siblings) since it is meant purely as a text
+# secondary model. Its own default 0.35 gpu-memory-utilization + the primary's
+# 0.34 = 0.69 of the shared unified-memory pool, leaving headroom for the OS —
+# not yet confirmed on real hardware the way the FP8 pairing below was, so
+# treat as a starting point:
+#   QWEN38_GMU=0.35 ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3.8-27B-NVFP4"
+# QWEN38_GMU and QWEN38_MAX_MODEL_LEN are shared with the BF16/FP8 siblings
+# above (same knob, same model family) — override for a solo/full-power run:
+#   QWEN38_GMU=0.85 QWEN38_MAX_MODEL_LEN=262144 ./install_ai_spark_vllm.sh --start Qwen3.8-27B-NVFP4
+# HF card's own example targets a bigger multi-GPU box (--tensor-parallel-size
+# 4); fixed to 1 here since a DGX Spark is a single GPU.
+# https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4
+#        HF Repo                        Local Dir                Display Name                              Disk VRAM  Port  Category
+_add "nvidia/Qwen3.8-27B-NVFP4"      "Qwen3.8-27B-NVFP4"      "Qwen3.8-27B (NVFP4, nvidia, text-only)"     18   45   8026  "Dense Models"
 
 # ── Sehyo Qwen3.5-35B-A3B NVFP4 (co-run "primary" alongside Qwen3.8-27B-FP8
 # "secondary" on ports 8006/8007) ─────────────────────────────────────────────
@@ -3682,6 +3715,35 @@ _serve_model() {
             --trust-remote-code \
             "${_qwen38_input_args[@]+"${_qwen38_input_args[@]}"}" \
             "${_qwen38_thinking_args[@]+"${_qwen38_thinking_args[@]}"}" \
+            "${_SERVE_TEMP_ARGS[@]}"
+        ;;
+
+    # NVFP4 build — text-only by design (see catalog comment above), so unlike
+    # its BF16/FP8 siblings this skips _configure_qwen38 entirely and just
+    # follows the global reasoning/temperature defaults like any other
+    # non-Qwen3.8 profile (_SERVE_CHAT_KWARGS_ARGS/_SERVE_TEMP_ARGS). Default
+    # 0.35 gpu-memory-utilization is sized to co-run as "secondary" alongside
+    # nvidia/Qwen3.6-35B-A3B-NVFP4's 0.34 "primary" default; QWEN38_GMU and
+    # QWEN38_MAX_MODEL_LEN (shared with the BF16/FP8 siblings) override for a
+    # solo/full-context run. --tensor-parallel-size fixed at 1 - a DGX Spark is
+    # a single GPU, unlike the HF card's own multi-GPU example command.
+    "nvidia/Qwen3.8-27B-NVFP4")
+        _vllm_launch "$idx" \
+            --served-model-name "Qwen3.8-27B-NVFP4" \
+            --trust-remote-code \
+            --language-model-only \
+            --tensor-parallel-size 1 \
+            --gpu-memory-utilization "${QWEN38_GMU:-0.35}" \
+            --max-model-len "${QWEN38_MAX_MODEL_LEN:-$SERVE_MAX_MODEL_LEN}" \
+            --kv-cache-dtype fp8_e4m3 \
+            --max-num-seqs 32 \
+            --max-num-batched-tokens 32768 \
+            --enable-chunked-prefill \
+            --enable-auto-tool-choice \
+            --tool-call-parser qwen3_coder \
+            --reasoning-parser qwen3 \
+            --seed 0 \
+            "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
             "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
