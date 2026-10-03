@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.3.39  |  Update: 9/13/2026
+# Christopher Gray  |  Version: 0.3.40  |  Update: 10/3/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
@@ -10,6 +10,8 @@
 #
 #
 # ---- other examples ---
+#   ./install_ai_spark_vllm.sh --start "DeepSeek-V4-Flash-NVFP4"   (SOLO, TWO Sparks — set SPARK_* in config/.env)
+#   ./install_ai_spark_vllm.sh --start "Qwen3-Coder-Next-FP8"      (SOLO, one Spark)
 #   ./install_ai_spark_vllm.sh --start "Qwen3.8-27B-FP8,Qwen3-Embedding-4B"
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3-Embedding-4B"
 
@@ -20,9 +22,13 @@
 #   ./install_ai_spark_vllm.sh --start "Gemma-4-31B-IT-NVFP4"
 #   ./install_ai_spark_vllm.sh --start "Qwen3.5-35B-A3B-NVFP4,Qwen3.8-27B-FP8"
 #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3.8-27B-FP8"
+#   
 #
-# Full 262144-context Qwen3.6-35B-A3B-NVFP4 (solo only — see its case block):
-#   QWEN36_35B_MAX_MODEL_LEN=262144 ./install_ai_spark_vllm.sh --start Qwen3.6-35B-A3B-NVFP4
+#   ./install_ai_spark_vllm.sh --start "Qwen3.8-Flash-Next-NVFP4"        (SOLO, Docker — github.com/blazux/qwen3.8-Flash-DGX)
+#
+# Qwen3.6 / Nemotron-Omni hybrids default to 262144 context (HYBRID_MAX_MODEL_LEN).
+# Old MTP/marlin solo profile for Qwen3.6-35B-A3B-NVFP4 (see its case block):
+#   QWEN36_35B_PROFILE=solo ./install_ai_spark_vllm.sh --start Qwen3.6-35B-A3B-NVFP4
 #
 #
 # Move to DGX Spark / GB10:
@@ -86,6 +92,125 @@
 #           }'
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.3.40  10/3/2026
+#   - MERGE: this GitHub line (v0.3.13-v0.3.39) and a local copy that had split
+#     off at v0.3.12 (its own v0.3.13-v0.3.16, kept below as "local-fork") are
+#     one script again. Brought over from the local copy: GGUF catalog support
+#     (MDL_HF_INCLUDE / MDL_SERVE_FILE) + Qwen3.5-122B-A10B UD-Q4_K_XL GGUF,
+#     DeepSeek-V4-Flash-NVFP4 on TWO Sparks (2-SPARK CLUSTER config, Ray), the
+#     SOLO_MODELS guard, and Qwen3-Coder-Next-FP8 (now "MoE Models"). Headless
+#     runs now replace a running solo model (they stop everything first since
+#     v0.3.35) instead of refusing.
+#   - vLLM AUTO-UPDATE back ON, made safe. Every run upgrades vLLM and
+#     AUTO_UPDATE_PACKAGES (flashinfer-python, transformers, tokenizers,
+#     safetensors, fastsafetensors, huggingface_hub). pip dry-runs first; when
+#     something would change, the WHOLE venv is copied to <venv>.pre-update,
+#     the upgrade runs with torch replacements from TORCH_CUDA_INDEX (cu130)
+#     instead of PyPI's CPU-only aarch64 wheel, and the result must pass a GPU
+#     check (CUDA visible, a matmul on the GPU, vllm + flashinfer import).
+#     Failure → the copy is moved back. If a model then dies with an
+#     environment-shaped error, _rebuild_vllm_venv restores that copy before
+#     any vendor rebuild. The old `pip install torch==<old>` rollback could not
+#     restore NVIDIA's build (PyPI doesn't carry it); the copy can.
+#   - Added Qwen3.8-Flash-Next NVFP4 (SOLO, Docker) from
+#     github.com/blazux/qwen3.8-Flash-DGX. The repo is cloned to
+#     QWEN38_FLASH_DIR and fast-forwarded every run (image rebuilt when it
+#     moved); its `flash` launcher downloads (~124 GiB into
+#     QWEN38_FLASH_HF_CACHE), prepares and serves it on this script's port with
+#     the usual alias ("primary" on 8006). Profile: QWEN38_FLASH_PROFILE
+#     (default = 500k context). The container's --restart unless-stopped is
+#     removed after launch so --set-boot-model stays in charge of boot.
+#     _kill_vllm_processes stops the container too.
+#   - Context windows: Qwen3.6-35B-A3B-NVFP4, Qwen3.6-27B-NVFP4 and
+#     Nemotron-3-Nano-Omni FP8/NVFP4 now default to their native 262144
+#     (HYBRID_MAX_MODEL_LEN), sized from each model's config.json: only 10/40,
+#     16/64 and 6/52 of their layers keep a growing KV cache, so a full-length
+#     sequence costs 2.7 / 8.6 / 1.6 GB. Entering a value at the context prompt
+#     (or SERVE_MAX_MODEL_LEN) still overrides them. gmu: 27B 0.25 → 0.32,
+#     Omni-NVFP4 0.20 → 0.25 (0.20 barely covered its 22.4 GB of weights).
+#     35B co-run profile: --max-num-batched-tokens 3072 → 8192. Its old MTP solo
+#     profile is now QWEN36_35B_PROFILE=solo (QWEN36_35B_MAX_MODEL_LEN=262144
+#     still selects it). Qwen3-Reranker-4B: 10000 → 16384 (all-attention, so
+#     its KV is costly). Pairs: 35B + 27B = 0.66 of the pool; 35B + reranker
+#     0.46. Check on the box: grep -E "GPU KV cache size|Maximum concurrency" <log>
+#
+# local-fork v0.3.15  9/28/2026
+#   - DeepSeek-V4-Flash-NVFP4 now runs TP=2 across TWO Sparks (new
+#     MULTINODE_MODELS list). New config block "2-SPARK CLUSTER"
+#     (SPARK_HEAD_IP, SPARK_WORKER_IP, SPARK_WORKER_SSH, SPARK_IFACE,
+#     SPARK_IB_HCA, RAY_PORT, also read from .env). Launch flow: preflight
+#     (config set, passwordless SSH, Ray/vLLM on the worker, same vLLM version
+#     on both, worker memory free after stopping anything there), download on
+#     this node, rsync the model to the worker at the same path, start a fresh
+#     2-node Ray cluster (head here, worker over SSH, NCCL/Gloo pinned to the
+#     ConnectX interface, Ray's OOM killer off), then vllm serve with
+#     --tensor-parallel-size 2 --distributed-executor-backend ray. The API
+#     stays on this node. Default context raised 32768 → 262144 (per-node KV
+#     room is ~19 GB after ~84 GB of weights; V4's KV is tiny).
+#     _kill_vllm_processes now also stops Ray on both nodes when it's running.
+#   - Added Qwen/Qwen3-Coder-Next-FP8 (80B/3B-active Qwen3-Next MoE, ~80 GB),
+#     SOLO, single Spark: 0.80 utilization, 262144 context, flashinfer
+#     attention, prefix caching + chunked prefill (8192), max-num-seqs 8,
+#     qwen3_coder tool calling. bf16 KV (only 12/48 layers are full attention,
+#     ~6.4 GB at full context). Overrides: QCN_GPU_MEMORY_UTILIZATION,
+#     QCN_MAX_MODEL_LEN, QCN_MAX_NUM_SEQS, QCN_KV_CACHE_DTYPE.
+#   - Fixed: the v0.3.14 DeepSeek serve arm had been inserted between the GGUF
+#     model's comment block and its case arm; both are now in order.
+#
+# local-fork v0.3.14  9/28/2026
+#   - Added nvidia/DeepSeek-V4-Flash-NVFP4 (284B total / 13B active MoE, NVFP4
+#     routed experts + FP8 attention/shared experts/MTP, ~168 GB on disk).
+#     Catalog category "Super Large", local dir DeepSeek-V4-Flash-NVFP4.
+#   - New SOLO_MODELS list: a solo model never shares the box. Selecting it
+#     with anything else is an error in headless --start (interactive keeps
+#     only the solo model); launching it stops every other vLLM process first
+#     (headless: automatically; interactive: asks, and aborts on No); and while
+#     it is running, --start of any other model is refused.
+#   - Text-focused serve profile: fp8 KV cache (V4's CSA/HCA compressed
+#     attention already keeps the per-token KV small), prefix caching with
+#     VLLM_PREFIX_CACHE_RETENTION_INTERVAL=4096, chunked prefill capped at 8192
+#     batched tokens, max-num-seqs 4 (few sequences, so most of the reservation
+#     goes to one long context instead of concurrency), deepseek_v4 tokenizer
+#     mode + reasoning parser + tool-call parser. 0.85 utilization, 32768 context.
+#     Overrides: DSV4_GPU_MEMORY_UTILIZATION, DSV4_MAX_MODEL_LEN,
+#     DSV4_MAX_NUM_SEQS, DSV4_MTP=true (1-token MTP speculative decoding, off by
+#     default because it costs memory), DSV4_PREFIX_RETENTION.
+#   - Idle-sleep is disabled for this model (SLEEP_MIN=0): on unified memory,
+#     sleeping to "CPU" frees nothing, and waking a 168 GB model is slow.
+#   - ⚠️  The ~168 GB checkpoint is larger than one DGX Spark's ~121 GB pool.
+#     Launch prints a warning with the numbers but still tries (per request).
+#     The vLLM recipe for GB10 runs it with TP=2 across two Sparks.
+#
+# local-fork v0.3.13  7/26/2026
+#   - Added a GGUF UD-Q4_K_XL quant of Qwen/Qwen3.5-122B-A10B, sourced from
+#     unsloth/Qwen3.5-122B-A10B-MTP-GGUF (catalog idx new, port 8034, ~78.6 GB
+#     weights). Deliberately does NOT use the
+#     meshllm/Qwen3.5-122B-A10B-UD-Q4_K_XL-layers repo requested initially — its
+#     HF metadata (library_name: mesh-llm, tags: distributed-inference,
+#     layer-package) shows it's a 49-file-per-layer repackaging built for the
+#     third-party "mesh-llm" tool to split a model across MULTIPLE NETWORKED
+#     MACHINES, not something a single-node `vllm serve` can load. The unsloth
+#     repo's UD-Q4_K_XL/ folder is a normal 3-shard llama.cpp-style split.
+#   - New catalog mechanism for GGUF entries: MDL_HF_INCLUDE (optional
+#     `hf download --include` glob, so only the one quant folder is pulled
+#     instead of the whole multi-hundred-GB repo) and MDL_SERVE_FILE (optional
+#     path to the specific file inside the local dir — used both to probe
+#     "already downloaded" instead of config.json, and as the actual path
+#     `vllm serve` gets, since vLLM's GGUF loader wants a file, not a
+#     directory). _add() now takes these as optional 9th/10th args;
+#     _ensure_model_downloaded and _vllm_launch both honor them; every existing
+#     catalog entry is unaffected (both default to the old directory/config.json
+#     behavior).
+#   - Serve profile: --language-model-only (this checkpoint is multimodal;
+#     forces text-only), --reasoning-parser qwen3, --tokenizer pointed at the
+#     original Qwen/Qwen3.5-122B-A10B repo (the GGUF repo ships no HF
+#     tokenizer), --gpu-memory-utilization 0.90 (~110 GB of the DGX Spark's
+#     ~121.7 GB unified-memory pool — this model MUST run solo), fp8 KV cache
+#     with --calculate-kv-scales and --max-num-seqs 1 to fit the DGX Spark's
+#     remaining headroom, --max-model-len defaulting to 32768 (override with
+#     QWEN35_122B_GGUF_MAX_MODEL_LEN). A startup warning states it needs the
+#     whole pool and nothing else can run alongside it.
 #
 # v0.3.39  9/13/2026
 #   - Added nvidia/Qwen3.8-27B-NVFP4 (catalog port 8026, "Dense Models"). Fixed
@@ -367,24 +492,26 @@ EMBEDDING_BASE_PORT=8010
 # of skipping a missing model instead.
 AUTO_DOWNLOAD=true
 
-# Before serving, check PyPI for a newer vLLM and upgrade the venv if one exists.
-# Runs in every mode (including headless --start / cron). Best-effort: a network
-# error or PyPI hiccup is logged and skipped, never blocking model startup.
-# ⚠️  Trade-off: this reaches the network every run and a vLLM upgrade wheel can
-# be large/slow, so a cron @reboot start may take longer. It also means a bad
-# upstream release could regress a working stack — set false to pin the installed
-# version once you have one that works (e.g. after NVFP4 support lands).
-#
-# ⚠️  DEFAULT FLIPPED TO false IN v0.3.15. On DGX Spark the venv's torch is an
-# NVIDIA aarch64+CUDA build that PyPI does not carry. `pip install -U vllm` resolves
-# its torch dependency against PyPI and can swap that build for a generic wheel with
-# no CUDA runtime — after which torch sees no GPU and vLLM dies with "Failed to
-# infer device type" before it can even parse arguments. Running that unpinned
-# upgrade on EVERY restart (including cron @reboot) is a lot of exposure for a
-# build you specifically do not want replaced. _maybe_update_vllm now also snapshots
-# torch and rolls back automatically if an upgrade strips CUDA support, so turning
-# this back on is far safer than it was — but it stays off by default.
-AUTO_UPDATE_VLLM=false
+# Every run (including headless --start / cron), upgrade vLLM and the packages it
+# serves with to their latest releases — safely (see _maybe_update_vllm):
+# dry-run first, then a full copy of the venv, upgrade, a GPU + import check,
+# and an automatic restore of that copy if anything fails. If a model then
+# fails to start with an environment-shaped error, the copy is restored before
+# any vendor rebuild. History: v0.3.15 had turned this off after an unpinned
+# `pip install -U vllm` swapped NVIDIA's aarch64+CUDA torch for PyPI's CPU-only
+# wheel and left the box GPU-blind; the copy + verify + restore steps exist so
+# that can't stick. Costs: network on every run, and when an update exists a
+# venv copy (~10-20 GB of disk, a minute or two) before the cron start serves.
+# One-off disable: AUTO_UPDATE_VLLM=false ./install_ai_spark_vllm.sh ...
+AUTO_UPDATE_VLLM="${AUTO_UPDATE_VLLM:-true}"
+# What gets upgraded. vLLM pulls its own exact pins (torch, flashinfer,
+# cutlass-dsl, ...) along; the rest are what loading and serving models needs.
+# ray is deliberately absent: a 2-Spark cluster needs identical versions on
+# both nodes, and this only updates this node.
+AUTO_UPDATE_PACKAGES="${AUTO_UPDATE_PACKAGES:-vllm flashinfer-python transformers tokenizers safetensors fastsafetensors huggingface_hub[cli]}"
+# Where a replacement torch comes from when a new vLLM needs one. PyPI's aarch64
+# torch has no CUDA; PyTorch's cu130 index matches DGX OS's CUDA 13.
+TORCH_CUDA_INDEX="${TORCH_CUDA_INDEX:-https://download.pytorch.org/whl/cu130}"
 
 # On startup, verify the GPU is actually visible and try to recover it if not.
 # Two distinct failures, handled differently (see _preflight_gpu):
@@ -451,10 +578,49 @@ VLLM_READY_TIMEOUT=1800
 #   SERVE_MAX_MODEL_LEN=131072 SERVE_REASONING=false ./... --start <spec>
 #   SERVE_REASONING_EFFORT=xhigh SERVE_THINKING_BUDGET=4096 SERVE_TEMPERATURE=0.7 ./...
 DEFAULT_MAX_MODEL_LEN=65536          # --max-model-len for in-scope chat models
+# Hybrid linear-attention models (Qwen3.6-35B-A3B / 27B NVFP4, Nemotron-3-Nano-
+# Omni FP8/NVFP4) keep a growing KV cache in only a few layers (10/40, 16/64,
+# 6/52), so their full native context costs ~1.6-8.6 GB per sequence. They use
+# HYBRID_MAX_MODEL_LEN instead of DEFAULT_MAX_MODEL_LEN — unless you enter a
+# value at the prompt / set SERVE_MAX_MODEL_LEN, which then applies to them too.
+HYBRID_MAX_MODEL_LEN=262144
 DEFAULT_REASONING_ENABLED=true       # send reasoning_effort/thinking_token_budget by default
 DEFAULT_REASONING_EFFORT="low"       # low | medium | xhigh
 DEFAULT_THINKING_TOKEN_BUDGET=1024
 DEFAULT_TEMPERATURE=0.2
+
+# 2-SPARK CLUSTER (multi-node models, e.g. DeepSeek-V4-Flash-NVFP4)
+# =============================================
+# Models listed in MULTINODE_MODELS run tensor-parallel (TP=2) across THIS Spark
+# (the Ray head, which also serves the API) and one worker Spark, over the
+# ConnectX link. Requirements:
+#   • Both Sparks cabled directly via ConnectX (QSFP) with IPs on that link.
+#   • Passwordless SSH from this node to SPARK_WORKER_SSH (the script runs
+#     `ray start` there and rsyncs the model to it).
+#   • The worker has the SAME vLLM venv at the SAME path ($VLLM_VENV) and the
+#     SAME vLLM version — run this script on the worker once to install it.
+#     The model is rsynced to the same $MODELS_DIR path on the worker.
+# Any of these can also be set in .env (same names) instead of editing here.
+SPARK_HEAD_IP=""             # THIS node's IP on the ConnectX link, e.g. 192.168.100.10
+SPARK_WORKER_IP=""           # worker's IP on the ConnectX link, e.g. 192.168.100.11
+SPARK_WORKER_SSH=""          # ssh target for the worker; empty = $USER@$SPARK_WORKER_IP
+SPARK_IFACE=""               # ConnectX netdev on BOTH nodes, e.g. enp1s0f0np0 (see: ibdev2netdev)
+SPARK_IB_HCA=""              # RoCE HCAs for NCCL, e.g. rocep1s0f0,roceP2p1s0f0; empty = autodetect
+RAY_PORT=6379
+
+# =============================================
+# QWEN3.8-FLASH-NEXT (Docker, SOLO) — https://github.com/blazux/qwen3.8-Flash-DGX
+# =============================================
+# Served by that repo's patched vLLM v0.30.0 container, not the venv. Every run
+# fast-forwards the checkout and rebuilds the image when it moved. Profiles
+# (in the repo's profiles/): default (500k context, recommended), speed,
+# context, context-1m, shared, published, native.
+QWEN38_FLASH_REPO="https://github.com/blazux/qwen3.8-Flash-DGX.git"
+QWEN38_FLASH_DIR="${QWEN38_FLASH_DIR:-$BASE_DIR/qwen3.8-Flash-DGX}"
+QWEN38_FLASH_PROFILE="${QWEN38_FLASH_PROFILE:-default}"
+QWEN38_FLASH_HF_CACHE="${QWEN38_FLASH_HF_CACHE:-$BASE_DIR/hf-cache}"   # ~137 GB: checkpoint + hybrid layout
+QWEN38_FLASH_CONTAINER="qwen38-flash"
+QWEN38_FLASH_GPU_MEM="${QWEN38_FLASH_GPU_MEM:-}"   # empty = the profile's own (0.80)
 
 # =============================================
 # OPTIONAL FEATURES — toggle on/off
@@ -527,6 +693,12 @@ ENV_OWUI_PASS=$(_env_load OWUI_ADMIN_PASSWORD)
 [ -n "$ENV_OWUI_PASS" ] && OWUI_ADMIN_PASSWORD="$ENV_OWUI_PASS" && echo "✅ OWUI_ADMIN_PASSWORD loaded from .env"
 [ -z "$ENV_OWUI_PASS" ] && [ -n "$OWUI_ADMIN_PASSWORD" ] && _env_save OWUI_ADMIN_PASSWORD "$OWUI_ADMIN_PASSWORD"
 
+for _v in SPARK_HEAD_IP SPARK_WORKER_IP SPARK_WORKER_SSH SPARK_IFACE SPARK_IB_HCA RAY_PORT; do
+    _val=$(_env_load "$_v")
+    [ -n "$_val" ] && printf -v "$_v" '%s' "$_val"
+done
+[ -z "$SPARK_WORKER_SSH" ] && [ -n "$SPARK_WORKER_IP" ] && SPARK_WORKER_SSH="${USER:-$(id -un)}@$SPARK_WORKER_IP"
+
 if [ -z "$OWUI_ADMIN_EMAIL" ] || [ -z "$OWUI_ADMIN_PASSWORD" ]; then
     echo "⚠️  OWUI credentials not set — visit http://localhost:3000 on first run to create your admin account."
 fi
@@ -552,12 +724,24 @@ MDL_THINKING=()        # Qwen3.8 runtime choice: true | false
 MDL_PORT_EXPLICIT=()   # [idx]=1 when a --start "model:PORT" pinned this model's port
                        # (pinned models are exempt from sequential re-assignment)
 MDL_SERVED_NAME=()     # [idx]=stable API alias assigned from the model's port/role
+MDL_HF_INCLUDE=()      # optional HF `download --include` glob — restricts the download to a
+                       # subset of repo files (e.g. one GGUF quant folder) instead of the whole
+                       # repo. Empty = download everything (existing behavior for every model
+                       # that doesn't set this).
+MDL_SERVE_FILE=()      # optional path, relative to the model's local dir, to a single file that
+                       # (a) is checked instead of config.json to decide "already downloaded",
+                       # and (b) is passed to `vllm serve` in place of the local dir itself.
+                       # Needed for GGUF repos: vLLM's GGUF loader wants the .gguf file path, not
+                       # a directory, and GGUF-only repos ship no config.json to probe for.
+                       # Empty (default) = old behavior: probe/serve the local dir.
 
 _add() {
     local i=${#MDL_HF[@]}
     MDL_HF[$i]="$1"; MDL_DIR[$i]="$2"; MDL_NAME[$i]="$3"
     MDL_DISK[$i]="$4"; MDL_VRAM[$i]="$5"; MDL_PORT[$i]="$6"; MDL_CAT[$i]="$7"
     MDL_SLEEP[$i]="${8:-}"
+    MDL_HF_INCLUDE[$i]="${9:-}"
+    MDL_SERVE_FILE[$i]="${10:-}"
 }
 
 # ── Standard models ────────────────────────────────────────────────────────────
@@ -602,6 +786,20 @@ _add "openai/gpt-oss-120b"                                       "gpt-oss-120b" 
 # here, and the only one that supports the full 262144 context — see the
 # _serve_model entry below for why).
 #_add "sjug/Qwen3.5-122B-A10B-NVFP4-resharded"                    "Qwen3.5-122B-A10B-NVFP4-spark"         "Qwen3.5-122B-A10B-NVFP4 (Spark resharded) [SUPER]" 71 72   8034  "Super Large"
+
+# GGUF UD-Q4_K_XL quant of Qwen3.5-122B-A10B, from unsloth's standard GGUF repo:
+# https://huggingface.co/unsloth/Qwen3.5-122B-A10B-MTP-GGUF (UD-Q4_K_XL/ folder,
+# a normal 3-shard llama.cpp-style split, ~78.6 GB total).
+# NOTE: deliberately NOT using meshllm/Qwen3.5-122B-A10B-UD-Q4_K_XL-layers — its
+# HF metadata (library_name: mesh-llm, tags: distributed-inference/layer-package)
+# shows it's a 49-file-per-layer repackaging built for the third-party "mesh-llm"
+# tool to split a model ACROSS MULTIPLE NETWORKED MACHINES. It is not a normal
+# single-node GGUF and `vllm serve` cannot load it on one DGX Spark.
+# MDL_HF_INCLUDE restricts the download to just the UD-Q4_K_XL/ folder (not
+# every quant in the repo — that's several hundred GB). MDL_SERVE_FILE points
+# vllm serve at the actual first-shard .gguf file (see _serve_model below).
+_add "unsloth/Qwen3.5-122B-A10B-MTP-GGUF"    "Qwen3.5-122B-A10B-UD-Q4_K_XL-GGUF"    "Qwen3.5-122B-A10B (GGUF UD-Q4_K_XL) [SUPER]" 79   83   8034  "Super Large" "" \
+    "UD-Q4_K_XL/*" "UD-Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf"
 
 # ── Small models with a custom idle-sleep timeout ─────────────────────────────
 # These pass the optional 8th _add field (SLEEP_MIN) = 60, so the sleep watchdog
@@ -697,7 +895,59 @@ _add "nvidia/Qwen3.8-27B-NVFP4"      "Qwen3.8-27B-NVFP4"      "Qwen3.8-27B (NVFP
 #        HF Repo                            Local Dir                  Display Name                       Disk VRAM  Port  Category
 _add "Sehyo/Qwen3.5-35B-A3B-NVFP4"       "Qwen3.5-35B-A3B-NVFP4"    "Qwen3.5-35B-A3B (NVFP4, Sehyo)"    20   44   8025  "MoE Models"
 
+# ── DeepSeek-V4-Flash NVFP4 (SOLO) ────────────────────────────────────────────
+# https://huggingface.co/nvidia/DeepSeek-V4-Flash-NVFP4
+# 284B total / 13B active MoE. ModelOpt NVFP4 routed experts; attention, shared
+# experts, router head and MTP stay FP8. ~168 GB of safetensors — too big for
+# one Spark, so it's in MULTINODE_MODELS: TP=2 across this Spark + a worker
+# (see 2-SPARK CLUSTER config), ~84 GB of weights per node (VRAM column is
+# per node). Also in SOLO_MODELS, so it never runs alongside another model.
+# SLEEP_MIN=0: the idle watchdog skips it (sleeping frees nothing on unified
+# memory).
+#        HF Repo                                Local Dir                       Display Name                              Disk VRAM  Port  Category      Sleep(min)
+_add "nvidia/DeepSeek-V4-Flash-NVFP4"         "DeepSeek-V4-Flash-NVFP4"      "DeepSeek-V4-Flash (NVFP4) [SOLO, 2x Spark]" 168 84   8040  "Super Large" 0
+
+# ── Qwen3-Coder-Next FP8 (SOLO, single Spark) ─────────────────────────────────
+# https://huggingface.co/Qwen/Qwen3-Coder-Next-FP8
+# 80B total / 3B active Qwen3-Next MoE (hybrid: 36 Gated-DeltaNet linear-attention
+# layers + 12 full-attention layers with 2 KV heads), block-FP8, ~80 GB. Coding
+# model, non-thinking only. In SOLO_MODELS. SLEEP_MIN=0 for the same reason as
+# DeepSeek above.
+_add "Qwen/Qwen3-Coder-Next-FP8"              "Qwen3-Coder-Next-FP8"         "Qwen3-Coder-Next (FP8) [SOLO]"           81   97   8041  "MoE Models"  0
+
+# ── Qwen3.8-Flash-Next NVFP4 (SOLO, Docker) ──────────────────────────────────
+# https://github.com/blazux/qwen3.8-Flash-DGX · nvidia/Qwen3.8-Flash-Next-NVFP4
+# ~176B (125B main + 51B n-gram table, 6B active) MoE. The repo's patched
+# vLLM image serves the 48 GiB n-gram table from NVMe via mmap, which brings
+# resident weights to ~75 GiB and leaves room for a ~500K-token KV pool in
+# one Spark. Downloaded and served by the repo's `flash` launcher (see
+# _launch_qwen38_flash and the QWEN3.8-FLASH-NEXT config block); the Local Dir
+# column is unused. VRAM ≈ the profile's GPU_MEM 0.80 of the pool.
+_add "nvidia/Qwen3.8-Flash-Next-NVFP4"        "Qwen3.8-Flash-Next-NVFP4"     "Qwen3.8-Flash-Next (NVFP4, Docker) [SOLO]" 137 97  8042  "Super Large" 0
+
 MODEL_TOTAL=${#MDL_HF[@]}
+
+# ── Solo models ────────────────────────────────────────────────────────────────
+# HF repo ids of models that must be the ONLY vLLM model on the box. See
+# _enforce_solo_models: they can't be co-selected, launching one stops every
+# other vLLM process, and while one is running no other model can start.
+SOLO_MODELS=("nvidia/DeepSeek-V4-Flash-NVFP4" "Qwen/Qwen3-Coder-Next-FP8" "nvidia/Qwen3.8-Flash-Next-NVFP4")
+
+# HF repo ids of models served TP=2 across two Sparks via Ray (see the 2-SPARK
+# CLUSTER config and _start_ray_cluster). Every multi-node model must also be solo.
+MULTINODE_MODELS=("nvidia/DeepSeek-V4-Flash-NVFP4")
+
+_is_solo_model() {
+    local s
+    for s in "${SOLO_MODELS[@]}"; do [ "${MDL_HF[$1]}" = "$s" ] && return 0; done
+    return 1
+}
+
+_is_multinode_model() {
+    local s
+    for s in "${MULTINODE_MODELS[@]}"; do [ "${MDL_HF[$1]}" = "$s" ] && return 0; done
+    return 1
+}
 
 # ── Default pre-selected models ────────────────────────────────────────────────
 # Nothing is pre-selected — the user picks models in the interactive menus (or
@@ -1286,7 +1536,11 @@ _configure_qwen38() {
 # see the comment above DEFAULT_MAX_MODEL_LEN for the exact var names.
 # ─────────────────────────────────────────────────────────────────────────────
 _configure_serve_defaults() {
+    # Did the user pick a context length explicitly? Only then does it also
+    # override HYBRID_MAX_MODEL_LEN for the hybrid models.
+    local _ctx_explicit=false
     if [ "$HEADLESS" -eq 1 ]; then
+        [ -n "${SERVE_MAX_MODEL_LEN:-}" ] && _ctx_explicit=true
         SERVE_MAX_MODEL_LEN="${SERVE_MAX_MODEL_LEN:-$DEFAULT_MAX_MODEL_LEN}"
         SERVE_REASONING_ENABLED="${SERVE_REASONING:-$DEFAULT_REASONING_ENABLED}"
         SERVE_REASONING_EFFORT="${SERVE_REASONING_EFFORT:-$DEFAULT_REASONING_EFFORT}"
@@ -1297,12 +1551,15 @@ _configure_serve_defaults() {
         echo "  ── Generation defaults (chat models only) ──────────────────────────"
         local _ans
 
-        printf "  Max context length --max-model-len [%s]: " "$DEFAULT_MAX_MODEL_LEN"
+        printf "  Max context length --max-model-len [%s; hybrid Qwen3.6/Nemotron-Omni: %s]: " \
+            "$DEFAULT_MAX_MODEL_LEN" "$HYBRID_MAX_MODEL_LEN"
         read -r _ans
+        [ -n "$_ans" ] && _ctx_explicit=true
         SERVE_MAX_MODEL_LEN="${_ans:-$DEFAULT_MAX_MODEL_LEN}"
         [[ "$SERVE_MAX_MODEL_LEN" =~ ^[0-9]+$ ]] || {
             echo "  ⚠️  Invalid value; using $DEFAULT_MAX_MODEL_LEN."
             SERVE_MAX_MODEL_LEN="$DEFAULT_MAX_MODEL_LEN"
+            _ctx_explicit=false
         }
 
         printf "  Enable reasoning by default (reasoning_effort / thinking budget) [Y/n]: "
@@ -1340,6 +1597,13 @@ _configure_serve_defaults() {
             SERVE_TEMPERATURE="$DEFAULT_TEMPERATURE"
         }
     fi
+
+    if [ "$_ctx_explicit" = "true" ]; then
+        SERVE_HYBRID_MAX_MODEL_LEN="$SERVE_MAX_MODEL_LEN"
+    else
+        SERVE_HYBRID_MAX_MODEL_LEN="$HYBRID_MAX_MODEL_LEN"
+    fi
+    echo "  → hybrid-model max-model-len=$SERVE_HYBRID_MAX_MODEL_LEN"
 
     if [ "$SERVE_REASONING_ENABLED" = "true" ]; then
         echo "  → max-model-len=$SERVE_MAX_MODEL_LEN  reasoning=on (effort=$SERVE_REASONING_EFFORT, budget=$SERVE_THINKING_BUDGET)  temperature=$SERVE_TEMPERATURE"
@@ -1437,6 +1701,11 @@ _kill_vllm_processes() {
     pkill -9 -f "vllm.engine"       2>/dev/null || true
     # Also stop a previous run's sleep watchdog so watchdogs don't stack.
     pkill -f "sleep_watchdog.sh"    2>/dev/null || true
+    # A multi-node model leaves Ray workers holding memory on both Sparks.
+    pgrep -f "raylet" >/dev/null 2>&1 && _stop_ray_cluster
+    # Qwen3.8-Flash-Next runs in a root-owned container pkill can't reach.
+    _flash_container_running && docker stop -t 30 "$QWEN38_FLASH_CONTAINER" >/dev/null 2>&1
+    true
 }
 
 # Echo the PID(s) of whatever is LISTENING on a TCP port (space-separated, empty
@@ -1522,6 +1791,323 @@ _maybe_shutdown_existing_models() {
     fi
 }
 
+# True if catalog model <idx> currently has a vLLM server process. Matches the
+# serve target path, so this script's own "--start <name>" args never match.
+_model_is_running() {
+    if _is_flash_model "$1"; then _flash_container_running; return; fi
+    pgrep -f "(vllm serve|api_server) $MODELS_DIR/${MDL_DIR[$1]}( |/|\$)" >/dev/null 2>&1
+}
+
+# Enforce SOLO_MODELS against RUN_SELECTED (call after selection, before launch):
+#   1. A solo model selected with others → headless: exit 1; interactive: keep
+#      only the solo model.
+#   2. A solo model already running and something else selected → refuse
+#      (headless: exit 1; interactive: offer to stop it first).
+#   3. A solo model selected while other vLLM processes run → stop them
+#      (headless: automatically; interactive: ask, abort on No).
+_enforce_solo_models() {
+    local idx solo_sel="" i
+    for idx in "${RUN_SELECTED[@]}"; do
+        _is_solo_model "$idx" && { solo_sel="$idx"; break; }
+    done
+
+    if [ -n "$solo_sel" ] && [ "${#RUN_SELECTED[@]}" -gt 1 ]; then
+        echo ""
+        echo "  ⚠️  ${MDL_NAME[$solo_sel]} is a SOLO model — it cannot run with other models."
+        if [ "$HEADLESS" -eq 1 ]; then
+            echo "  ❌ Headless: --start it by itself, e.g. --start \"${MDL_DIR[$solo_sel]}\""
+            exit 1
+        fi
+        echo "  → Dropping the other selections; serving only ${MDL_NAME[$solo_sel]}."
+        RUN_SELECTED=("$solo_sel")
+    fi
+
+    if [ -z "$solo_sel" ]; then
+        for i in $(seq 0 $((MODEL_TOTAL - 1))); do
+            _is_solo_model "$i" && _model_is_running "$i" || continue
+            [ "${#RUN_SELECTED[@]}" -eq 0 ] && return 0
+            echo ""
+            echo "  ⚠️  SOLO model ${MDL_NAME[$i]} is running — nothing else may start beside it."
+            if [ "$HEADLESS" -eq 1 ]; then
+                # Headless runs stop every running vLLM process before launching
+                # (v0.3.35), so the solo model is replaced, not shared.
+                echo "  → Headless: it will be stopped before the new selection launches."
+                return 0
+            fi
+            echo -n "  Stop it and continue with your selection? [y/N]: "
+            read -r _ans
+            [[ "$_ans" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+            _kill_vllm_processes; sleep 3
+            echo "  ✅ ${MDL_NAME[$i]} stopped."
+            return 0
+        done
+        return 0
+    fi
+
+    pgrep -f "vllm serve" >/dev/null 2>&1 || pgrep -f "vllm.entrypoints" >/dev/null 2>&1 || return 0
+    echo ""
+    echo "  ⚠️  Other vLLM model(s) are running; ${MDL_NAME[$solo_sel]} needs the whole box."
+    if [ "$HEADLESS" -ne 1 ]; then
+        echo -n "  Stop ALL running vLLM models now? [Y/n]: "
+        read -r _ans
+        [[ "$_ans" =~ ^[Nn]$ ]] && { echo "Aborted — a SOLO model can't start beside others."; exit 0; }
+    fi
+    echo "  → Stopping all running vLLM processes..."
+    _kill_vllm_processes; sleep 3
+    echo "  ✅ Stopped."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2-SPARK CLUSTER HELPERS — Ray head on this node, one Ray worker over SSH.
+# Used by MULTINODE_MODELS (TP=2). See the 2-SPARK CLUSTER config block.
+# ─────────────────────────────────────────────────────────────────────────────
+_ssh_worker() {
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "$SPARK_WORKER_SSH" "$@"
+}
+
+_ray_bin() { echo "${VENV_DIR:-$VLLM_VENV}/bin/ray"; }
+
+# Networking env for NCCL/Gloo/Ray on one node (arg: that node's ConnectX IP),
+# as "export …;" text so the same settings can be eval'd here and sent over SSH.
+# RAY_memory_monitor_refresh_ms=0 disables Ray's OOM killer: on unified memory a
+# model at 0.85 utilization pushes system RAM past Ray's 95% kill threshold, and
+# Ray would kill the vLLM workers it's hosting.
+_cluster_env() {
+    local ip="$1"
+    printf 'export VLLM_HOST_IP=%q NCCL_SOCKET_IFNAME=%q GLOO_SOCKET_IFNAME=%q TP_SOCKET_IFNAME=%q UCX_NET_DEVICES=%q NCCL_IB_DISABLE=0 RAY_memory_monitor_refresh_ms=0;' \
+        "$ip" "$SPARK_IFACE" "$SPARK_IFACE" "$SPARK_IFACE" "$SPARK_IFACE"
+    [ -n "$SPARK_IB_HCA" ] && printf ' export NCCL_IB_HCA=%q;' "$SPARK_IB_HCA"
+    echo ""
+}
+
+# Stop Ray (and any vLLM) on BOTH nodes. Safe to call when nothing is running.
+_stop_ray_cluster() {
+    "$(_ray_bin)" stop --force >/dev/null 2>&1 || true
+    [ -n "$SPARK_WORKER_SSH" ] || return 0
+    # Bracketed patterns so pkill doesn't match (and kill) this remote shell,
+    # whose own command line contains the pattern text.
+    _ssh_worker "pkill -9 -f '[v]llm serve|[V]LLM::|[r]ay::' 2>/dev/null; '$(_ray_bin)' stop --force >/dev/null 2>&1; true" \
+        >/dev/null 2>&1 || true
+}
+
+# Validate config and the worker before a multi-node launch. Args: name, gmu.
+_cluster_preflight() {
+    local name="$1" gmu="$2" v missing=""
+    for v in SPARK_HEAD_IP SPARK_WORKER_IP SPARK_WORKER_SSH SPARK_IFACE; do
+        [ -z "${!v}" ] && missing="$missing $v"
+    done
+    if [ -n "$missing" ]; then
+        echo "   ❌ $name runs on TWO Sparks, but these aren't set:$missing"
+        echo "      Set them in the 2-SPARK CLUSTER config block or in $ENV_FILE."
+        return 1
+    fi
+    if ! _ssh_worker true 2>/dev/null; then
+        echo "   ❌ Can't SSH to the worker ($SPARK_WORKER_SSH) without a password."
+        echo "      Fix: ssh-copy-id $SPARK_WORKER_SSH"
+        return 1
+    fi
+    local ray_bin; ray_bin="$(_ray_bin)"
+    if [ ! -x "$ray_bin" ]; then
+        echo "   ❌ Ray not found at $ray_bin on this node."
+        echo "      Install: ${VENV_DIR:-$VLLM_VENV}/bin/pip install -U 'ray[default]'"
+        return 1
+    fi
+    if ! _ssh_worker "test -x '$ray_bin' && test -x '${VENV_DIR:-$VLLM_VENV}/bin/vllm'"; then
+        echo "   ❌ Worker is missing vLLM/Ray at ${VENV_DIR:-$VLLM_VENV}. Run this script on"
+        echo "      the worker once (full install), then retry."
+        return 1
+    fi
+    local py="${VENV_DIR:-$VLLM_VENV}/bin/python" lv rv
+    lv=$("$py" -c 'import vllm; print(vllm.__version__)' 2>/dev/null)
+    rv=$(_ssh_worker "'$py' -c 'import vllm; print(vllm.__version__)'" 2>/dev/null)
+    if [ "$lv" != "$rv" ]; then
+        echo "   ❌ vLLM versions differ — head: ${lv:-?}, worker: ${rv:-?}. They must match."
+        echo "      Upgrade the older one: <venv>/bin/pip install -U vllm"
+        return 1
+    fi
+    echo "   ✅ Cluster config OK — head $SPARK_HEAD_IP, worker $SPARK_WORKER_IP ($SPARK_WORKER_SSH), vLLM $lv"
+
+    # Solo on the worker too: stop anything there, then check its free memory.
+    _stop_ray_cluster
+    local w_mt w_ma req
+    read -r w_mt w_ma < <(_ssh_worker "awk '/^MemTotal:/{t=\$2} /^MemAvailable:/{a=\$2} END{print int(t/1048576), int(a/1048576)}' /proc/meminfo" 2>/dev/null)
+    if [[ "${w_mt:-}" =~ ^[0-9]+$ ]] && [[ "${w_ma:-}" =~ ^[0-9]+$ ]]; then
+        req=$(awk -v t="$w_mt" -v f="$gmu" 'BEGIN{printf "%d", (t*f)+0.999}')
+        if [ "$req" -gt "$w_ma" ]; then
+            echo "   ❌ Worker has ${w_ma} GB free of ${w_mt} GB; ${gmu} utilization needs ~${req} GB."
+            echo "      Free memory on the worker (or lower the utilization) and retry."
+            return 1
+        fi
+        echo "   ✅ Worker memory OK — ${w_ma} GB free, ~${req} GB needed"
+    fi
+}
+
+# Copy catalog model <idx> from this node to the same path on the worker.
+# rsync only sends what's missing/changed, so a synced model costs seconds.
+_sync_model_to_worker() {
+    local idx="$1" model_path="$MODELS_DIR/${MDL_DIR[$1]}"
+    command -v rsync >/dev/null 2>&1 || { echo "   ❌ rsync not installed (apt install rsync)."; return 1; }
+    echo "   ⇄  Syncing ${MDL_NAME[$idx]} to the worker (only missing/changed files)..."
+    if rsync -a --partial --info=progress2 \
+            -e "ssh -o BatchMode=yes -o ConnectTimeout=10" \
+            --rsync-path="mkdir -p '$model_path' && rsync" \
+            "$model_path/" "$SPARK_WORKER_SSH:$model_path/"; then
+        echo "   ✅ Worker has the model at $model_path"
+        return 0
+    fi
+    echo "   ❌ rsync to $SPARK_WORKER_SSH:$model_path failed."
+    return 1
+}
+
+# Start a fresh 2-node Ray cluster (head here, worker over SSH) and wait until
+# both GPUs are registered. Exports this node's cluster env + RAY_ADDRESS so the
+# vllm serve that follows joins this cluster.
+_start_ray_cluster() {
+    local ray_bin; ray_bin="$(_ray_bin)"
+    local head_env worker_env
+    head_env="$(_cluster_env "$SPARK_HEAD_IP")"
+    worker_env="$(_cluster_env "$SPARK_WORKER_IP")"
+
+    _stop_ray_cluster
+    eval "$head_env"
+    export RAY_ADDRESS="$SPARK_HEAD_IP:$RAY_PORT"
+
+    echo "   ▶  Ray head on $SPARK_HEAD_IP:$RAY_PORT (iface $SPARK_IFACE)"
+    if ! "$ray_bin" start --head --node-ip-address="$SPARK_HEAD_IP" --port="$RAY_PORT" \
+            --num-gpus=1 --disable-usage-stats >>"$VLLM_LOGS/ray-head.log" 2>&1; then
+        echo "   ❌ Ray head failed to start — see $VLLM_LOGS/ray-head.log"
+        return 1
+    fi
+    echo "   ▶  Ray worker on $SPARK_WORKER_IP"
+    if ! _ssh_worker "$worker_env '$ray_bin' start --address='$SPARK_HEAD_IP:$RAY_PORT' \
+            --node-ip-address='$SPARK_WORKER_IP' --num-gpus=1 --disable-usage-stats" \
+            >>"$VLLM_LOGS/ray-worker.log" 2>&1; then
+        echo "   ❌ Ray worker failed to join — see $VLLM_LOGS/ray-worker.log"
+        _stop_ray_cluster
+        return 1
+    fi
+
+    local waited=0
+    until "$ray_bin" status --address="$RAY_ADDRESS" 2>/dev/null | grep -qE '/2(\.0)? GPU'; do
+        if [ "$waited" -ge 90 ]; then
+            echo "   ❌ Ray cluster never showed 2 GPUs. Current status:"
+            "$ray_bin" status --address="$RAY_ADDRESS" 2>&1 | sed 's/^/      /'
+            _stop_ray_cluster
+            return 1
+        fi
+        sleep 3; waited=$((waited + 3))
+    done
+    echo "   ✅ Ray cluster up — 2 nodes, 2 GPUs"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QWEN3.8-FLASH-NEXT (Docker) — github.com/blazux/qwen3.8-Flash-DGX
+# Not a venv model: the repo's `flash` launcher builds a patched vLLM v0.30.0
+# image (serves the 48 GiB n-gram table from NVMe via mmap, fixes GB10 prefix
+# caching and top-k determinism) and runs it as container $QWEN38_FLASH_CONTAINER.
+# This script keeps that repo current, lets `flash` do setup and serve, and
+# gives the container the same port/alias/log/solo handling as other models.
+# ─────────────────────────────────────────────────────────────────────────────
+_is_flash_model() { [ "${MDL_HF[$1]}" = "nvidia/Qwen3.8-Flash-Next-NVFP4" ]; }
+
+_flash_container_running() {
+    command -v docker >/dev/null 2>&1 || return 1
+    [ "$(docker inspect -f '{{.State.Status}}' "$QWEN38_FLASH_CONTAINER" 2>/dev/null)" = "running" ]
+}
+
+# Clone or fast-forward the repo, rebuild the image when the repo moved, then
+# `flash setup` (download ~124 GiB + one-time hybrid prep; each step is skipped
+# once done).
+_qwen38_flash_setup() {
+    local dir="$QWEN38_FLASH_DIR" head image
+    command -v git >/dev/null 2>&1    || { echo "   ❌ git is not installed."; return 1; }
+    command -v docker >/dev/null 2>&1 || { echo "   ❌ docker is not installed — Qwen3.8-Flash-Next runs in a container."; return 1; }
+    docker info >/dev/null 2>&1       || { echo "   ❌ Can't reach the docker daemon (is $USER in the docker group?)."; return 1; }
+
+    if [ -d "$dir/.git" ]; then
+        echo "   🔄 Updating $dir"
+        git -C "$dir" pull --ff-only -q 2>&1 | tail -2 || echo "   ⚠️  git pull failed — using the checkout as it is."
+    else
+        echo "   ⬇️  Cloning $QWEN38_FLASH_REPO → $dir"
+        mkdir -p "$(dirname "$dir")"
+        git clone -q "$QWEN38_FLASH_REPO" "$dir" || { echo "   ❌ git clone failed."; return 1; }
+    fi
+    head=$(git -C "$dir" rev-parse HEAD 2>/dev/null)
+
+    # `flash setup` only rebuilds when the image is missing or its base label
+    # changed, so new patches on the same vLLM base would never reach it. Rebuild
+    # whenever the checkout moved (layer cache makes unchanged steps instant).
+    image=$(sed -n 's/.*IMAGE="\${IMAGE:-\([^}]*\)}".*/\1/p' "$dir/flash" | head -1)
+    image="${image:-qwen38-flash-dgx:v0.30}"
+    if [ "$(cat "$dir/.image-built-from" 2>/dev/null)" != "$head" ] || ! docker image inspect "$image" >/dev/null 2>&1; then
+        echo "   🏗️  Building $image from $(git -C "$dir" log -1 --format='%h %s' | cut -c1-60)…"
+        if ! docker build -t "$image" "$dir" 2>&1 | tail -3; then
+            echo "   ❌ docker build failed."
+            return 1
+        fi
+        echo "$head" > "$dir/.image-built-from"
+    fi
+
+    mkdir -p "$QWEN38_FLASH_HF_CACHE"
+    HF_TOKEN="$HF_TOKEN" HF_CACHE="$QWEN38_FLASH_HF_CACHE" \
+        "$dir/flash" setup "$QWEN38_FLASH_PROFILE" || { echo "   ❌ flash setup failed."; return 1; }
+}
+
+_launch_qwen38_flash() {
+    local idx="$1"
+    local name="${MDL_NAME[$idx]}" port="${MDL_PORT[$idx]}"
+    local served="${MDL_SERVED_NAME[$idx]:-model${port}}"
+    local log_file="$VLLM_LOGS/vllm-${port}.log"
+    echo "   ⚠️  SOLO model (Docker) — reserves ~0.80 of the pool; nothing else can run beside it."
+
+    _qwen38_flash_setup || return 1
+    _flash_container_running && docker stop -t 30 "$QWEN38_FLASH_CONTAINER" >/dev/null 2>&1
+    _ensure_port_available "$port" "$name" || return 1
+    _preflight_memory "$name" "${QWEN38_FLASH_GPU_MEM:-0.80}" || return 1
+
+    echo ""
+    echo "--- Starting [idx $idx] $name on port $port ---"
+    echo "    Container: $QWEN38_FLASH_CONTAINER (profile $QWEN38_FLASH_PROFILE)"
+    echo "    API ID   : $served"
+    echo "    Log      : $log_file"
+    [ -f "$log_file" ] && mv -f "$log_file" "${log_file}.old" 2>/dev/null
+    local -a extra_env=()
+    [ -n "${QWEN38_FLASH_GPU_MEM:-}" ] && extra_env+=(GPU_MEM="$QWEN38_FLASH_GPU_MEM")
+    if ! env HF_TOKEN="$HF_TOKEN" HF_CACHE="$QWEN38_FLASH_HF_CACHE" NAME="$QWEN38_FLASH_CONTAINER" \
+            PORT="$port" SERVED_MODEL_NAME="$served" "${extra_env[@]+"${extra_env[@]}"}" \
+            "$QWEN38_FLASH_DIR/flash" serve "$QWEN38_FLASH_PROFILE" >>"$log_file" 2>&1; then
+        echo "   ❌ flash serve failed — last lines:"
+        tail -25 "$log_file" | sed 's/^/      /'
+        return 1
+    fi
+    # serve.sh creates the container with --restart unless-stopped, which would
+    # bring it back at every boot regardless of --set-boot-model. Boot starts
+    # belong to this script's @reboot entry, so drop the restart policy.
+    docker update --restart no "$QWEN38_FLASH_CONTAINER" >/dev/null 2>&1 || true
+    nohup docker logs -f "$QWEN38_FLASH_CONTAINER" >>"$log_file" 2>&1 &
+
+    echo "   ⏳ Loading (~75 GiB of weights, ~3-4 min; first boot compiles kernels)…"
+    local elapsed=0 timeout="${VLLM_READY_TIMEOUT:-1800}"
+    while true; do
+        if ! _flash_container_running; then
+            echo "   ❌ $name container stopped during loading — last log lines:"
+            docker logs --tail 25 "$QWEN38_FLASH_CONTAINER" 2>&1 | sed 's/^/      /'
+            return 1
+        fi
+        if curl -sf --max-time 5 "http://localhost:${port}/health" >/dev/null 2>&1; then
+            echo "   ✅ $name ready on port $port  (${elapsed}s)"
+            docker logs "$QWEN38_FLASH_CONTAINER" 2>&1 | grep -E 'GPU KV cache size' | tail -1 | sed 's/.*\] /      /'
+            return 0
+        fi
+        if [ "$elapsed" -ge "$timeout" ]; then
+            echo "   ⚠️  $name not ready after ${timeout}s — check: docker logs -f $QWEN38_FLASH_CONTAINER"
+            return 1
+        fi
+        sleep 5; elapsed=$((elapsed + 5))
+        [ $((elapsed % 60)) -eq 0 ] && echo "   … ${elapsed}s"
+    done
+}
+
 _check_vram() {
     local total_required=0
     for idx in "${RUN_SELECTED[@]}"; do
@@ -1583,101 +2169,162 @@ _check_vram() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# vLLM AUTO-UPDATE — upgrade the venv's vLLM to the latest PyPI release if newer.
-# Best-effort: never fails the run. Called once VENV_DIR is known (all modes).
+# vLLM AUTO-UPDATE (v0.3.40) — every run, bring vLLM and the packages it serves
+# with (AUTO_UPDATE_PACKAGES) to their latest releases, without risking the box:
+#   1. Dry run: ask pip what an upgrade WOULD install. Nothing → done, no copy.
+#   2. Back up the WHOLE venv (cp -a to $VENV_DIR.pre-update). Restoring a copy
+#      never depends on PyPI, unlike `pip install torch==<old>`, which can't
+#      bring back NVIDIA's DGX Spark build because PyPI doesn't carry it.
+#   3. Upgrade. If the new vLLM needs a different torch, pip takes it from
+#      TORCH_CUDA_INDEX (PyTorch's CUDA aarch64 wheels), never PyPI's CPU build.
+#   4. Verify: torch sees the GPU and runs a CUDA op; vllm and flashinfer import.
+#      Any failure → the backup is moved back into place, old versions serve.
+#   5. The backup is kept. If a model then dies with an environment-shaped error
+#      (missing symbol, import error, GPU invisible — not OOM),
+#      _rebuild_vllm_venv restores it before trying a full vendor rebuild.
+# Best-effort: never fails the run.
 # ─────────────────────────────────────────────────────────────────────────────
+_VLLM_UPDATE_BACKUP=""   # set to the backup dir when THIS run upgraded the venv
+
+# Torch + GPU + vLLM import check used after an upgrade (and after a restore).
+_verify_vllm_venv() {
+    local py="$1/bin/python"
+    [ -x "$py" ] || return 1
+    timeout 600 "$py" - <<'PY'
+import sys
+try:
+    import torch
+    if not torch.version.cuda:
+        sys.exit("torch %s has no CUDA runtime" % torch.__version__)
+    if not torch.cuda.is_available():
+        sys.exit("torch %s (CUDA %s) cannot see the GPU" % (torch.__version__, torch.version.cuda))
+    x = torch.randn(256, 256, device="cuda")
+    float((x @ x).sum())
+    torch.cuda.synchronize()
+    import vllm, flashinfer
+    print("   ✓ torch %s (CUDA %s, %s) · vllm %s · flashinfer %s" % (
+        torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0),
+        vllm.__version__, getattr(flashinfer, "__version__", "?")))
+except SystemExit:
+    raise
+except Exception as e:
+    sys.exit("%s: %s" % (type(e).__name__, e))
+PY
+}
+
+# Move the pre-update backup back into place. Returns 0 on success.
+_restore_vllm_update_backup() {
+    local venv="${VENV_DIR:-}" bak="${_VLLM_UPDATE_BACKUP:-}"
+    [ -n "$venv" ] && [ -n "$bak" ] && [ -d "$bak" ] || return 1
+    echo "↩️  Restoring the pre-update venv from $bak…"
+    rm -rf "$venv.failed-update" 2>/dev/null
+    mv "$venv" "$venv.failed-update" 2>/dev/null || return 1
+    if mv "$bak" "$venv"; then
+        _VLLM_UPDATE_BACKUP=""
+        rm -rf "$venv.failed-update" 2>/dev/null &
+        echo "✅ Previous venv restored."
+        return 0
+    fi
+    mv "$venv.failed-update" "$venv" 2>/dev/null
+    echo "❌ Could not move the backup into place — venv left as it was."
+    return 1
+}
+
 _maybe_update_vllm() {
     [ "${AUTO_UPDATE_VLLM:-true}" = "true" ] || return 0
-    local py="$VENV_DIR/bin/python" pip="$VENV_DIR/bin/pip"
+    local venv="$VENV_DIR" py="$VENV_DIR/bin/python" pip="$VENV_DIR/bin/pip"
     if [ ! -x "$py" ] || [ ! -x "$pip" ]; then
         echo "ℹ️  vLLM auto-update skipped — venv python/pip not found under $VENV_DIR"
         return 0
     fi
 
-    echo "--- Checking for a newer vLLM (AUTO_UPDATE_VLLM=true) ---"
+    echo "--- Updating vLLM and serving packages (AUTO_UPDATE_VLLM=true) ---"
     local cur
     cur=$("$py" -c 'import vllm; print(vllm.__version__)' 2>/dev/null)
     if [ -z "$cur" ]; then
+        # Nothing working to protect — install straight away.
         echo "⚠️  vllm not importable in the venv — installing the latest release…"
-        "$pip" install -U vllm 2>&1 | tail -4
+        "$pip" install -U vllm --extra-index-url "$TORCH_CUDA_INDEX" 2>&1 | tail -4
         "$py" -c 'import vllm; print("✅ vllm installed:", vllm.__version__)' 2>/dev/null \
             || echo "❌ vllm still not importable — check the pip output above."
         _fix_flashinfer_versions "$VENV_DIR"
         return 0
     fi
 
-    # Latest stable version from PyPI (jq preferred; grep fallback). Best-effort.
-    local latest pypi_json
-    pypi_json=$(curl -sf --max-time 8 https://pypi.org/pypi/vllm/json 2>/dev/null)
-    if [ -n "$pypi_json" ]; then
-        if command -v jq >/dev/null 2>&1; then
-            latest=$(printf '%s' "$pypi_json" | jq -r '.info.version' 2>/dev/null)
-        else
-            latest=$(printf '%s' "$pypi_json" \
-                | grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 \
-                | sed -E 's/.*"([^"]*)"$/\1/')
-        fi
-    fi
-    # Fallback to pip's own index query if PyPI JSON was unreachable.
-    [ -z "${latest:-}" ] && latest=$("$pip" index versions vllm 2>/dev/null \
-        | sed -n 's/.*LATEST:[[:space:]]*//p' | head -1)
-
-    if [ -z "${latest:-}" ]; then
-        echo "ℹ️  vLLM $cur installed — couldn't reach PyPI to check for updates; keeping current."
+    # 1. Dry run — what would an upgrade change?
+    local -a pkgs
+    read -r -a pkgs <<< "$AUTO_UPDATE_PACKAGES"
+    local report
+    report=$(mktemp 2>/dev/null || echo "/tmp/vllm-update-$$.json")
+    if ! timeout 600 "$pip" install --dry-run --quiet -U "${pkgs[@]}" \
+            --extra-index-url "$TORCH_CUDA_INDEX" --report "$report" >/dev/null 2>&1; then
+        echo "ℹ️  vLLM $cur — couldn't resolve an upgrade (offline, or no compatible set); keeping current."
+        rm -f "$report"
         return 0
     fi
-
-    # Upgrade only if $latest is strictly newer than $cur (version-aware sort), so
-    # a locally-installed nightly is never downgraded to the PyPI stable.
-    local newest
-    newest=$(printf '%s\n%s\n' "$cur" "$latest" | sort -V 2>/dev/null | tail -1)
-    if [ "$cur" = "$latest" ] || [ "$newest" = "$cur" ]; then
-        echo "✅ vLLM is up to date ($cur; PyPI latest $latest)."
+    local changes
+    changes=$("$py" - "$report" <<'PY' 2>/dev/null
+import json, sys
+from importlib.metadata import version, PackageNotFoundError
+for item in json.load(open(sys.argv[1])).get("install", []):
+    md = item["metadata"]
+    try:
+        old = version(md["name"])
+    except PackageNotFoundError:
+        old = "new"
+    print("%s %s -> %s" % (md["name"], old, md["version"]))
+PY
+)
+    rm -f "$report"
+    if [ -z "$changes" ]; then
+        echo "✅ vLLM $cur and serving packages are up to date."
         return 0
     fi
+    echo "⬆️  Updates available:"
+    echo "$changes" | sed 's/^/     /'
+    if echo "$changes" | grep -qiE '^(torch|torchvision|torchaudio|triton) '; then
+        echo "   ⚠️  This replaces torch — it will come from $TORCH_CUDA_INDEX and is"
+        echo "       verified on the GPU before it's kept."
+    fi
 
-    echo "⬆️  vLLM $cur → $latest available — upgrading…"
+    # 2. Back up the whole venv (same filesystem, so restore is a rename).
+    local need_kb free_kb bak="$venv.pre-update"
+    need_kb=$(du -sk "$venv" 2>/dev/null | awk '{print $1}')
+    free_kb=$(df -Pk "$(dirname "$venv")" 2>/dev/null | awk 'NR==2{print $4}')
+    if [ -z "$need_kb" ] || [ -z "$free_kb" ] || [ "$free_kb" -lt $(( need_kb + 4194304 )) ]; then
+        echo "⚠️  Not enough free disk for a venv backup (need ~$(( ${need_kb:-0} / 1048576 + 4 )) GB) — skipping the update."
+        return 0
+    fi
+    echo "   💾 Backing up the venv ($(( need_kb / 1048576 )) GB) to $bak…"
+    rm -rf "$bak" 2>/dev/null
+    if ! cp -a "$venv" "$bak" 2>/dev/null; then
+        rm -rf "$bak" 2>/dev/null
+        echo "⚠️  venv backup failed — skipping the update."
+        return 0
+    fi
+    _VLLM_UPDATE_BACKUP="$bak"
+    _stamp_known_good_torch "$venv"
 
-    # Snapshot torch BEFORE pip runs. `pip install -U vllm` resolves torch against
-    # PyPI, which does not carry NVIDIA's DGX Spark aarch64+CUDA build — so an
-    # upgrade can silently swap in a generic wheel and leave the box GPU-blind.
-    # torch.version.cuda is build metadata (independent of whether the driver is
-    # currently up), which makes it the right signal for "did we lose CUDA?".
-    local pre_torch pre_cuda
-    pre_torch=$(_torch_gpu_probe "$py" | awk '$1=="torch"{print $2}')
-    pre_cuda=$(_torch_gpu_probe  "$py" | awk '$1=="cuda"{print $2}')
-    _stamp_known_good_torch "$VENV_DIR"
+    # 3. Upgrade, then reconcile vLLM's exact accelerator pins.
+    if ! "$pip" install -U "${pkgs[@]}" --extra-index-url "$TORCH_CUDA_INDEX" 2>&1 | tail -4; then
+        echo "⚠️  pip upgrade failed."
+    fi
+    _fix_flashinfer_versions "$VENV_DIR"
 
-    if "$pip" install -U vllm 2>&1 | tail -4; then
+    # 4. Verify on the GPU; restore the backup on any failure.
+    if _verify_vllm_venv "$venv"; then
         local new
         new=$("$py" -c 'import vllm; print(vllm.__version__)' 2>/dev/null)
-        echo "✅ vLLM upgraded to ${new:-$latest}."
+        echo "✅ Updated — vLLM ${cur} → ${new:-?}. Backup kept at $bak until the next update."
+        _stamp_known_good_torch "$venv"
+        return 0
+    fi
+    echo "🚨 The upgraded venv failed verification (see the line above)."
+    if _restore_vllm_update_backup && _verify_vllm_venv "$venv"; then
+        echo "   Serving with the previous versions (vLLM $cur)."
     else
-        echo "⚠️  vLLM upgrade failed — continuing with $cur."
+        echo "❌ Restore did not produce a working venv — the GPU pre-flight below will try to recover."
     fi
-
-    # Did the upgrade strip CUDA support out of torch? If so, put it back.
-    local post_torch post_cuda
-    post_torch=$(_torch_gpu_probe "$py" | awk '$1=="torch"{print $2}')
-    post_cuda=$(_torch_gpu_probe  "$py" | awk '$1=="cuda"{print $2}')
-    if [ "$pre_cuda" != "-" ] && [ "$post_cuda" = "-" ]; then
-        echo "🚨 The vLLM upgrade replaced torch $pre_torch (CUDA $pre_cuda) with"
-        echo "   $post_torch (no CUDA runtime) — that would leave the box GPU-blind."
-        echo "🔧 Rolling torch back to $pre_torch…"
-        "$pip" install --no-deps --force-reinstall "torch==$pre_torch" 2>&1 | tail -3
-        local chk
-        chk=$(_torch_gpu_probe "$py" | awk '$1=="cuda"{print $2}')
-        if [ "$chk" != "-" ]; then
-            echo "✅ torch rolled back — CUDA $chk restored."
-            echo "   ⚠️  vLLM $new may now expect a newer torch. If it misbehaves, pin"
-            echo "       vLLM back to $cur and leave AUTO_UPDATE_VLLM=false."
-        else
-            echo "❌ Rollback did not restore CUDA support — see the GPU pre-flight below."
-        fi
-    fi
-    # An upgrade drags flashinfer-python forward but leaves its companion packages
-    # behind — reconcile now, while we still know an upgrade just happened.
-    _fix_flashinfer_versions "$VENV_DIR"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2518,6 +3165,15 @@ _rebuild_vllm_venv() {
             grep -aqE "has no attribute|ImportError|ModuleNotFoundError|undefined symbol|version .*does not match|Failed to infer device type" "$log_file" \
                 || return 1
         fi
+        # This run upgraded the venv and a model now fails with an environment-
+        # shaped error: the upgrade is the prime suspect, and restoring the
+        # pre-update copy is seconds, not a 15-minute vendor rebuild.
+        if [ -n "${_VLLM_UPDATE_BACKUP:-}" ] && [ -d "$_VLLM_UPDATE_BACKUP" ]; then
+            echo "   🔎 The venv was upgraded this run — rolling that upgrade back first."
+            if _restore_vllm_update_backup && _verify_vllm_venv "$venv"; then
+                return 0
+            fi
+        fi
         # Loop guard: at most one automatic rebuild per 24h.
         if [ -f "$REBUILD_STAMP" ]; then
             local age
@@ -2743,6 +3399,7 @@ if [ "$HEADLESS" -eq 1 ]; then
     echo "  HEADLESS MODE (--start) — no prompts, serving requested models"
     echo "════════════════════════════════════════════════════════════════════"
     _resolve_start_specs "$START_SPECS"
+    _enforce_solo_models
 else
     echo ""
     echo "════════════════════════════════════════════════════════════════════"
@@ -2754,6 +3411,7 @@ else
     echo "  (ASR/NeMo models are download-only and excluded from this list)"
     echo "════════════════════════════════════════════════════════════════════"
     _checkbox_menu "Models to serve with vLLM (toggle with numbers, d=done):" "true" RUN_SELECTED DEFAULT_SERVE_INDICES
+    _enforce_solo_models
 
     # Offer to free a previous run's models before measuring available memory.
     _maybe_shutdown_existing_models
@@ -2974,13 +3632,22 @@ else
         for idx in "${DL_SELECTED[@]}"; do
             echo ""
             echo "--- Downloading ${MDL_NAME[$idx]} ---"
+            if _is_flash_model "$idx"; then
+                # Its own launcher downloads into an HF cache and prepares the
+                # hybrid layout + image; a plain --local-dir copy would be unused.
+                _qwen38_flash_setup && echo "✅ ${MDL_NAME[$idx]} ready" \
+                    || echo "❌ ${MDL_NAME[$idx]} setup FAILED (see above) — skipping."
+                continue
+            fi
             echo "    HF repo  : ${MDL_HF[$idx]}"
             echo "    Local dir: $MODELS_DIR/${MDL_DIR[$idx]}"
             if [ "${MDL_CAT[$idx]}" = "Super Large" ]; then
                 echo "    ⚠️  SUPER LARGE model (~${MDL_DISK[$idx]} GB) — this will take a while."
                 echo "    ℹ️  Nemotron-3-Super info: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard"
             fi
-            if $HF_DL "${MDL_HF[$idx]}" --local-dir "$MODELS_DIR/${MDL_DIR[$idx]}"; then
+            _dl_include_args=()
+            [ -n "${MDL_HF_INCLUDE[$idx]}" ] && _dl_include_args=(--include "${MDL_HF_INCLUDE[$idx]}")
+            if $HF_DL "${MDL_HF[$idx]}" --local-dir "$MODELS_DIR/${MDL_DIR[$idx]}" "${_dl_include_args[@]}"; then
                 echo "✅ ${MDL_NAME[$idx]} downloaded"
             else
                 echo "❌ ${MDL_NAME[$idx]} download FAILED (see error above) — skipping."
@@ -3116,7 +3783,8 @@ _ensure_model_downloaded() {
     local idx="$1"
     local name="${MDL_NAME[$idx]}" repo="${MDL_HF[$idx]}" dir="${MDL_DIR[$idx]}"
     local model_path="$MODELS_DIR/$dir"
-    [ -f "$model_path/config.json" ] && return 0    # already downloaded
+    local probe_file="${MDL_SERVE_FILE[$idx]:-config.json}"
+    [ -f "$model_path/$probe_file" ] && return 0    # already downloaded
 
     if [ "${AUTO_DOWNLOAD:-true}" != "true" ]; then
         echo "  ℹ️  $name not on disk and AUTO_DOWNLOAD=false — not downloading."
@@ -3140,13 +3808,18 @@ _ensure_model_downloaded() {
 
     local auth=""
     [ -n "$HF_TOKEN" ] && auth="--token $HF_TOKEN"
+    local include_args=()
+    if [ -n "${MDL_HF_INCLUDE[$idx]}" ]; then
+        include_args=(--include "${MDL_HF_INCLUDE[$idx]}")
+        echo "       filter: --include '${MDL_HF_INCLUDE[$idx]}' (not the whole repo)"
+    fi
     mkdir -p "$MODELS_DIR"
-    if "$hf_cli" download $auth "$repo" --local-dir "$model_path"; then
-        if [ -f "$model_path/config.json" ]; then
+    if "$hf_cli" download $auth "$repo" --local-dir "$model_path" "${include_args[@]}"; then
+        if [ -f "$model_path/$probe_file" ]; then
             echo "  ✅ $name downloaded."
             return 0
         fi
-        echo "  ⚠️  Download finished but no config.json under $model_path — check the repo id."
+        echo "  ⚠️  Download finished but $probe_file not found under $model_path — check the repo id."
         return 1
     fi
     echo "  ❌ Auto-download failed for $repo (gated repo without HF_TOKEN, wrong id, or network)."
@@ -3223,7 +3896,14 @@ _vllm_launch() {
     _launch_args+=(--served-model-name "$served_name")
     set -- "${_launch_args[@]}"
 
-    if [ ! -f "$model_path/config.json" ]; then
+    # Most models pass their local dir to `vllm serve`; a model with MDL_SERVE_FILE
+    # set (GGUF quants) instead points at one specific file inside that dir.
+    local serve_file="${MDL_SERVE_FILE[$idx]:-}"
+    local serve_target="$model_path"
+    [ -n "$serve_file" ] && serve_target="$model_path/$serve_file"
+    local probe_file="${serve_file:-config.json}"
+
+    if [ ! -f "$model_path/$probe_file" ]; then
         # Not on disk yet — try to fetch it before giving up (AUTO_DOWNLOAD).
         if ! _ensure_model_downloaded "$idx"; then
             echo "⚠️  [idx $idx] $name — model not available at $model_path and could not be"
@@ -3258,10 +3938,10 @@ _vllm_launch() {
 
     echo ""
     echo "--- Starting [idx $idx] $name on port $port ---"
-    echo "    Model : $model_path"
+    echo "    Model : $serve_target"
     echo "    API ID: $served_name"
     echo "    Log   : $log_file"
-    echo "    CMD   : $vllm_label $model_path --host 0.0.0.0 --port $port --enable-sleep-mode $*"
+    echo "    CMD   : $vllm_label $serve_target --host 0.0.0.0 --port $port --enable-sleep-mode $*"
 
     # Rotate any previous log. Headless mode skips the interactive clean-start
     # wipe, so this file otherwise accumulates across runs and the root-cause
@@ -3269,7 +3949,7 @@ _vllm_launch() {
     # The port-available guard above ensures nothing is still writing to it.
     [ -f "$log_file" ] && mv -f "$log_file" "${log_file}.old" 2>/dev/null
 
-    vllm_serve "$model_path" --host 0.0.0.0 --port "$port" --enable-sleep-mode "$@" >> "$log_file" 2>&1 &
+    vllm_serve "$serve_target" --host 0.0.0.0 --port "$port" --enable-sleep-mode "$@" >> "$log_file" 2>&1 &
     local launch_pid=$!
     sleep 2
     if ! kill -0 "$launch_pid" 2>/dev/null; then
@@ -3790,17 +4470,21 @@ _serve_model() {
             "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
-    # Two profiles, selected by QWEN36_35B_MAX_MODEL_LEN:
+    # Two profiles, selected by QWEN36_35B_PROFILE (co-run | solo):
     #
-    # DEFAULT (unset, or any value other than 262144) — lighter "primary" co-run
-    # profile with the SAME settings as Sehyo/Qwen3.5-35B-A3B-NVFP4 below: 32768
-    # context, 0.34 gmu, fp8 KV cache, prefix caching, qwen3_coder tool parsing,
-    # qwen3 reasoning parsing, no speculative decoding. Combined with
-    # Qwen3.8-27B-FP8's 0.45-gmu default as "secondary", that's 0.79 of the pool
-    # — no QWEN38_GMU override needed for this pairing:
+    # DEFAULT co-run — lighter "primary" profile with the SAME settings as
+    # Sehyo/Qwen3.5-35B-A3B-NVFP4 below: 0.34 gmu, fp8 KV cache, prefix caching,
+    # qwen3_coder tool parsing, qwen3 reasoning parsing, no speculative decoding.
+    # Context is HYBRID_MAX_MODEL_LEN (262144, the native max) since v0.3.40:
+    # only 10 of 40 layers are full attention (2 KV heads × 256 dim) → fp8 KV
+    # ≈ 10 KB/token ≈ 2.7 GB per 262K sequence, and 0.34 ≈ 41 GB − 23.4 GB
+    # weights − overhead leaves ~12 GB of KV. Override with
+    # QWEN36_35B_MAX_MODEL_LEN. Combined with Qwen3.8-27B-FP8's 0.45-gmu default
+    # as "secondary", that's 0.79 of the pool:
     #   ./install_ai_spark_vllm.sh --start "Qwen3.6-35B-A3B-NVFP4,Qwen3.8-27B-FP8"
     #
-    # QWEN36_35B_MAX_MODEL_LEN=262144 — the original v0.3.26 full DGX Spark
+    # QWEN36_35B_PROFILE=solo (or the older QWEN36_35B_MAX_MODEL_LEN=262144,
+    # still honored so existing cron lines keep working) — the original v0.3.26 full DGX Spark
     # profile: no --quantization flag (vLLM auto-detects NVFP4 from the
     # checkpoint, which --moe-backend marlin needs — an explicit --quantization
     # modelopt_fp4 alongside it was observed to conflict); --async-scheduling
@@ -3813,9 +4497,9 @@ _serve_model() {
     # the MTP draft model + the 262144-context KV cache reservation landing
     # outside the profiled budget. SOLO USE ONLY — it does not leave room to
     # co-run anything else:
-    #   QWEN36_35B_MAX_MODEL_LEN=262144 ./install_ai_spark_vllm.sh --start Qwen3.6-35B-A3B-NVFP4
+    #   QWEN36_35B_PROFILE=solo ./install_ai_spark_vllm.sh --start Qwen3.6-35B-A3B-NVFP4
     "nvidia/Qwen3.6-35B-A3B-NVFP4")
-        if [ "${QWEN36_35B_MAX_MODEL_LEN:-32768}" = "262144" ]; then
+        if [ "${QWEN36_35B_PROFILE:-co-run}" = "solo" ] || [ "${QWEN36_35B_MAX_MODEL_LEN:-}" = "262144" ]; then
             _vllm_launch "$idx" \
                 --served-model-name "Qwen3.6-35B-A3B-NVFP4" \
                 --tensor-parallel-size 1 \
@@ -3838,20 +4522,21 @@ _serve_model() {
                 "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
                 "${_SERVE_TEMP_ARGS[@]}"
         else
-            # --max-num-batched-tokens 3072: with --enable-prefix-caching on,
-            # vLLM's own block_size at this context landed at 2096 on-box,
-            # above the 2048 default — "AssertionError: In Mamba cache align
-            # mode, block_size (2096) must be <= max_num_batched_tokens (2048)"
-            # (see _diagnose_and_repair, which auto-retried and fixed this the
-            # first time it happened; set explicitly here to skip that retry).
+            # --max-num-batched-tokens: with --enable-prefix-caching on, vLLM's
+            # own block_size landed at 2096 on-box at 32768 context, above the
+            # 2048 default — "AssertionError: In Mamba cache align mode,
+            # block_size (2096) must be <= max_num_batched_tokens (2048)". 8192
+            # (as on the 27B and Nemotron entries) leaves margin at the larger
+            # context and chunks long prefills; _diagnose_and_repair still
+            # auto-retries if a future vLLM picks an even larger block_size.
             _vllm_launch "$idx" \
                 --served-model-name "Qwen3.6-35B-A3B-NVFP4" \
                 --dtype auto \
                 --trust-remote-code \
                 --gpu-memory-utilization 0.34 \
-                --max-model-len "${QWEN36_35B_MAX_MODEL_LEN:-32768}" \
+                --max-model-len "${QWEN36_35B_MAX_MODEL_LEN:-${SERVE_HYBRID_MAX_MODEL_LEN:-$HYBRID_MAX_MODEL_LEN}}" \
                 --kv-cache-dtype fp8 \
-                --max-num-batched-tokens 3072 \
+                --max-num-batched-tokens 8192 \
                 --enable-prefix-caching \
                 --enable-auto-tool-choice \
                 --tool-call-parser qwen3_coder \
@@ -3864,16 +4549,19 @@ _serve_model() {
     # Current HF card (nvidia-modelopt v0.45.0 / NVFP4 1.0) recommends:
     #   vllm serve nvidia/Qwen3.6-27B-NVFP4 --quantization modelopt
     #     --max-model-len 262144 --reasoning-parser qwen3
-    # DGX Spark co-run default keeps max-model-len lower so this can live beside
-    # the 35B-A3B NVFP4 process. For full solo context:
-    #   QWEN36_27B_MAX_MODEL_LEN=262144 ./install_ai_spark_vllm.sh --start Qwen3.6-27B-NVFP4
+    # Full 262144 context (HYBRID_MAX_MODEL_LEN), sized to co-run with the
+    # 35B-A3B NVFP4 (0.34 + 0.32 = 0.66 ≈ 80 GB). 16 of 64 layers are full
+    # attention (4 KV heads × 256 dim) → fp8 KV ≈ 32 KB/token ≈ 8.6 GB per 262K
+    # sequence. 0.32 ≈ 39 GB − 21.9 GB weights − overhead ≈ 12 GB KV (1-2
+    # full-length sequences); the old 0.25 only fit ~100K tokens.
+    # Override: QWEN36_27B_MAX_MODEL_LEN.
     "nvidia/Qwen3.6-27B-NVFP4")
         _vllm_launch "$idx" \
             --served-model-name "Qwen3.6-27B-NVFP4" \
             --dtype auto \
             --quantization modelopt \
-            --gpu-memory-utilization 0.25 \
-            --max-model-len "${QWEN36_27B_MAX_MODEL_LEN:-$SERVE_MAX_MODEL_LEN}" \
+            --gpu-memory-utilization 0.32 \
+            --max-model-len "${QWEN36_27B_MAX_MODEL_LEN:-${SERVE_HYBRID_MAX_MODEL_LEN:-$HYBRID_MAX_MODEL_LEN}}" \
             --kv-cache-dtype fp8 \
             --max-num-seqs 4 \
             --max-num-batched-tokens 8192 \
@@ -4031,6 +4719,10 @@ _serve_model() {
     # footprint. 0.35 × 121 ≈ 42 GB budget leaves headroom for the vision tower
     # + KV. vLLM auto-detects modelopt FP8 from the checkpoint config; the explicit
     # flag makes it deterministic — drop it if your vLLM build errors on it.
+    # Context is HYBRID_MAX_MODEL_LEN (262144, the native max): only 6 of 52
+    # layers are attention (2 KV heads × 128 dim; the rest are Mamba-2 / MoE) →
+    # bf16 KV ≈ 6 KB/token ≈ 1.6 GB per 262K sequence, which fits in what's left
+    # after 35.2 GB of weights.
     "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8")
         # --max-num-batched-tokens bumped 4096→8192 to clear the larger Mamba
         # align-mode block_size at the new default context (see comment above).
@@ -4039,7 +4731,7 @@ _serve_model() {
             --dtype auto \
             --quantization modelopt \
             --gpu-memory-utilization 0.35 \
-            --max-model-len "$SERVE_MAX_MODEL_LEN" \
+            --max-model-len "${SERVE_HYBRID_MAX_MODEL_LEN:-$HYBRID_MAX_MODEL_LEN}" \
             --max-num-batched-tokens 8192 \
             --enable-prefix-caching \
             --trust-remote-code \
@@ -4047,8 +4739,10 @@ _serve_model() {
             "${_SERVE_TEMP_ARGS[@]}"
         ;;
 
-    # NVFP4 (~4-bit) build — ~a quarter of the BF16 footprint. 0.20 × 121 ≈ 24 GB
-    # budget. Same modelopt_fp4 path as the other Nemotron/Qwen NVFP4 entries.
+    # NVFP4 (~4-bit) build — 22.4 GB of weights (incl. vision/audio towers).
+    # Raised 0.20 → 0.25 (≈30 GB budget): 0.20 ≈ 24 GB barely cleared the
+    # weights. Full 262144 context at ~1.6 GB KV per sequence (see FP8 above).
+    # Same modelopt_fp4 path as the other Nemotron/Qwen NVFP4 entries.
     "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4")
         # --max-num-batched-tokens bumped 4096→8192 to clear the larger Mamba
         # align-mode block_size at the new default context (see comment above).
@@ -4056,8 +4750,8 @@ _serve_model() {
             --served-model-name "Nemotron-3-Nano-Omni-30B-A3B-NVFP4" \
             --dtype auto \
             --quantization modelopt_fp4 \
-            --gpu-memory-utilization 0.20 \
-            --max-model-len "$SERVE_MAX_MODEL_LEN" \
+            --gpu-memory-utilization 0.25 \
+            --max-model-len "${SERVE_HYBRID_MAX_MODEL_LEN:-$HYBRID_MAX_MODEL_LEN}" \
             --max-num-batched-tokens 8192 \
             --enable-prefix-caching \
             --trust-remote-code \
@@ -4101,13 +4795,16 @@ _serve_model() {
 
     # Generative yes/no reranker — clients score via logprobs on "yes"/"no"
     # tokens: POST /v1/completions with logprobs=1; compare P("yes") vs P("no").
-    # ~9 GB weights; 0.12≈15 GB leaves room for KV at max-model-len 10000.
+    # ~8 GB weights; 0.12≈15 GB leaves ~4.5 GB of KV. Every layer is full
+    # attention (36 × 8 KV heads × 128 dim) → bf16 KV ≈ 144 KB/token, so ~30K
+    # tokens in total. 16384 leaves room for concurrent rerank batches; 32768
+    # (the model max) would fit only one request at a time.
     "Qwen/Qwen3-Reranker-4B")
         _vllm_launch "$idx" \
             --served-model-name "Qwen3-Reranker-4B" \
             --dtype auto \
             --gpu-memory-utilization 0.12 \
-            --max-model-len 10000 \
+            --max-model-len 16384 \
             --enable-prefix-caching \
             --max-logprobs 20 \
             --trust-remote-code
@@ -4209,6 +4906,141 @@ _serve_model() {
             --trust-remote-code \
             "${_SERVE_CHAT_KWARGS_ARGS[@]+"${_SERVE_CHAT_KWARGS_ARGS[@]}"}" \
             "${_SERVE_TEMP_ARGS[@]}"
+        ;;
+
+    # Qwen3.8-Flash-Next — SOLO, Docker. Not a `vllm serve` from the venv; see
+    # _launch_qwen38_flash. Profile/context: QWEN38_FLASH_PROFILE (default 500k).
+    "nvidia/Qwen3.8-Flash-Next-NVFP4")
+        _launch_qwen38_flash "$idx"
+        ;;
+
+    # DeepSeek-V4-Flash NVFP4 — SOLO, TP=2 across two Sparks (MULTINODE_MODELS).
+    # ~168 GB of weights → ~84 GB per node. Flow: check cluster config + worker
+    # (and stop anything on it), download here, rsync to the worker, start a
+    # 2-node Ray cluster, then vllm serve on this node with the Ray executor.
+    # The API is served from THIS node only.
+    # Text-only profile focused on KV cache:
+    #  • --kv-cache-dtype fp8 halves KV vs bf16. V4's CSA/HCA compressed attention
+    #    (compress_ratios 4/128 per layer) already makes per-token KV tiny —
+    #    ~10% of V3.2's at 1M context — so the ~19 GB left per node after
+    #    weights at 0.85 holds a long context. Default 262144; raise with
+    #    DSV4_MAX_MODEL_LEN (the model supports 1048576). vLLM refuses to start
+    #    and prints the maximum that fits if the value is too high.
+    #  • Prefix caching + VLLM_PREFIX_CACHE_RETENTION_INTERVAL=4096 keeps shared
+    #    prompt prefixes (system prompt, chat history) warm between turns. 4096 is
+    #    a multiple of both the 32-block assumption in the source config and the
+    #    256 block size the vLLM recipe validates. --block-size is left to vLLM,
+    #    which picks what V4's attention backend needs.
+    #  • --max-num-seqs 4 / --max-num-batched-tokens 8192: few concurrent
+    #    sequences and bounded prefill chunks, so memory goes to KV for long
+    #    context instead of batch activations and CUDA-graph captures.
+    #  • deepseek_v4 tokenizer mode (required), reasoning + tool-call parsers.
+    #  • Quantization is auto-detected from the checkpoint (modelopt mixed
+    #    NVFP4/FP8) — no --quantization flag.
+    # DSV4_MTP=true enables the checkpoint's 1-layer MTP head for speculative
+    # decoding (faster single-stream decode, costs extra memory).
+    # Needs a recent vLLM with DeepseekV4ForCausalLM (card verified on
+    # 0.22.1rc1; recipe lists 0.25.0+) on BOTH nodes. AUTO_UPDATE_VLLM only
+    # updates this node — keep the worker's version identical (checked).
+    "nvidia/DeepSeek-V4-Flash-NVFP4")
+        local _dsv4_gmu="${DSV4_GPU_MEMORY_UTILIZATION:-0.85}"
+        echo "   ⚠️  SOLO model on TWO Sparks — nothing else can run on either node."
+        _cluster_preflight "${MDL_NAME[$idx]}" "$_dsv4_gmu" || return 1
+        _ensure_model_downloaded "$idx"                    || return 1
+        _sync_model_to_worker "$idx"                       || return 1
+        _start_ray_cluster                                 || return 1
+        local -a _dsv4_spec=()
+        [ "${DSV4_MTP:-false}" = "true" ] && \
+            _dsv4_spec=(--speculative-config '{"method":"mtp","num_speculative_tokens":1}')
+        VLLM_PREFIX_CACHE_RETENTION_INTERVAL="${DSV4_PREFIX_RETENTION:-4096}" \
+        _vllm_launch "$idx" \
+            --served-model-name "DeepSeek-V4-Flash" \
+            --trust-remote-code \
+            --tokenizer-mode deepseek_v4 \
+            --tensor-parallel-size 2 \
+            --distributed-executor-backend ray \
+            --gpu-memory-utilization "$_dsv4_gmu" \
+            --max-model-len "${DSV4_MAX_MODEL_LEN:-262144}" \
+            --kv-cache-dtype fp8 \
+            --enable-prefix-caching \
+            --enable-chunked-prefill \
+            --max-num-batched-tokens 8192 \
+            --max-num-seqs "${DSV4_MAX_NUM_SEQS:-4}" \
+            --reasoning-parser deepseek_v4 \
+            --enable-auto-tool-choice \
+            --tool-call-parser deepseek_v4 \
+            ${_dsv4_spec[@]+"${_dsv4_spec[@]}"} \
+            || { _stop_ray_cluster; return 1; }
+        ;;
+
+    # Qwen3-Coder-Next FP8 — SOLO, single Spark. ~80 GB block-FP8 weights;
+    # 0.80 × ~121 GB ≈ 97 GB reservation leaves ~16 GB for KV + activations.
+    # KV cache: only 12 of 48 layers are full attention (2 KV heads × 256 dim);
+    # the other 36 are Gated-DeltaNet with a small fixed per-sequence state. So
+    # bf16 KV at the full 262144 context is only ~6.4 GB per sequence — no need
+    # for fp8 KV (set QCN_KV_CACHE_DTYPE=fp8 to trade a little quality for room).
+    #  • --max-num-seqs 8 (default 256): each sequence also reserves linear-
+    #    attention state, and fewer seqs means smaller CUDA-graph captures.
+    #  • --max-num-batched-tokens 8192 chunks long-context prefill so a 200K-token
+    #    prompt doesn't spike activation memory.
+    #  • flashinfer attention, prefix caching, qwen3_coder tool calling (from the
+    #    source config). Non-thinking model — no reasoning parser.
+    # Model card sampling: temperature=1.0, top_p=0.95, top_k=40 — vLLM applies
+    # the checkpoint's generation_config.json defaults automatically.
+    # Needs vLLM >= 0.15.0. The source config used port 8000; pin it with
+    # --start "Qwen3-Coder-Next-FP8:8000".
+    "Qwen/Qwen3-Coder-Next-FP8")
+        echo "   ⚠️  SOLO model — nothing else can run while this is loaded."
+        _vllm_launch "$idx" \
+            --served-model-name "Qwen3-Coder-Next" \
+            --trust-remote-code \
+            --gpu-memory-utilization "${QCN_GPU_MEMORY_UTILIZATION:-0.80}" \
+            --max-model-len "${QCN_MAX_MODEL_LEN:-262144}" \
+            --kv-cache-dtype "${QCN_KV_CACHE_DTYPE:-auto}" \
+            --attention-backend flashinfer \
+            --enable-prefix-caching \
+            --enable-chunked-prefill \
+            --max-num-batched-tokens 8192 \
+            --max-num-seqs "${QCN_MAX_NUM_SEQS:-8}" \
+            --enable-auto-tool-choice \
+            --tool-call-parser qwen3_coder
+        ;;
+
+    # GGUF UD-Q4_K_XL quant of Qwen3.5-122B-A10B (see catalog comment above for
+    # why this is the unsloth repo and not the meshllm distributed-inference one).
+    # ~78.6 GB of weights alone on a DGX Spark's ~121.7 GB unified-memory pool —
+    # --gpu-memory-utilization 0.90 reserves ~110 GB, leaving only ~12 GB spare
+    # for the OS/driver, so this MUST run solo: no other model (served or
+    # auto-downloading) can share the box while this is loaded.
+    # --language-model-only forces text-only (this checkpoint is multimodal;
+    # matches the profile NVIDIA/unsloth publish for text-only DGX Spark use).
+    # KV cache is pushed to fp8 (--calculate-kv-scales computes scales on the fly
+    # since the GGUF checkpoint doesn't ship them) and capped at max-num-seqs 1
+    # (single user) to keep the ~12-31 GB of remaining headroom sufficient.
+    # vLLM's GGUF loader reads architecture/hyperparameters from the GGUF header
+    # itself, but ships no HF tokenizer — --tokenizer points at the original
+    # safetensors repo for that piece.
+    # Raise/lower context with QWEN35_122B_GGUF_MAX_MODEL_LEN (default 32768);
+    # go higher only if you've confirmed the extra KV cache still fits.
+    "unsloth/Qwen3.5-122B-A10B-MTP-GGUF")
+        echo "   ⚠️  SUPER LARGE (GGUF Q4) — reserves ~110 GB of the DGX Spark's unified memory."
+        echo "       This model MUST run alone: no other model can be loaded at the same time."
+        _vllm_launch "$idx" \
+            --served-model-name "Qwen3.5-122B-A10B-UD-Q4_K_XL" \
+            --tokenizer "Qwen/Qwen3.5-122B-A10B" \
+            --quantization gguf \
+            --dtype auto \
+            --tensor-parallel-size 1 \
+            --language-model-only \
+            --reasoning-parser qwen3 \
+            --gpu-memory-utilization 0.90 \
+            --max-model-len "${QWEN35_122B_GGUF_MAX_MODEL_LEN:-32768}" \
+            --max-num-seqs 1 \
+            --kv-cache-dtype fp8 \
+            --calculate-kv-scales \
+            --enable-chunked-prefill \
+            --enable-prefix-caching \
+            --trust-remote-code
         ;;
 
     # ── Small models (1-hour idle-sleep via catalog SLEEP_MIN=60) ─────────────
