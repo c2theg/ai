@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Christopher Gray  |  Version: 0.3.40  |  Update: 10/3/2026
+# Christopher Gray  |  Version: 0.3.41  |  Update: 10/3/2026
 # vLLM install, model download, and serve script for DGX Spark / NVIDIA systems
 #
 # Update Yourself:
@@ -92,6 +92,25 @@
 #           }'
 #
 # ── Changelog ─────────────────────────────────────────────────────────────────
+#
+# v0.3.41  10/3/2026
+#   - FIX Qwen3.8-Flash-Next setup: "python3: can't open file '/tools/fp8_convert.py'".
+#     The flash repo's scripts/prepare-hybrid.sh mounts "$PWD/tools" into the
+#     container, so it only works when run from the repo root — this script ran
+#     `flash` from wherever it was started (e.g. ~), mounting a missing ~/tools.
+#     `flash setup` and `flash serve` now run from inside $QWEN38_FLASH_DIR.
+#     (A stray empty, root-owned ~/tools may be left from the failed run:
+#     `sudo rmdir ~/tools`.)
+#   - FIX "Failed building wheel for tokenizers ... can't find Rust compiler"
+#     during install. `pip install -U "huggingface_hub[cli]" sentence-transformers`
+#     upgraded huggingface_hub to 2.x, which the venv's transformers doesn't
+#     allow, so pip backtracked transformers to 4.12.2 (2021) — needing an old
+#     tokenizers with no aarch64 wheel. Had it built, it would have DOWNGRADED
+#     vLLM's transformers. Now the packages vLLM installed (vllm, torch,
+#     transformers, tokenizers, huggingface_hub, safetensors) are held at their
+#     current versions with a pip constraints file, wheels are preferred and
+#     tokenizers is never built from source; a failure here is a warning only
+#     (sentence-transformers isn't used by this script).
 #
 # v0.3.40  10/3/2026
 #   - MERGE: this GitHub line (v0.3.13-v0.3.39) and a local copy that had split
@@ -2049,8 +2068,10 @@ _qwen38_flash_setup() {
     fi
 
     mkdir -p "$QWEN38_FLASH_HF_CACHE"
-    HF_TOKEN="$HF_TOKEN" HF_CACHE="$QWEN38_FLASH_HF_CACHE" \
-        "$dir/flash" setup "$QWEN38_FLASH_PROFILE" || { echo "   ❌ flash setup failed."; return 1; }
+    # Run from the repo root: its scripts use $PWD (prepare-hybrid.sh mounts
+    # "$PWD/tools" for fp8_convert.py), so running from ~ broke the hybrid step.
+    ( cd "$dir" && HF_TOKEN="$HF_TOKEN" HF_CACHE="$QWEN38_FLASH_HF_CACHE" \
+        ./flash setup "$QWEN38_FLASH_PROFILE" ) || { echo "   ❌ flash setup failed."; return 1; }
 }
 
 _launch_qwen38_flash() {
@@ -2073,9 +2094,10 @@ _launch_qwen38_flash() {
     [ -f "$log_file" ] && mv -f "$log_file" "${log_file}.old" 2>/dev/null
     local -a extra_env=()
     [ -n "${QWEN38_FLASH_GPU_MEM:-}" ] && extra_env+=(GPU_MEM="$QWEN38_FLASH_GPU_MEM")
-    if ! env HF_TOKEN="$HF_TOKEN" HF_CACHE="$QWEN38_FLASH_HF_CACHE" NAME="$QWEN38_FLASH_CONTAINER" \
+    # From the repo root, like setup (some of the repo's scripts resolve paths from $PWD).
+    if ! ( cd "$QWEN38_FLASH_DIR" && env HF_TOKEN="$HF_TOKEN" HF_CACHE="$QWEN38_FLASH_HF_CACHE" NAME="$QWEN38_FLASH_CONTAINER" \
             PORT="$port" SERVED_MODEL_NAME="$served" "${extra_env[@]+"${extra_env[@]}"}" \
-            "$QWEN38_FLASH_DIR/flash" serve "$QWEN38_FLASH_PROFILE" >>"$log_file" 2>&1; then
+            ./flash serve "$QWEN38_FLASH_PROFILE" ) >>"$log_file" 2>&1; then
         echo "   ❌ flash serve failed — last lines:"
         tail -25 "$log_file" | sed 's/^/      /'
         return 1
@@ -3599,7 +3621,26 @@ else
         echo "✅ vllm already installed: $("$VENV_DIR/bin/python" -c 'import vllm; print(vllm.__version__)')"
     fi
 
-    "$VENV_PIP" install -U "huggingface_hub[cli]" sentence-transformers
+    # HF CLI + sentence-transformers WITHOUT moving anything vLLM installed: an
+    # unconstrained `-U` upgraded huggingface_hub past what transformers allows,
+    # and pip "solved" it by backtracking transformers to 4.12.2 (source-built
+    # tokenizers, needs Rust). Hold vLLM's stack at its current versions instead.
+    _pins=$(mktemp)
+    "$VENV_DIR/bin/python" - >"$_pins" 2>/dev/null <<'PY'
+import importlib.metadata as m
+for p in ("vllm", "torch", "transformers", "tokenizers", "huggingface-hub", "safetensors"):
+    try:
+        print(f"{p}=={m.version(p)}")
+    except m.PackageNotFoundError:
+        pass
+PY
+    if ! "$VENV_PIP" install --prefer-binary --only-binary=tokenizers -c "$_pins" \
+            "huggingface_hub[cli]" sentence-transformers; then
+        echo "⚠️  Couldn't add huggingface_hub[cli] / sentence-transformers alongside the"
+        echo "    installed vLLM stack without changing it ($(tr '\n' ' ' <"$_pins"))."
+        echo "    Skipped — vLLM is untouched. (This script doesn't need sentence-transformers.)"
+    fi
+    rm -f "$_pins"
 
     if [ -x "$VENV_DIR/bin/hf" ]; then
         HF_CLI="$VENV_DIR/bin/hf"
