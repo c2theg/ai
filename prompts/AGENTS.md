@@ -194,3 +194,29 @@ Keep the final report concise and include:
 - Verification commands and results
 - Any remaining risks, skipped checks, or assumptions
 - Rollback guidance when required by `[SAFE-05]`
+
+
+# Autonomous Research
+
+This repository contains RESEARCH.md.
+
+When explicitly launched in research mode:
+1. Read RESEARCH.md.
+2. Inspect the current repository, recent git history, open issues,
+   tests, benchmarks, logs, TODOs, and architecture.
+3. Research opportunities to improve:
+   - performance
+   - security
+   - reliability
+   - architecture
+   - UX
+   - cost
+   - AI model quality
+   - observability
+   - testing
+4. Prefer evidence-backed improvements over speculative changes.
+5. Write findings under research/findings/.
+6. Do NOT modify production code unless the research task explicitly
+   authorizes an experiment.
+7. Never deploy, push, delete data, rotate credentials, or modify
+   production systems during autonomous research.
