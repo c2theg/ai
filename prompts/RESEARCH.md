@@ -49,6 +49,84 @@ Experimental code must go in:
 
 research/experiments/
 
+## Recursive Self-Improvement
+
+The research system should also evaluate its own effectiveness.
+
+During each research cycle, examine:
+
+- prompt quality
+- model selection
+- tool selection
+- retrieval quality
+- context efficiency
+- token consumption
+- latency
+- research accuracy
+- false-positive recommendations
+- benchmark coverage
+- experiment success rate
+
+The agent may propose improvements to:
+
+- AGENTS.md
+- RESEARCH.md
+- research prompts
+- model routing
+- RAG configuration
+- embeddings
+- tool usage
+- benchmark suites
+- evaluation methodology
+- speculative decoding configuration
+
+Self-improvements must be evaluated exactly like application changes.
+
+The agent MUST NOT automatically replace its own production instructions.
+
+All recursive improvements go through:
+
+PROPOSE
+→ EXPERIMENT
+→ BENCHMARK
+→ REVIEW
+→ APPROVE
+→ MERGE
+
+
+Generation N
+
+Researcher
+   ↓
+"I think Researcher v2 would work better"
+
+Experiment branch
+   ↓
+Researcher v2
+
+        A/B TEST
+       /        \
+ Researcher v1   Researcher v2
+       \          /
+        Evaluator
+
+Metrics:
+• useful findings
+• false positives
+• code quality
+• tests passed
+• latency
+• token cost
+• security
+• benchmark improvements
+
+        ↓
+
+v2 wins by required threshold?
+          │
+       yes/no
+
+
 Do not:
 - deploy
 - push to remote
