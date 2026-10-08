@@ -68,6 +68,7 @@ my-app/
 ├── CHANGELOG.md         # user-visible changes by version (Keep a Changelog style)
 ├── LEARNINGS.md         # lessons learned, gotchas, repeated mistakes to avoid
 ├── SOUL.md              # OPTIONAL: persona, tone and values for user-facing agents
+├── BUGS.md              # issues found that need to be fixed or have been fixed
 ├── RESEARCH.md          # research index (remote template, see Step 2)
 ├── .env.example         # every config variable, with placeholder values, no secrets
 ├── docs/
