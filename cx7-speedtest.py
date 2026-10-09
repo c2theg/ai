@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 # cx7-speedtest.py - Christopher Gray - 10/2026
 #
+#  Install:
+#    wget https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/cx7-speedtest.py && chmod +x cx7-speedtest.py
+#
+# Usage:
+#   python3 cx7-speedtest.py --ssh user@10.13.1.21
+#
 # True link speed test between two DGX Sparks cabled directly over ConnectX-7 (the 4 netdevs configured by
 # configure-cx7-direct-dgx-spark.sh: 10.200.{1..4}.{1,2}/30).  Python 3 stdlib only, nice colour output.
 #
