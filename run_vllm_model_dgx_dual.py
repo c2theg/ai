@@ -3,7 +3,7 @@
 
 Author: Chris Gray
 Updated: 10/9/2026
-Version: 0.0.9
+Version: 0.0.10
  
 Install:
      wget https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/run_vllm_model_dgx_dual.py && chmod +x run_vllm_model_dgx_dual.py
