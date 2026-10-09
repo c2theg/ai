@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# cx7-speedtest.py - Christopher Gray - 10/2026
+# cx7-speedtest.py - Christopher Gray - 10/8/2026 - v:0.0.8
 #
 #  Install:
 #    wget https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/cx7-speedtest.py && chmod +x cx7-speedtest.py
@@ -16,14 +16,25 @@
 #       ./cx7-speedtest.py --ssh user@10.13.1.21              # TCP: each link alone, then all 4 together
 #       ./cx7-speedtest.py --ssh user@10.13.1.21 --rdma       # + RDMA (ib_write_bw) = the real wire speed
 #       ./cx7-speedtest.py --ssh user@10.13.1.21 --reverse    # also test the other direction
+#       ./cx7-speedtest.py --ssh user@10.13.1.21 --udp        # + UDP: packet loss and jitter at a fixed offered rate
+#
+#   One-time ssh key setup (run on EACH Spark so either one can be the client; A = this box, B = the other,
+#   use the management IPs and your username). Skip any step that says the key/host already exists:
+#       # on Spark A:
+#       [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
+#       ssh-keygen -R <B-mgmt-ip>                       # only if B's IP was used by another machine before
+#       ssh-copy-id -o StrictHostKeyChecking=accept-new user@<B-mgmt-ip>   # asks B's password once
+#       ssh -o BatchMode=yes user@<B-mgmt-ip> hostname  # must print B's hostname with no prompt
+#       # then repeat on Spark B, pointing at A.
 #
 #   No ssh between the Sparks?  On the peer run:   ./cx7-speedtest.py server
 #   then on this one:                              ./cx7-speedtest.py
 #
-#   Options: --time 10  --streams 4  --base 10.200  --json out.json  --demo (fake numbers, to preview the layout)
+#   Options: --links 1,4 (test a subset)  --time 10  --streams 4  --udp-rate 80 (Gbit/s offered per link)  --base 10.200  --json out.json  --demo (fake numbers, to preview the layout)
 #
-# Reading the numbers: each physical 200G port is two PCIe x4 halves (~100 Gbit/s each), so the bars are scaled
-# to 100 Gbit/s per link and the full two-cable total is ~400 Gbit/s. Kernel TCP is CPU-bound and usually lands
+# Reading the numbers: each physical 200G port is two PCIe x4 halves (~110 Gbit/s each), so the bars are scaled
+# to 110 Gbit/s per link. Links on the same PCIe domain (1&3, 2&4) SHARE one x4, so the real ceiling for the whole
+# NIC is ~2 x 110 = ~220 Gbit/s - use one link per PCIe domain (e.g. --links 1,4) for the most throughput. Kernel TCP is CPU-bound and usually lands
 # lower than RDMA; NCCL/RDMA is the number that matters for multi-Spark inference/training.
 #
 # NOTE: always run the client on one Spark and the server on the OTHER. Testing against your own IP goes over
@@ -47,8 +58,11 @@ IFACES = ["enp1s0f0np0", "enP2p1s0f0np0", "enp1s0f1np1", "enP2p1s0f1np1"]
 CABLE = ["A", "A", "B", "B"]
 TCP_PORT = 5200      # + link number
 RDMA_PORT = 18515    # + link number
-HALF = 100.0         # Gbit/s a single PCIe half can carry
+HALF = 110.0         # Gbit/s one PCIe Gen5 x4 half carries (measured ~110.7)
+LINKS = []           # links selected for this run (set in client())
 W = 80
+# BatchMode = never prompt; accept-new = trust a host the first time, but still refuse if its key CHANGES
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new"]
 
 TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 
@@ -87,7 +101,7 @@ def sh(cmd, timeout=None):
 
 
 def rsh(host, cmd, timeout=20):
-    return sh(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, cmd], timeout)
+    return sh(["ssh"] + SSH_OPTS + ["-o", "ConnectTimeout=5", host, cmd], timeout)
 
 
 def read(path):
@@ -119,7 +133,10 @@ def detect(base):
             speed=int(speed) // 1000 if speed and speed.lstrip("-").isdigit() and int(speed) > 0 else None,
             mtu=int(read(f"/sys/class/net/{ifn}/mtu") or 0),
             carrier=read(f"/sys/class/net/{ifn}/carrier") == "1",
-            rdma=rdma_dev(ifn)))
+            rdma=rdma_dev(ifn),
+            pci=os.path.basename(os.path.realpath(f"/sys/class/net/{ifn}/device"))))
+    for l in links:
+        l["pci_dom"] = l["pci"].rsplit(".", 1)[0]
     return links
 
 
@@ -185,11 +202,13 @@ def run_parallel(fns, label, secs):
         return [f.result() for f in futs]
 
 
-def iperf(l, a, reverse=False):
+def iperf(l, a, reverse=False, udp=False):
     cmd = ["iperf3", "-c", l["peer"], "-p", str(TCP_PORT + l["i"]), "-B", l["ip"], "-P", str(a.streams),
            "-t", str(a.time), "-O", "1", "-J"]
     if reverse:
         cmd.append("-R")
+    if udp:  # -b is per stream; jumbo datagrams (MTU - 28) so packet rate stays sane at ~100G
+        cmd += ["-u", "-b", f"{a.udp_rate / a.streams:g}G", "-l", str(l["mtu"] - 28)]
     p = sh(cmd, timeout=a.time + 30)
     try:
         d = json.loads(p.stdout)
@@ -198,6 +217,10 @@ def iperf(l, a, reverse=False):
     if "error" in d:
         return dict(error=d["error"][:80])
     e = d["end"]
+    if udp:
+        u = e.get("sum") or e.get("sum_received") or {}
+        return dict(gbps=u.get("bits_per_second", 0) / 1e9, loss=u.get("lost_percent", 0.0),
+                    jitter=u.get("jitter_ms", 0.0), cpu=e["cpu_utilization_percent"]["host_total"])
     return dict(gbps=e["sum_received"]["bits_per_second"] / 1e9,
                 retr=e["sum_sent"].get("retransmits"),
                 cpu=e["cpu_utilization_percent"]["host_total"])
@@ -213,7 +236,7 @@ def rdma_one(l, a):
         return dict(error=f"no RoCEv2 GID for {l['ip']} / {l['peer']} on {dev}")
     port = RDMA_PORT + l["i"]
     opts = ["-d", dev, "-p", str(port), "-q", "4", "-s", "1048576", "-D", str(a.time), "--report_gbits", "-F"]
-    srv = subprocess.Popen(["ssh", "-o", "BatchMode=yes", a.ssh, "ib_write_bw " + " ".join(opts + ["-x", str(ridx)])],
+    srv = subprocess.Popen(["ssh"] + SSH_OPTS + [a.ssh, "ib_write_bw " + " ".join(opts + ["-x", str(ridx)])],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(2)
     p = sh(["ib_write_bw"] + opts + ["-x", str(lidx), l["peer"]], timeout=a.time + 30)
@@ -239,31 +262,50 @@ def row(l, r):
     if r.get("cpu") is not None:
         extra += f"  cpu {r['cpu']:.0f}%"
     g = r["gbps"]
-    print(f"{name}{bar(g)} {c(tone(g, HALF), f'{g:6.1f}')} Gbit/s {dim(f'{g / HALF * 100:3.0f}%')}{dim(extra)}")
+    loss = ""
+    if r.get("loss") is not None:
+        lc = "32" if r["loss"] == 0 else "33" if r["loss"] < 0.1 else "31"
+        loss = "  " + c(lc, f"loss {r['loss']:.3f}%") + dim(f"  jitter {r['jitter']:.3f} ms")
+    print(f"{name}{bar(g)} {c(tone(g, HALF), f'{g:6.1f}')} Gbit/s {dim(f'{g / HALF * 100:3.0f}%')}{loss}{dim(extra)}")
 
 
 def preflight_table(links, pings):
-    print(dim("  #  NIC             cable  local → peer                  speed   MTU  RoCE dev        RTT      jumbo"))
+    print(dim("  #  NIC             cable  local → peer                  speed   MTU  RoCE dev        RTT      jumbo  PCIe"))
     for l, (rt, jb) in zip(links, pings):
         sp = f"{l['speed']}G" if l["speed"] else red("down")
         rd = l["rdma"] or dim("—")
         rts = f"{rt:5.0f} µs" if rt else red("  fail ")
         print(f"  {l['i']}  {l['ifn']:<14}  {l['cable']}      {l['ip']:>10} → {l['peer']:<12}  {sp:>5}  {l['mtu']:>5}  "
-              f"{rd:<14}  {rts}  {green('✓') if jb else red('✗')}")
+              f"{rd:<14}  {rts}  {green('✓') if jb else red('✗')}      {l['pci']}")
+
+
+def loss_note(res):
+    ls = [r["loss"] for r in res if r.get("loss") is not None]
+    return dim(f"  worst loss {max(ls):.3f}%") if ls else ""
+
+
+def groups(key):
+    g = {}
+    for idx, l in enumerate(LINKS):
+        g.setdefault(l[key], []).append(idx)
+    return g
 
 
 def summary_line(name, res):
     g = [r.get("gbps", 0) for r in res]
-    ca, cb = g[0] + g[1], g[2] + g[3]
-    tot = ca + cb
+    tot = sum(g)
     cells = "".join(f"{x:7.1f}" for x in g)
-    print(f"  {name:<22}{cells}  {dim('│')} A {ca:6.1f}  B {cb:6.1f} {dim('│')} {bold(c(tone(tot, 400), f'{tot:6.1f}'))}")
+    cab = " ".join(f"{k} {sum(g[i] for i in v):5.1f}" for k, v in groups("cable").items())
+    pci = " ".join(f"{sum(g[i] for i in v):5.1f}" for v in groups("pci_dom").values())
+    print(f"  {name:<22}{cells}  {dim('│')} cable {cab} {dim('│')} PCIe x4 {pci} {dim('│')} "
+          f"{bold(c(tone(tot, HALF * 4), f'{tot:6.1f}'))}{loss_note(res)}")
     return tot
 
 
 def finish(results, a):
     section("Summary")
-    print(dim(f"  {'test':<22}{'link1':>7}{'link2':>7}{'link3':>7}{'link4':>7}  │ cable totals     │ total Gbit/s"))
+    hdr = "".join(f"{'link' + str(l['i']):>7}" for l in LINKS)
+    print(dim(f"  {'test':<22}{hdr}  │ cable totals │ per PCIe x4 domain │ total Gbit/s"))
     best = (None, 0)
     for name, res in results.items():
         if all("gbps" in r for r in res):
@@ -271,13 +313,21 @@ def finish(results, a):
                 t = summary_line(name, res)
             else:
                 g = [r["gbps"] for r in res]
-                print(f"  {name:<22}" + "".join(f"{x:7.1f}" for x in g))
+                print(f"  {name:<22}" + "".join(f"{x:7.1f}" for x in g) + loss_note(res))
                 t = sum(g)
-            if t > best[1] and name.endswith("(all links)"):
+            if t > best[1] and name.endswith("(all links)") and not name.startswith("UDP"):
                 best = (name, t)
     if best[0]:
-        print(f"\n  best aggregate  {bar(best[1], 400, 40)}  {bold(f'{best[1]:.1f}')} of ~400 Gbit/s ({best[1] / 4:.0f}%)")
-    print(dim("\n  bars: % of 100 Gbit/s per PCIe half | green ≥80%  yellow ≥40%  red <40%"))
+        ceiling = HALF * len(groups("pci_dom"))
+        print(f"\n  best aggregate  {bar(best[1], ceiling, 40)}  {bold(f'{best[1]:.1f}')} of ~{ceiling:.0f} Gbit/s "
+              f"hardware ceiling ({best[1] / ceiling * 100:.0f}%)")
+    tcp_all = results.get("TCP (all links)")
+    shared = [v for v in groups("pci_dom").values() if len(v) > 1]
+    if tcp_all and shared and all("gbps" in r for r in tcp_all) and sum(r["gbps"] for r in tcp_all) < 0.65 * HALF * len(tcp_all):
+        pairs = ", ".join("&".join(str(LINKS[i]["i"]) for i in v) for v in shared)
+        print(yellow(f"\n  note: links {pairs} share one PCIe x4 (~{HALF:.0f}G each domain), so running them together splits it."))
+        print(yellow("        One link per PCIe domain on different cables gives the most: try --links 1,4 (or 2,3)."))
+    print(dim(f"\n  bars: % of {HALF:.0f} Gbit/s (one PCIe x4) | green ≥80%  yellow ≥40%  red <40%"))
     if a.json:
         with open(a.json, "w") as f:
             json.dump(results, f, indent=2)
@@ -316,19 +366,31 @@ def serve(a):
 def demo_links(base):
     return [dict(i=i, ifn=IFACES[i - 1], cable=CABLE[i - 1], ip=f"{base}.{i}.1", node=1, peer=f"{base}.{i}.2",
                  speed=200, mtu=9000, carrier=True,
+                 pci=["0000:01:00.0", "0002:01:00.0", "0000:01:00.1", "0002:01:00.1"][i - 1],
+                 pci_dom=["0000:01:00", "0002:01:00", "0000:01:00", "0002:01:00"][i - 1],
                  rdma=["rocep1s0f0", "roceP2p1s0f0", "rocep1s0f1", "roceP2p1s0f1"][i - 1]) for i in range(1, 5)]
 
 
 def client(a):
     t_all = time.time()
     links = demo_links(a.base) if a.demo else detect(a.base)
+    if a.links:
+        sel = {int(x) for x in a.links.split(",")}
+        links = [l for l in links if l["i"] in sel]
+        if not links:
+            sys.exit(red("\n  --links matched nothing (use numbers 1-4, e.g. --links 1,4)"))
+    LINKS[:] = links
     section("DGX Spark ConnectX-7 direct-link speed test")
     me = socket.gethostname()
     peer_name = "peer"
     if a.ssh and not a.demo:
         r = rsh(a.ssh, "hostname")
         if r.returncode != 0:
-            sys.exit(red(f"\n  ssh to {a.ssh} failed (needs key-based login): {r.stderr.strip()[:100]}"))
+            err = r.stderr.strip()
+            hint = ("the host key CHANGED or is stale: ssh-keygen -R " + a.ssh.split("@")[-1] if "verification failed" in err or "CHANGED" in err
+                    else "install your key: ssh-copy-id " + a.ssh if "denied" in err
+                    else "is that the right IP, and is sshd running there?")
+            sys.exit(red(f"\n  ssh to {a.ssh} failed: {err[:120]}") + f"\n  {dim('hint: ' + hint)}")
         peer_name = r.stdout.strip()
     print(f"  {bold(me)} ⇄ {bold(peer_name)}   {dim(f'{a.streams} streams × {a.time}s per test, base {a.base}')}")
 
@@ -368,12 +430,15 @@ def client(a):
                 except OSError:
                     sys.exit(red(f"\n  nothing listening on {l['peer']}:{TCP_PORT + l['i']} - run './cx7-speedtest.py server' on the peer, or use --ssh"))
 
-        def tcp(label, reverse=False):
+        def tcp(label, reverse=False, udp=False):
             if a.demo:
                 import random
                 random.seed(len(label))
+                if udp:
+                    return [dict(gbps=random.uniform(70, 80), loss=random.choice([0, 0, 0.002, 0.04, 0.9]),
+                                 jitter=random.uniform(0.001, 0.02), cpu=random.uniform(20, 50)) for _ in links]
                 return [dict(gbps=random.uniform(82, 112), retr=random.randint(0, 40), cpu=random.uniform(20, 50)) for _ in links]
-            return run_parallel([lambda l=l: iperf(l, a, reverse) for l in links], label, a.time + 1)
+            return run_parallel([lambda l=l: iperf(l, a, reverse, udp) for l in links], label, a.time + 1)
 
         def rdma(label, one_by_one):
             if a.demo:
@@ -384,20 +449,23 @@ def client(a):
                 return [run_parallel([lambda l=l: rdma_one(l, a)], f"{l['ifn']}", a.time + 3)[0] for l in links]
             return run_parallel([lambda l=l: rdma_one(l, a) for l in links], label, a.time + 3)
 
-        phases = [("TCP", False)] + ([("TCP reverse", True)] if a.reverse else [])
-        for pname, rev in phases:
-            section(f"{pname} — one link at a time" + ("  (peer → here)" if rev else ""))
+        phases = [("TCP", False, False)] + ([("TCP reverse", True, False)] if a.reverse else [])
+        if a.udp:
+            phases += [("UDP", False, True)] + ([("UDP reverse", True, True)] if a.reverse else [])
+        for pname, rev, udp in phases:
+            note = ("  (peer → here)" if rev else "") + (f"  (offering {a.udp_rate:g} Gbit/s per link)" if udp else "")
+            section(f"{pname} — one link at a time" + note)
             res = []
             for l in links:
                 if a.demo:
-                    r = tcp(l["ifn"], rev)[l["i"] - 1]
+                    r = tcp(l["ifn"], rev, udp)[links.index(l)]
                 else:
-                    r = run_parallel([lambda l=l: iperf(l, a, rev)], l["ifn"], a.time + 1)[0]
+                    r = run_parallel([lambda l=l: iperf(l, a, rev, udp)], l["ifn"], a.time + 1)[0]
                 row(l, r)
                 res.append(r)
             results[f"{pname} (single)"] = res
-            section(f"{pname} — all four links together" + ("  (peer → here)" if rev else ""))
-            res = tcp(f"{pname} all", rev)
+            section(f"{pname} — all four links together" + note)
+            res = tcp(f"{pname} all", rev, udp)
             for l, r in zip(links, res):
                 row(l, r)
             results[f"{pname} (all links)"] = res
@@ -426,6 +494,9 @@ def main():
     ap.add_argument("--ssh", metavar="USER@PEER", help="start/stop the peer's servers over ssh (use its management IP/name)")
     ap.add_argument("--rdma", action="store_true", help="also run ib_write_bw (needs --ssh and the perftest package)")
     ap.add_argument("--reverse", action="store_true", help="also test peer → here")
+    ap.add_argument("--udp", action="store_true", help="also run UDP tests (packet loss + jitter at --udp-rate)")
+    ap.add_argument("--udp-rate", type=float, default=80.0, metavar="GBIT", help="UDP rate offered per link, Gbit/s (default 80)")
+    ap.add_argument("--links", metavar="N,N", help="only test these links, e.g. --links 1,4")
     ap.add_argument("--time", type=int, default=10)
     ap.add_argument("--streams", type=int, default=4)
     ap.add_argument("--base", default="10.200")
