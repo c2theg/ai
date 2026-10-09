@@ -3,7 +3,7 @@
 
 Author: Chris Gray
 Updated: 10/9/2026
-Version: 0.0.10
+Version: 0.0.12
  
 Install:
      wget https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/run_vllm_model_dgx_dual.py && chmod +x run_vllm_model_dgx_dual.py
@@ -50,6 +50,7 @@ Config (environment or a .env beside this script; same names as install_ai_spark
     SPARK_IB_HCA       RoCE devices for NCCL, e.g. rocep1s0f0,roceP2p1s0f0 (default: all Up)
     EXTRA_KILL_CONTAINERS  extra container names to stop before a launch (default: qwen38-flash);
                        any container whose name/image/command mentions vllm is always stopped
+    LOG_DIR            where a failed start saves each node's full log (~/vllm-logs)
     SYNC_JOBS          parallel rsyncs when copying a model to the other Spark (4)
     MODELS_DIR         /opt/ai/models        PORT  8000        MASTER_PORT  29501
     CONTAINER_NAME     vllm_node             HEALTH_TIMEOUT  seconds to wait for the API (3600)
@@ -684,10 +685,34 @@ def wait_ready(nodes, name, port, timeout):
     return False
 
 
-def dump_logs(nodes, name, n_lines=40):
+ERROR_MARKERS = ("Traceback (most recent call last)", " ERROR ", "OutOfMemoryError", "out of memory",
+                 "AssertionError", "CUDA error", "NCCL error", "Segmentation fault", "Killed")
+
+
+def first_error(text, context=30):
+    """The first real error in a log (not the final 'Engine core initialization failed' echo), with context."""
+    lines = text.splitlines()
+    for i, l in enumerate(lines):
+        if any(m in l for m in ERROR_MARKERS) and "Engine core initialization failed" not in l:
+            return "\n".join(lines[max(0, i - 3):i + context])
+    return ""
+
+
+def diagnose(nodes, name, key):
+    """Save the FULL log of every node to a file and show where each one first went wrong."""
+    log_dir = os.path.expanduser(cfg("LOG_DIR", "~/vllm-logs"))
+    os.makedirs(log_dir, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
     for n in nodes:
-        print(f"\n----- last {n_lines} log lines [{n.label}] -----")
-        print(n.out(f"docker logs --tail {n_lines} {shlex.quote(name)} 2>&1"))
+        text = n.out(f"docker logs {shlex.quote(name)} 2>&1", timeout=120)
+        path = os.path.join(log_dir, f"{stamp}-{key}-{n.label}.log")
+        with open(path, "w") as f:
+            f.write(text)
+        print(f"\n===== [{n.label}] full log: {path}  ({len(text.splitlines())} lines) =====")
+        err = first_error(text)
+        print(err if err else "\n".join(text.splitlines()[-25:]) + "\n(no explicit error marker found; last 25 lines shown)")
+        if err:
+            print("----- (first error above; the lines after it are usually just fallout) -----")
 
 
 # -------------------------------------------------------------
@@ -765,8 +790,9 @@ def cmd_start(args):
     if DRY:
         return
     if not wait_ready(nodes, name, port, int(cfg("HEALTH_TIMEOUT", "3600"))):
-        dump_logs(nodes, name)
-        stop_all(nodes, name)
+        diagnose(nodes, name, key)
+        print(f"\nThe containers were left running so you can inspect them (docker logs / docker exec -it {name} bash).\n"
+              f"`{sys.argv[0]} stop` removes them; the next `start` does too.")
         sys.exit(1)
     print(f"\nServing {prof.get('served', prof['repo'])} on {'1 Spark' if solo else '2 Sparks'}.\n  API   : http://{head.ip}:{port}/v1\n  Models: curl http://{head.ip}:{port}/v1/models"
           f"\n  Logs  : {sys.argv[0]} logs -f\n  Stop  : {sys.argv[0]} stop")
