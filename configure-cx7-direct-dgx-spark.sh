@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# configure-cx7-direct.sh - Christopher Gray - 10/2026
+# configure-cx7-direct-dgx-spark.sh - Christopher Gray - 10/8/2026 - version 0.0.6
+#
+#   Install: 
+#       wget https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/configure-cx7-direct-dgx-spark.sh && chmod +x configure-cx7-direct-dgx-spark.sh
+
 #
 # Configure the ConnectX-7 200G ports on a DGX Spark for a direct (no switch) link to a second DGX Spark.
 #
@@ -18,9 +22,9 @@
 #   - arp_ignore/arp_announce are set so the two halves on one cable don't answer ARP for each other's IPs.
 #
 # Usage (run on EACH Spark; node number must differ):
-#     sudo ./configure-cx7-direct.sh 1 --dry-run      # validate only, changes nothing
-#     sudo ./configure-cx7-direct.sh 1                # node 1
-#     sudo ./configure-cx7-direct.sh 2                # node 2 (on the other Spark)
+#     sudo ./configure-cx7-direct-dgx-spark.sh 1 --dry-run      # validate only, changes nothing
+#     sudo ./configure-cx7-direct-dgx-spark.sh 1                # node 1
+#     sudo ./configure-cx7-direct-dgx-spark.sh 2                # node 2 (on the other Spark)
 #     options: --mtu 9000   --base 10.200
 #
 # Safety: backs up /etc/netplan, validates the generated NetworkManager profiles offline first (NM silently
