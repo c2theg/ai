@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """Downloads vLLM models (full Hugging Face repos, e.g. NVFP4 safetensors) onto an Ubuntu box.
 
+Author: Christopher Gray
+Updated: 10/8/2026
+Version: 0.0.10
+
+Download:
+    wget https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/download_vllm_models_large.py && chmod +x download_vllm_models_large.py
+
+
 Companion to download_llama_cpp_models.sh, but for whole-repo vLLM models that are
 hundreds of GB across many shard files. Python 3.8+, standard library only.
 
@@ -30,6 +38,19 @@ The picker flags models that are too big for one Spark (needs both) or for the p
 Usage:
     ./download_vllm_models_large.py [MODELS_DIR] [--add REPO_OR_URL ...] [--sync-to HOST]
 
+Examples:
+    CHECK=1 ./download_vllm_models_large.py                  # sizes + status only, downloads nothing
+    ./download_vllm_models_large.py                          # menu: pick models, Enter to start
+    ALL=1 nohup ./download_vllm_models_large.py > download.log 2>&1 &   # overnight, no menu
+    ./download_vllm_models_large.py --add nvidia/Some-Model-NVFP4       # one extra repo
+
+    # Copy the finished models to the 2nd Spark over the ConnectX-7 link: give the address
+    # of the 200 Gb/s port (ip -br addr), not the LAN hostname. Needs ssh keys + rsync.
+    ./download_vllm_models_large.py --sync-only <user>@192.168.100.11
+    # Uses 4 parallel rsyncs + a fast cipher by default; SYNC_JOBS=8 for more. Ends with a size check.
+    # Or download and sync each model as it finishes:
+    SYNC_TO=<user>@192.168.100.11 ALL=1 ./download_vllm_models_large.py
+
 On a terminal a checkbox menu lets you pick models (Up/Down or j/k move, Space
 toggles, a = all/none, Enter = start, q = quit). Models not complete on disk, or
 changed on HF, are pre-checked. With no terminal (cron, pipes) every model is
@@ -50,20 +71,25 @@ Environment:
     SYNC_TO      After each model finishes, rsync it to this host (ssh name of the
                  second Spark, e.g. "spark2" or "user@10.0.0.2"), same MODELS_DIR path.
                  Use the ConnectX-7 link address for 200 Gb/s transfers.
+    SYNC_JOBS    Parallel rsyncs when copying to the 2nd Spark (default: 4)
+    REMOTE_MODELS_DIR  Models dir on the 2nd Spark if different (default: same as here)
+    RSYNC_RSH    ssh command for the sync (default: ssh with the fast aes128-gcm cipher)
     SPARK_GB     Unified memory per Spark (default: 128); used for the fit hints
     HF_TOKEN     Hugging Face access token (gated/restricted repos, higher rate limits).
                  If unset, read from $HF_TOKEN_FILE, ~/.cache/huggingface/token (what
-                 `huggingface-cli login` writes) ~/.hf_token or a .env beside the script (HF_TOKEN=...). Never put the token in this
+                 `huggingface-cli login` writes), ~/.hf_token, or a .env beside the script
+                 (HF_TOKEN=...). Never put the token in this
                  script -- it lives in a synced folder. Create a read token at
                  https://huggingface.co/settings/tokens and accept each gated model's terms
                  on its page while logged in.
 """
-import argparse
+import argparse 
 import concurrent.futures as cf
 import hashlib
 import http.client
 import json
 import os
+import shlex
 import shutil
 import socket
 import ssl
@@ -109,19 +135,75 @@ def fit_note(total_bytes):
     return "TOO BIG even for 2 Sparks"
 
 
+def _sync_buckets(files, jobs):
+    """Split [(relpath, size)] into `jobs` lists of similar total size (biggest first)."""
+    buckets = [[0, []] for _ in range(jobs)]
+    for rel, size in sorted(files, key=lambda x: -x[1]):
+        b = min(buckets, key=lambda x: x[0])
+        b[0] += size
+        b[1].append(rel)
+    return [b[1] for b in buckets if b[1]]
+
+
 def sync_repo(repo, models_dir, host):
-    """rsync a finished model dir to the second Spark. Resumable (--partial). Returns error|None."""
+    """Copy a finished model dir to the second Spark with several parallel rsyncs (a single
+    rsync is CPU-bound well below the ConnectX-7 link speed), then verify. Resumable.
+    Returns error|None."""
+    import tempfile
     name = local_dir_name(repo)
-    src = os.path.join(models_dir, name) + "/"
-    dst = f"{host}:{os.path.join(models_dir, name)}/"
-    say(f"   [sync] {name} -> {host}")
+    src = os.path.join(models_dir, name)
+    rdir = os.path.join(os.environ.get("REMOTE_MODELS_DIR", models_dir), name)
+    rsh = os.environ.get("RSYNC_RSH") or "ssh -c aes128-gcm@openssh.com -o Compression=no"
+    files = []
+    for root, _, names in os.walk(src):
+        for n in names:
+            if not n.endswith(".part"):
+                full = os.path.join(root, n)
+                files.append((os.path.relpath(full, src), os.path.getsize(full)))
+    if not files:
+        return f"nothing to sync in {src}"
+    total = sum(sz for _, sz in files)
+    jobs = max(1, min(int(os.environ.get("SYNC_JOBS", "4")), len(files)))
+    say(f"   [sync] {name}: {len(files)} files, {human(total)} -> {host}:{rdir}  ({jobs} parallel rsync)")
+
+    # Make sure the remote dir exists; fall back to sudo (passwordless) if the parent isn't writable.
+    q = shlex.quote(rdir)
+    mk = f'mkdir -p {q} 2>/dev/null || {{ sudo -n mkdir -p {q} && sudo -n chown "$(id -u):$(id -g)" {q}; }}'
+    if subprocess.run(shlex.split(rsh) + [host, mk]).returncode != 0:
+        return (f"can't create {rdir} on {host}. Run once on {host}:  "
+                f"sudo mkdir -p {os.path.dirname(rdir)} && sudo chown $USER {os.path.dirname(rdir)}")
+
+    tmpdir = tempfile.mkdtemp(prefix="vllm_sync_")
     try:
-        subprocess.run(["ssh", host, "mkdir", "-p", os.path.join(models_dir, name)], check=True)
-        subprocess.run(["rsync", "-a", "--partial", "--inplace", "--info=progress2", "--exclude", "*.part", src, dst],
-                       check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        return f"sync to {host} failed: {e}"
-    return None
+        def listfile(rels, i):
+            path = os.path.join(tmpdir, f"files{i}.txt")
+            with open(path, "w") as f:
+                f.write("\n".join(rels) + "\n")
+            return path
+
+        base = ["rsync", "-a", "--partial", "--inplace", "-e", rsh]
+        t0 = time.time()
+        procs = []
+        for i, rels in enumerate(_sync_buckets(files, jobs)):
+            extra = ["--info=progress2"] if jobs == 1 else []
+            procs.append(subprocess.Popen(base + extra + [f"--files-from={listfile(rels, i)}", src + "/", f"{host}:{rdir}/"]))
+        rcs = [p.wait() for p in procs]
+        if any(rcs):
+            return f"rsync failed (exit codes {rcs}); re-run to resume"
+        secs = max(time.time() - t0, 1)
+        say(f"   [sync] copied in {fmt_time(secs)} (~{human(total / secs)}/s); verifying sizes...")
+
+        # Verify: a dry run must have nothing left to transfer.
+        out = subprocess.run(["rsync", "-rn", "--size-only", "--out-format=%n", "-e", rsh,
+                              f"--files-from={listfile([r for r, _ in files], 'all')}", src + "/", f"{host}:{rdir}/"],
+                             capture_output=True, text=True)
+        diff = [l for l in out.stdout.splitlines() if l.strip()]
+        if out.returncode != 0 or diff:
+            return f"verify failed ({len(diff)} file(s) differ, e.g. {diff[:2]}); re-run to resume"
+        say(f"   [sync] verified: {len(files)} files match on {host}")
+        return None
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 CHUNK = 4 * 1024 * 1024
