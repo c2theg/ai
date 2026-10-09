@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# cx7-speedtest.py - Christopher Gray - 10/8/2026 - v:0.0.8
+# cx7-speedtest.py - Christopher Gray - 10/8/2026 - v:0.0.9
 #
 #  Install:
 #    wget https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/cx7-speedtest.py && chmod +x cx7-speedtest.py
@@ -18,14 +18,13 @@
 #       ./cx7-speedtest.py --ssh user@10.13.1.21 --reverse    # also test the other direction
 #       ./cx7-speedtest.py --ssh user@10.13.1.21 --udp        # + UDP: packet loss and jitter at a fixed offered rate
 #
-#   One-time ssh key setup (run on EACH Spark so either one can be the client; A = this box, B = the other,
-#   use the management IPs and your username). Skip any step that says the key/host already exists:
-#       # on Spark A:
-#       [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
-#       ssh-keygen -R <B-mgmt-ip>                       # only if B's IP was used by another machine before
-#       ssh-copy-id -o StrictHostKeyChecking=accept-new user@<B-mgmt-ip>   # asks B's password once
-#       ssh -o BatchMode=yes user@<B-mgmt-ip> hostname  # must print B's hostname with no prompt
-#       # then repeat on Spark B, pointing at A.
+#   First time? Run the one-time setup (creates your ssh key, trusts the peer's host key, copies the key over,
+#   then does the same in the other direction so EITHER Spark can run the tests, and checks iperf3/perftest on both):
+#       python3 cx7-speedtest.py setup --ssh user@10.13.1.20        # asks each box's password once
+#       python3 cx7-speedtest.py setup --ssh user@10.13.1.20 --yes  # also auto-replace a stale/changed host key
+#       python3 cx7-speedtest.py setup --ssh user@10.13.1.20 --no-reverse   # only this box -> peer
+#   (Manual equivalent, if you ever need it:  ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 ;
+#    ssh-keygen -R <peer-ip> ; ssh-copy-id user@<peer-ip> ; ssh -o BatchMode=yes user@<peer-ip> hostname)
 #
 #   No ssh between the Sparks?  On the peer run:   ./cx7-speedtest.py server
 #   then on this one:                              ./cx7-speedtest.py
@@ -76,6 +75,7 @@
 
 import argparse
 import concurrent.futures as cf
+import getpass
 import glob
 import json
 import os
@@ -396,6 +396,93 @@ def serve(a):
             p.terminate()
 
 
+# ---------------------------------------------------------------- setup mode (ssh keys)
+def ask(q, a):
+    if a.yes:
+        print(f"  {q} {dim('[auto-yes]')}")
+        return True
+    try:
+        return input(f"  {q} [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def tick(ok, msg):
+    print(f"  {green('✓') if ok else red('✗')} {msg}")
+
+
+def setup(a):
+    if not a.ssh:
+        sys.exit(red("\n  setup needs the peer:  python3 cx7-speedtest.py setup --ssh user@<peer-mgmt-ip>"))
+    host = a.ssh.split("@")[-1]
+    me_user = getpass.getuser()
+    section(f"SSH key setup  {me_user}@{socket.gethostname()} → {a.ssh}")
+    if not shutil.which("ssh-copy-id") or not shutil.which("ssh-keygen"):
+        sys.exit(red("  ssh client tools missing:  sudo apt install openssh-client"))
+
+    # 1) our key
+    key = os.path.expanduser("~/.ssh/id_ed25519")
+    if os.path.exists(key):
+        tick(True, f"key exists: {key}")
+    else:
+        os.makedirs(os.path.dirname(key), mode=0o700, exist_ok=True)
+        r = sh(["ssh-keygen", "-t", "ed25519", "-N", "", "-q", "-f", key, "-C", f"{me_user}@{socket.gethostname()} cx7-speedtest"])
+        tick(r.returncode == 0, f"created key {key}" if r.returncode == 0 else f"ssh-keygen failed: {r.stderr.strip()}")
+        if r.returncode:
+            sys.exit(1)
+
+    # 2) this box -> peer (trust host key, then copy our key)
+    def probe():
+        r = rsh(a.ssh, "hostname", 20)
+        return r.returncode == 0, r.stdout.strip(), r.stderr.strip()
+
+    ok, out, err = probe()
+    if not ok and any(k in err for k in ("HOST IDENTIFICATION HAS CHANGED", "verification failed")):
+        print(yellow(f"  the saved host key for {host} does not match what it presents now."))
+        print(dim("    (normal if the box was reinstalled or the IP moved to another machine; suspicious otherwise)"))
+        if ask(f"remove the old key for {host} and trust the new one?", a):
+            sh(["ssh-keygen", "-R", host])
+            ok, out, err = probe()
+        else:
+            sys.exit(red("  stopped - nothing changed."))
+    if not ok and "denied" in err:
+        print(f"  copying key to {a.ssh} {dim('(enter that account\'s password when asked)')}")
+        subprocess.run(["ssh-copy-id", "-o", "StrictHostKeyChecking=accept-new", a.ssh])
+        ok, out, err = probe()
+    if not ok:
+        tick(False, f"can't log in to {a.ssh}: {err[:140] or 'no response'}")
+        print(dim("    check the IP, that sshd is running there, and the username"))
+        sys.exit(1)
+    tick(True, f"{me_user}@{socket.gethostname()} → {a.ssh}  logs in with no prompt  ({out})")
+
+    # 3) peer -> this box, so either Spark can be the client
+    if not a.no_reverse:
+        m = re.search(r"src (\S+)", sh(["ip", "route", "get", host]).stdout)
+        mine = m.group(1) if m else None
+        if not mine:
+            tick(False, "couldn't work out this box's address as seen from the peer - skipping reverse direction")
+        else:
+            back = f"{me_user}@{mine}"
+            print(f"  now the other way: {a.ssh} → {back} {dim('(enter this account\'s password when asked)')}")
+            remote = ("[ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N '' -q -f ~/.ssh/id_ed25519; "
+                      f"ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new {back} true 2>/dev/null || "
+                      f"ssh-copy-id -o StrictHostKeyChecking=accept-new {back}; "
+                      f"ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new {back} hostname")
+            r = subprocess.run(["ssh", "-t", "-o", "StrictHostKeyChecking=accept-new", a.ssh, remote])
+            tick(r.returncode == 0, f"{a.ssh} → {back}  logs in with no prompt" if r.returncode == 0 else
+                 f"reverse direction not set up (root logins/passwords may be disabled). Run this on the peer instead:  "
+                 f"python3 cx7-speedtest.py setup --ssh {back} --no-reverse")
+
+    # 4) tools on both boxes
+    section("Tools")
+    for tool, why in (("iperf3", "TCP/UDP tests"), ("ib_write_bw", "--rdma tests (package: perftest)")):
+        here = shutil.which(tool) is not None
+        there = rsh(a.ssh, f"command -v {tool}", 15).returncode == 0
+        tick(here and there, f"{tool:<12} here {'yes' if here else red('MISSING')}   peer {'yes' if there else red('MISSING')}   {dim(why)}")
+    print(dim("    missing? run on that box:  sudo apt install iperf3 perftest"))
+    print(green(f"\n  Ready:  python3 {os.path.basename(sys.argv[0])} --ssh {a.ssh} --rdma\n"))
+
+
 # ---------------------------------------------------------------- client mode
 def demo_links(base):
     return [dict(i=i, ifn=IFACES[i - 1], cable=CABLE[i - 1], ip=f"{base}.{i}.1", node=1, peer=f"{base}.{i}.2",
@@ -421,8 +508,8 @@ def client(a):
         r = rsh(a.ssh, "hostname")
         if r.returncode != 0:
             err = r.stderr.strip()
-            hint = ("the host key CHANGED or is stale: ssh-keygen -R " + a.ssh.split("@")[-1] if "verification failed" in err or "CHANGED" in err
-                    else "install your key: ssh-copy-id " + a.ssh if "denied" in err
+            hint = (f"run the one-time setup:  python3 {os.path.basename(sys.argv[0])} setup --ssh {a.ssh}"
+                    if any(k in err for k in ("verification failed", "CHANGED", "denied"))
                     else "is that the right IP, and is sshd running there?")
             sys.exit(red(f"\n  ssh to {a.ssh} failed: {err[:120]}") + f"\n  {dim('hint: ' + hint)}")
         peer_name = r.stdout.strip()
@@ -524,7 +611,7 @@ def client(a):
 
 def main():
     ap = argparse.ArgumentParser(description="Speed test between two DGX Sparks over the direct CX-7 links")
-    ap.add_argument("mode", nargs="?", choices=["client", "server"], default="client")
+    ap.add_argument("mode", nargs="?", choices=["client", "server", "setup"], default="client")
     ap.add_argument("--ssh", metavar="USER@PEER", help="start/stop the peer's servers over ssh (use its management IP/name)")
     ap.add_argument("--rdma", action="store_true", help="also run ib_write_bw (needs --ssh and the perftest package)")
     ap.add_argument("--reverse", action="store_true", help="also test peer → here")
@@ -536,8 +623,12 @@ def main():
     ap.add_argument("--base", default="10.200")
     ap.add_argument("--json", metavar="FILE")
     ap.add_argument("--demo", action="store_true", help="fake numbers, just to preview the output")
+    ap.add_argument("--yes", action="store_true", help="setup: auto-confirm replacing a stale/changed host key")
+    ap.add_argument("--no-reverse", action="store_true", help="setup: only set up this box → peer")
     a = ap.parse_args()
-    if a.mode == "server":
+    if a.mode == "setup":
+        setup(a)
+    elif a.mode == "server":
         serve(a)
     else:
         client(a)
