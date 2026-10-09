@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """Launch ONE vLLM model across BOTH DGX Sparks (tensor parallel 2) over ConnectX-7 / RoCE.
 
+Author: Chris Gray
+Updated: 10/9/2026
+Version: 0.0.8
+ 
+Install:
+     wget https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/run_vllm_model_dgx_dual.py && chmod +x run_vllm_model_dgx_dual.py
+
+
 Re-implements the multi-node path of https://github.com/eugr/spark-vllm-docker
 (launch-cluster.sh + recipes/) in a single stdlib-only script: it starts that
 project's Docker image on both Sparks (privileged, host network, /dev/infiniband),
@@ -47,7 +55,7 @@ Config (environment or a .env beside this script; same names as install_ai_spark
     CONTAINER_NAME     vllm_node             HEALTH_TIMEOUT  seconds to wait for the API (3600)
     SETUP_DIR          ~/spark-vllm-docker   where `setup` clones eugr's repo
 """
-import argparse
+import argparse 
 import getpass
 import json
 import os
