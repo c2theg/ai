@@ -3,7 +3,7 @@
 
 Author: Christopher Gray
 Updated: 10/8/2026
-Version: 0.0.10
+Version: 0.0.11
 
 Download:
     wget https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/download_vllm_models_large.py && chmod +x download_vllm_models_large.py
@@ -169,7 +169,13 @@ def sync_repo(repo, models_dir, host):
     # Make sure the remote dir exists; fall back to sudo (passwordless) if the parent isn't writable.
     q = shlex.quote(rdir)
     mk = f'mkdir -p {q} 2>/dev/null || {{ sudo -n mkdir -p {q} && sudo -n chown "$(id -u):$(id -g)" {q}; }}'
-    if subprocess.run(shlex.split(rsh) + [host, mk]).returncode != 0:
+    ok = subprocess.run(shlex.split(rsh) + [host, mk], stderr=subprocess.DEVNULL).returncode == 0
+    if not ok and sys.stdin.isatty():
+        # sudo needs a password: let the user type it once (ssh -t gives sudo a terminal).
+        say(f"   [sync] {rdir} needs sudo on {host}; enter its password if asked:")
+        sudo = f'sudo mkdir -p {q} && sudo chown "$(id -u):$(id -g)" {q}'
+        ok = subprocess.run(shlex.split(rsh) + ["-t", host, sudo]).returncode == 0
+    if not ok:
         return (f"can't create {rdir} on {host}. Run once on {host}:  "
                 f"sudo mkdir -p {os.path.dirname(rdir)} && sudo chown $USER {os.path.dirname(rdir)}")
 
