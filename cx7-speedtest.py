@@ -30,12 +30,46 @@
 #   No ssh between the Sparks?  On the peer run:   ./cx7-speedtest.py server
 #   then on this one:                              ./cx7-speedtest.py
 #
-#   Options: --links 1,4 (test a subset)  --time 10  --streams 4  --udp-rate 80 (Gbit/s offered per link)  --base 10.200  --json out.json  --demo (fake numbers, to preview the layout)
+#   Options: --links 1,4 (test a subset)  --time 10  --streams 4  --udp-rate 80 (Gbit/s offered per link)
+#            --base 10.200  --json out.json  --demo (fake numbers, to preview the layout)
 #
 # Reading the numbers: each physical 200G port is two PCIe x4 halves (~110 Gbit/s each), so the bars are scaled
 # to 110 Gbit/s per link. Links on the same PCIe domain (1&3, 2&4) SHARE one x4, so the real ceiling for the whole
-# NIC is ~2 x 110 = ~220 Gbit/s - use one link per PCIe domain (e.g. --links 1,4) for the most throughput. Kernel TCP is CPU-bound and usually lands
-# lower than RDMA; NCCL/RDMA is the number that matters for multi-Spark inference/training.
+# NIC is ~2 x 110 = ~220 Gbit/s - use one link per PCIe domain (e.g. --links 1,4) for the most throughput.
+# Kernel TCP is CPU-bound and usually lands lower than RDMA; NCCL/RDMA is the number that matters for
+# multi-Spark inference/training.
+#
+# Link / PCIe map (bus-info from ethtool -i; same on both Sparks):
+#       link  netdev          cable  PCIe domain (x4 ~110G, shared)   RoCE device
+#       1     enp1s0f0np0     A      0000:01:00.0  <- domain 1        rocep1s0f0
+#       2     enP2p1s0f0np0   A      0002:01:00.0  <- domain 2        roceP2p1s0f0
+#       3     enp1s0f1np1     B      0000:01:00.1  <- domain 1        rocep1s0f1
+#       4     enP2p1s0f1np1   B      0002:01:00.1  <- domain 2        roceP2p1s0f1
+#   Links 1&3 share a PCIe x4 and links 2&4 share the other, so ALL FOUR together cap at ~200-220 Gbit/s total
+#   (measured 10/2026: each link alone = ~110.7 Gbit/s, all four together = 207 Gbit/s, i.e. ~52 each).
+#
+# Examples - is the hardware ceiling the PCIe domains?
+#   Links on DIFFERENT PCIe domains and DIFFERENT cables - should add up to ~220 Gbit/s:
+#       python3 cx7-speedtest.py --ssh user@10.13.1.20 --links 1,4 --rdma
+#   Control: links that SHARE a PCIe x4 - should add up to only ~110 Gbit/s:
+#       python3 cx7-speedtest.py --ssh user@10.13.1.20 --links 1,3
+#   Same cable, different domains (one 200G port, both halves) - tops out at the port, ~200 Gbit/s:
+#       python3 cx7-speedtest.py --ssh user@10.13.1.20 --links 1,2
+#   Everything, both directions, with RDMA and UDP loss/jitter, saved to a file:
+#       python3 cx7-speedtest.py --ssh user@10.13.1.20 --rdma --udp --reverse --json /tmp/cx7.json
+#   Quick 5-second pass, UDP offering 90G per link:
+#       python3 cx7-speedtest.py --ssh user@10.13.1.20 --time 5 --udp --udp-rate 90
+#
+# For NCCL / multi-Spark jobs use ONE link per PCIe domain, e.g. links 1 and 4 (or 2 and 3):
+#       NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f1        # (NCCL_SOCKET_IFNAME=enp1s0f0np0 for the bootstrap/TCP side)
+#   Using all four RoCE devices adds nothing - links 1&3 and 2&4 share the same PCIe lanes.
+#
+# Latency check (ping RTT in the pre-flight table looked high, 470-1069 us, probably CPU idle wake-up):
+#       ping -c 50 -i 0.2 -I enp1s0f0np0 10.200.1.1      # look at the avg; a direct 200G link should be well under 100 us
+#
+# PCIe link check (should show Speed 32GT/s, Width x4 per domain):
+#       sudo lspci -vv -s 0000:01:00.0 | grep -E 'LnkCap|LnkSta'
+#       sudo lspci -vv -s 0002:01:00.0 | grep -E 'LnkCap|LnkSta'
 #
 # NOTE: always run the client on one Spark and the server on the OTHER. Testing against your own IP goes over
 # loopback and never touches the cables (this tool picks the peer's address automatically to avoid that).
