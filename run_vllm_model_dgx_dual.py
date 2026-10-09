@@ -3,7 +3,7 @@
 
 Author: Chris Gray
 Updated: 10/9/2026
-Version: 0.0.8
+Version: 0.0.9
  
 Install:
      wget https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/run_vllm_model_dgx_dual.py && chmod +x run_vllm_model_dgx_dual.py
@@ -309,8 +309,13 @@ def preflight(nodes, prof, models_dir, solo):
         if not n.ok("true", timeout=20):
             errs.append(f"{t} can't reach {n.ssh} over ssh (passwordless key needed)")
             continue
-        if not n.ok("docker info >/dev/null 2>&1", timeout=30):
-            errs.append(f"{t} `docker info` fails: Docker not running, or this user isn't in the docker group")
+        di = n.run("docker info 2>&1 >/dev/null | head -3", timeout=30)
+        if di.returncode != 0 or di.stdout.strip():
+            why = di.stdout.strip().splitlines()[0] if di.stdout.strip() else "unknown error"
+            fix = ("add the user to the docker group (`sudo usermod -aG docker $USER`, then log in again)"
+                   if "permission denied" in why.lower() else "start Docker (`sudo systemctl start docker`)"
+                   if "cannot connect" in why.lower() else "check Docker")
+            errs.append(f"{t} `docker info` fails: {why[:140]} -> {fix}")
         if not n.ok(f"docker image inspect {shlex.quote(prof['image'])} >/dev/null 2>&1"):
             errs.append(f"{t} Docker image '{prof['image']}' missing: run `./run_vllm_model_dgx_dual.py setup`")
         if not n.ok("nvidia-smi -L >/dev/null 2>&1"):
@@ -835,9 +840,16 @@ def cmd_setup(args):
         subprocess.call(["git", "-C", d, "pull", "--ff-only"])
     elif subprocess.call(["git", "clone", EUGR_REPO, d]) != 0:
         sys.exit("git clone failed")
+    # build-and-copy.sh ssh's as $USER (root here) unless told: give it the worker's user and ConnectX IP.
+    ssh, wip = cfg("SPARK_WORKER_SSH"), cfg("SPARK_WORKER_IP")
+    if not wip and ssh:
+        _, w = make_nodes(need_worker=True)      # read its ConnectX IP
+        wip = w.ip if w else ""
+    copy = ["-c", wip] if wip else ["-c"]
+    user_flag = ["-u", ssh.split("@")[0]] if "@" in ssh else []
     builds = [[]] if args.regular_only else [["--exp-b12x"]] if args.b12x_only else [[], ["--exp-b12x"]]
     for flags in builds:
-        cmd = ["./build-and-copy.sh", *flags, "-c", "--copy-parallel"]
+        cmd = ["./build-and-copy.sh", *flags, *copy, "--copy-parallel", *user_flag]
         print(f"\n$ {' '.join(cmd)}   (in {d})")
         if subprocess.call(cmd, cwd=d) != 0:
             sys.exit("build-and-copy.sh failed; see eugr's docs/NETWORKING.md for the cluster/SSH setup it expects")
