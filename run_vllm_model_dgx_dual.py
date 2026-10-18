@@ -2,9 +2,14 @@
 """Launch ONE vLLM model across BOTH DGX Sparks (tensor parallel 2) over ConnectX-7 / RoCE.
 
 Author: Chris Gray
-Updated: 10/9/2026
-Version: 0.0.12
- 
+Updated: 10/18/2026
+Version: 0.0.14
+
+Examples (run from the HEAD Spark; SPARK_WORKER_SSH sets the SSH user@ip of the other Spark):
+    SPARK_WORKER_SSH=ubuntu@10.1.1.15 ./run_vllm_model_dgx_dual.py start glm-5.3-flash
+    SPARK_WORKER_SSH=ubuntu@10.1.1.15 ./run_vllm_model_dgx_dual.py start qwen3.8-flash-next    # Qwen3.8-Flash-Next-NVFP4
+    SPARK_WORKER_SSH=ubuntu@10.1.1.15 ./run_vllm_model_dgx_dual.py start deepseek-v4-flash     # DeepSeek V4 Flash
+
 Install:
      wget https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/run_vllm_model_dgx_dual.py && chmod +x run_vllm_model_dgx_dual.py
 
@@ -34,7 +39,6 @@ One-time prerequisites (see eugr's docs/NETWORKING.md):
 Usage:
     ./run_vllm_model_dgx_dual.py                       # menu: pick a model, then launch
     ./run_vllm_model_dgx_dual.py start qwen3.8-27b     # launch a profile (see `list`)
-    ./run_vllm_model_dgx_dual.py start glm-5.3-flash --max-model-len 131072 -- --enable-expert-parallel
     ./run_vllm_model_dgx_dual.py check                 # preflight only: network, RoCE, image, models
     ./run_vllm_model_dgx_dual.py status | logs [-f] [--worker] | stop | list | setup
     ./run_vllm_model_dgx_dual.py start <profile> --dry-run   # print every command, run nothing
@@ -42,8 +46,68 @@ Usage:
 Anything after `--` is appended to `vllm serve` last, so it overrides the profile
 (e.g. `-- --load-format auto --quantization modelopt`).
 
+Start each model (run on the HEAD Spark; each start first stops whatever else is running on
+the Sparks, so only one model is served at a time -- the API is http://<head-ip>:8000/v1):
+
+    # GLM 5.3 Flash (nvidia NVFP4, ~190 GB) -- TESTED on 2 Sparks. Profile pins the KV cache to 6G
+    # and a 262144 context because only ~1-2 GiB is left after the ~95 GB of weights per Spark.
+    ./run_vllm_model_dgx_dual.py start glm-5.3-flash
+    #   shorter context / smaller KV cache if memory is tight (the Spark's 128 GB is shared with the OS):
+    ./run_vllm_model_dgx_dual.py start glm-5.3-flash --max-model-len 131072 -- --kv-cache-memory-bytes 4G
+
+    # Qwen3.8 Flash Next (nvidia NVFP4). Recipe is written for local-inference-lab's checkpoint; if the
+    # nvidia one won't load, add the fallback flags after `--`.
+    ./run_vllm_model_dgx_dual.py start qwen3.8-flash-next
+    ./run_vllm_model_dgx_dual.py start qwen3.8-flash-next -- --load-format auto --quantization modelopt
+
+    # DeepSeek V4 Flash and the 0731 build (deepseek-ai repos; 0731 uses the B12X image + DSpark spec decoding)
+    ./run_vllm_model_dgx_dual.py start deepseek-v4-flash
+    ./run_vllm_model_dgx_dual.py start deepseek-v4-flash-0731
+    #   DeepSeek V4.1 Flash NVFP4 (nvidia), adapted from the V4 Flash recipe:
+    ./run_vllm_model_dgx_dual.py start deepseek-v4.1-flash
+
+    # Qwen3.8 27B NVFP4 (uses the DFlash2 draft model automatically if Qwen3.8-27B-DFlash2 is on disk)
+    ./run_vllm_model_dgx_dual.py start qwen3.8-27b
+
+    # Qwen3.6 35B-A3B NVFP4 (Marlin MoE + MTP)
+    ./run_vllm_model_dgx_dual.py start qwen3.6-35b-a3b
+
+    # Gemma 4 26B-A4B NVFP4 -- solo profile: runs on THIS Spark only (TP=1); the other stays free
+    ./run_vllm_model_dgx_dual.py start gemma-4-26b
+
+    # Any other folder under MODELS_DIR gets an automatic profile named after the folder:
+    ./run_vllm_model_dgx_dual.py list                  # shows every name and where it is on disk
+    ./run_vllm_model_dgx_dual.py start my-model-folder -- --max-model-len 65536
+
+    # If a model fails with "context length doesn't fit in the KV-cache memory", pin the cache size:
+    ./run_vllm_model_dgx_dual.py start deepseek-v4-flash -- --kv-cache-memory-bytes 6G
+
+Try it / watch it / stop it:
+    curl http://<head-ip>:8000/v1/models
+    curl http://<head-ip>:8000/v1/chat/completions -H 'Content-Type: application/json' \
+         -d '{"model":"nvidia/GLM-5.3-Flash-NVFP4","messages":[{"role":"user","content":"hi"}],"max_tokens":1000}'
+    ./run_vllm_model_dgx_dual.py status        # both containers + API health
+    ./run_vllm_model_dgx_dual.py logs -f       # head log; add --worker for the other Spark
+    ./run_vllm_model_dgx_dual.py stop          # remove the containers on both Sparks
+(Models not on disk yet: download_vllm_models_large.py fetches them; `start` then copies them to the other Spark.)
+
+Cron (run on the HEAD Spark; edit with `sudo crontab -e` as the user that runs this script and has
+passwordless ssh + docker access on both Sparks). `start` already stops anything else and relaunches, so
+"restart" = `start`. cron has no terminal, so give the model name explicitly and use absolute paths;
+`flock -n` stops overlapping runs (a start can take many minutes while the model loads).
+
+    # Restart GLM at 04:00 every night (frees memory fragmentation, picks up image/script updates):
+    0 4 * * *  flock -n /tmp/vllm_dual.lock /usr/bin/python3 /home/ubuntu/run_vllm_model_dgx_dual.py start glm-5.3-flash >> /var/log/vllm_dual_cron.log 2>&1
+
+    # Start it after a reboot (wait for the network and Docker first):
+    @reboot    sleep 120 && flock -n /tmp/vllm_dual.lock /usr/bin/python3 /home/ubuntu/run_vllm_model_dgx_dual.py start glm-5.3-flash >> /var/log/vllm_dual_cron.log 2>&1
+
+    # Watchdog: every 5 minutes, restart ONLY if the API is not answering (fixes a crashed/hung server):
+    */5 * * * * curl -sf -m 10 http://10.200.1.1:8000/health >/dev/null || flock -n /tmp/vllm_dual.lock /usr/bin/python3 /home/ubuntu/run_vllm_model_dgx_dual.py start glm-5.3-flash >> /var/log/vllm_dual_cron.log 2>&1
+    #   (10.200.1.1 = the head's ConnectX IP; the .env beside the script supplies SPARK_WORKER_SSH.)
+
 Config (environment or a .env beside this script; same names as install_ai_spark_vllm.sh):
-    SPARK_WORKER_SSH   ssh target of the other Spark, e.g. cgray@10.13.1.21   (required)
+    SPARK_WORKER_SSH   ssh target of the other Spark, e.g. ubuntu@10.1.1.15   (required)
     SPARK_WORKER_IP    its IP on the ConnectX link   (default: read from its ConnectX port)
     SPARK_HEAD_IP      this node's ConnectX IP       (default: read from the port)
     SPARK_IFACE        ConnectX netdev on both nodes, e.g. enp1s0f0np0 (default: ibdev2netdev)
@@ -73,6 +137,8 @@ EUGR_REPO = "https://github.com/eugr/spark-vllm-docker.git"
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10"]
 CACHE_DIRS = [".cache/vllm", ".cache/flashinfer", ".cache/b12x", ".triton", ".tilelang", ".cache/huggingface"]
 DRY = False
+CRON_TAG = "# run_vllm_model_dgx_dual autostart"
+BOOT_DELAY = 120   # seconds after boot before the cron job launches the model
 
 
 def load_env_file():
@@ -134,7 +200,8 @@ def args_glm53_flash(tp, models_dir):
             "--dtype", "bfloat16", "--kv-cache-dtype", "fp8", "--quantization", "modelopt_mixed",
             "--attention-backend", "B12X", "--block-size", "256", "--moe-backend", "b12x",
             "--linear-backend", "b12x", "--no-enable-flashinfer-autotune", "--load-format", "b12x",
-            "--max-model-len", "500000", "--max-num-seqs", "4", "--max-num-batched-tokens", "4096",
+            "--max-model-len", "262144", "--kv-cache-memory-bytes", "6G",
+            "--max-num-seqs", "4", "--max-num-batched-tokens", "4096",
             "--speculative-config", spec({"method": "mtp", "num_speculative_tokens": 5,
                                           "moe_backend": "humming", "attention_backend": "B12X"}),
             "--reasoning-parser", "glm45", "--tool-call-parser", "glm47", "--enable-auto-tool-choice",
@@ -206,7 +273,10 @@ PROFILES = {
         env=dict(B12X_ENV, VLLM_ENABLE_PCIE_ALLREDUCE="0", INSTANTTENSOR_BACKEND="BUFFERED",
                  INSTANTTENSOR_BUFFER_SIZE="67108864", INSTANTTENSOR_CHUNK_SIZE="8388608",
                  INSTANTTENSOR_CONCURRENCY="1", INSTANTTENSOR_IO_DEPTH="3"),
-        note="eugr recipe glm-5.3-flash. It targets local-inference-lab's Spark checkpoint; "
+        note="eugr recipe glm-5.3-flash. With nvidia's 190 GB checkpoint (~95 GB per Spark) the memory left for KV cache "
+             "is only ~1-2 GiB and varies per run, so this profile fixes it with --kv-cache-memory-bytes 6G "
+             "and a 262144 context. "
+             "It targets local-inference-lab's Spark checkpoint; "
              "if the nvidia one won't load try:  -- --load-format auto --quantization modelopt "
              "--attention-backend auto"),
     "deepseek-v4-flash": dict(
@@ -290,7 +360,7 @@ def make_nodes(need_worker=True):
     if not ssh and cfg("SPARK_WORKER_IP"):
         ssh = f"{getpass.getuser()}@{cfg('SPARK_WORKER_IP')}"
     if need_worker and not ssh:
-        sys.exit("SPARK_WORKER_SSH is not set (e.g. SPARK_WORKER_SSH=cgray@10.13.1.21 in .env or the environment).")
+        sys.exit("SPARK_WORKER_SSH is not set (e.g. SPARK_WORKER_SSH=ubuntu@10.1.1.15 in .env or the environment).")
     head, worker = Node("head"), Node("worker", ssh or None)
     nodes = [head] + ([worker] if need_worker else [])
     for n in nodes:
@@ -698,6 +768,21 @@ def first_error(text, context=30):
     return ""
 
 
+def headline(text):
+    """One-line cause + a ready-to-run fix for the failures we know how to recognise."""
+    m = re.search(r"estimated maximum model length is (\d+)", text)
+    if m:
+        n = int(m.group(1)) // 1024 * 1024
+        return (f"The context length doesn't fit in the KV-cache memory left after loading the weights (it varies run to run). "
+                f"Either set a fixed KV size:  start <model> -- --kv-cache-memory-bytes 6G   "
+                f"or use a smaller context:  start <model> --max-model-len {min(n, 32768) if n < 65536 else n}")
+    if re.search(r"out of memory|OutOfMemoryError", text, re.I):
+        return ("Out of GPU memory. Try a smaller --max-model-len / --max-num-seqs, or a lower "
+                "--gpu-memory-utilization (the Spark's 128 GB is shared with the OS).")
+    m = re.search(r"^\S* ?\(?[^\n]*?((?:ValueError|RuntimeError|AssertionError|KeyError|ImportError|ModuleNotFoundError)[^\n]{0,300})", text, re.M)
+    return f"Error: {m.group(1)}" if m else ""
+
+
 def diagnose(nodes, name, key):
     """Save the FULL log of every node to a file and show where each one first went wrong."""
     log_dir = os.path.expanduser(cfg("LOG_DIR", "~/vllm-logs"))
@@ -710,6 +795,9 @@ def diagnose(nodes, name, key):
             f.write(text)
         print(f"\n===== [{n.label}] full log: {path}  ({len(text.splitlines())} lines) =====")
         err = first_error(text)
+        hl = headline(text)
+        if hl:
+            print(f">>> {hl}")
         print(err if err else "\n".join(text.splitlines()[-25:]) + "\n(no explicit error marker found; last 25 lines shown)")
         if err:
             print("----- (first error above; the lines after it are usually just fallout) -----")
@@ -751,7 +839,7 @@ def cmd_start(args):
     key, c = pick_profile(args, build_catalog(head, worker, models_dir))
     prof, solo = c["prof"], c["prof"].get("solo", False)
     if not solo and worker is None:
-        sys.exit("SPARK_WORKER_SSH is not set (e.g. SPARK_WORKER_SSH=cgray@10.13.1.21 in .env or the environment).")
+        sys.exit("SPARK_WORKER_SSH is not set (e.g. SPARK_WORKER_SSH=ubuntu@10.1.1.15 in .env or the environment).")
     nodes = [head] if solo else [head, worker]
     tp = 1 if solo else 2
     print(f"\n{key}: {c['dir']}   image={prof['image']}   TP={tp} on {'1 Spark' if solo else '2 Sparks'}")
@@ -791,11 +879,53 @@ def cmd_start(args):
         return
     if not wait_ready(nodes, name, port, int(cfg("HEALTH_TIMEOUT", "3600"))):
         diagnose(nodes, name, key)
-        print(f"\nThe containers were left running so you can inspect them (docker logs / docker exec -it {name} bash).\n"
+        print(f"\nThe containers were left running so you can inspect them:  docker logs {name}   or   docker exec -it {name} bash\n"
               f"`{sys.argv[0]} stop` removes them; the next `start` does too.")
         sys.exit(1)
     print(f"\nServing {prof.get('served', prof['repo'])} on {'1 Spark' if solo else '2 Sparks'}.\n  API   : http://{head.ip}:{port}/v1\n  Models: curl http://{head.ip}:{port}/v1/models"
           f"\n  Logs  : {sys.argv[0]} logs -f\n  Stop  : {sys.argv[0]} stop")
+    offer_autostart(key, args)
+
+
+def current_crontab():
+    r = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else ""
+
+
+def autostart_entry(key, args):
+    """The crontab line that starts `key` BOOT_DELAY seconds after boot."""
+    script = os.path.abspath(__file__)
+    env = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"   # cron's default PATH lacks /usr/local/bin
+    if os.environ.get("SPARK_WORKER_SSH"):          # .env beside the script covers the rest
+        env += f" SPARK_WORKER_SSH={shlex.quote(os.environ['SPARK_WORKER_SSH'])}"
+    start = ["start", key] + (["--max-model-len", str(args.max_model_len)] if args.max_model_len else [])
+    start += (["--"] + args.extra) if args.extra else []
+    log = os.path.join(os.path.dirname(script), "vllm_autostart.log")
+    return (f"@reboot sleep {BOOT_DELAY} && cd {shlex.quote(os.path.dirname(script))} && {env} "
+            f"{shlex.quote(sys.executable)} {shlex.quote(script)} {' '.join(shlex.quote(a) for a in start)} "
+            f">> {shlex.quote(log)} 2>&1 {CRON_TAG}")
+
+
+def offer_autostart(key, args):
+    """Ask whether to start this model on boot; if yes, add a crontab entry (replacing any earlier one)."""
+    if DRY or not sys.stdin.isatty() or args.no_autostart_prompt:
+        return
+    entry = autostart_entry(key, args)
+    old = current_crontab()
+    if entry in old.splitlines():
+        return                                       # already set up for exactly this model
+    try:
+        ans = input(f"\nStart {key} automatically on startup ({BOOT_DELAY}s after boot, via cron)? [y/N]: ").strip().lower()
+    except EOFError:
+        return
+    if ans not in ("y", "yes"):
+        return
+    lines = [l for l in old.splitlines() if CRON_TAG not in l]   # only one autostart model at a time
+    r = subprocess.run(["crontab", "-"], input="\n".join(lines + [entry]) + "\n", text=True)
+    if r.returncode != 0:
+        print("  [warn] could not install the crontab entry.")
+        return
+    print(f"  Added to crontab: {entry}\n  Remove it with `crontab -e` (delete the line tagged '{CRON_TAG}').")
 
 
 def cmd_stop(args):
@@ -900,6 +1030,7 @@ def main():
     p.add_argument("--skip-checks", action="store_true")
     p.add_argument("--keep-others", action="store_true",
                    help="don't stop other vLLM instances/containers first (default: stop them)")
+    p.add_argument("--no-autostart-prompt", action="store_true", help="don't ask about starting this model on boot")
     p.add_argument("--dry-run", action="store_true", help="print every command, run nothing")
     p.set_defaults(fn=cmd_start)
     p = sub.add_parser("check", help="preflight only")
