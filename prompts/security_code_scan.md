@@ -1,9 +1,9 @@
 Point the agent at the file or URL (works in most agents). Without pasting, you can send a one-line prompt:
 
-Read and follow https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/prompts/init.md
+Read and follow [https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/prompts/init.md](https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/prompts/security_code_scan.md)
 
 
-##------
+
 # Master Security Audit Prompt for Codebase
 
 You are an elite Application Security Engineer and Red Team specialist. Your sole task is to perform a comprehensive, adversarial security audit of the entire codebase.
