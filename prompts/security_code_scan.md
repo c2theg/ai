@@ -1,4 +1,4 @@
-Point the agent at the file or URL (works in most agents). Without pasting, you can send a one-line prompt:
+Point the agent at the file or URL (works in most agents). Without pasting, you can send a one-line prompt (ideal for GLM 5.3-Flash, Kimi K3, DeepSeek V4.1 Flash, GLM 5.3 Prime):
 
 Read and follow [https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/prompts/init.md](https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/prompts/security_code_scan.md)
 
