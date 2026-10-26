@@ -15,7 +15,7 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.0.1
+Version:  0.0.6
 Last Updated:  10/25/2026
 
 
@@ -59,6 +59,7 @@ Usage:
 #   qwen36-35b-a3b     unsloth/Qwen3.6-35B-A3B-GGUF          (chat MoE,   port 10021)
 #   nemotron-bolt-e4b  nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB (chat,     port 10022)
 #   qwen38-27b         unsloth/Qwen3.8-27B-GGUF              (chat,       port 10020)
+#   gemma4-26b-a4b     unsloth/gemma-4-26B-A4B-it-qat-GGUF   (chat MoE,   port 10023)
 #
 # Paths:
 #   Source:   /opt/llama.cpp
@@ -418,8 +419,21 @@ CMAKE_ARGS=(
     -DCMAKE_BUILD_TYPE=Release
     -DBUILD_SHARED_LIBS=OFF
     -DLLAMA_BUILD_TESTS=OFF
-    -DGGML_NATIVE=ON
 )
+
+# llama.cpp's AVX code assumes AVX2 + FMA + F16C come with it. Older x86 CPUs
+# that have AVX but not the rest (Sandy/Ivy Bridge Xeons, early AMD FX) fail
+# to compile with -march=native, so build those for SSE 4.2 instead.
+CPU_FLAGS=" $(grep -m1 '^flags' /proc/cpuinfo | cut -d: -f2) "
+if [[ "$ARCH" == "x86_64" && "$CPU_FLAGS" == *" avx "* ]] &&
+   [[ "$CPU_FLAGS" != *" avx2 "* || "$CPU_FLAGS" != *" fma "* || "$CPU_FLAGS" != *" f16c "* ]]; then
+    echo "CPU has AVX without AVX2/FMA/F16C - building for SSE 4.2 (llama.cpp's AVX-only path doesn't compile)."
+    CMAKE_ARGS+=(-DGGML_NATIVE=OFF -DGGML_SSE42=ON -DGGML_AVX=OFF -DGGML_AVX2=OFF
+                 -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_BMI2=OFF)
+else
+    CMAKE_ARGS+=(-DGGML_NATIVE=ON)
+fi
+
 case "$BACKEND" in
     cuda)   CMAKE_ARGS+=(-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native
                          -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc") ;;
@@ -682,7 +696,7 @@ echo
 echo "[9/10] Models"
 echo "------------------------------------------------------------"
 
-MODEL_KEYS=(qwen3-embed-4b qwen36-35b-a3b nemotron-bolt-e4b qwen38-27b)
+MODEL_KEYS=(qwen3-embed-4b qwen36-35b-a3b nemotron-bolt-e4b qwen38-27b gemma4-26b-a4b)
 declare -A M_REPO M_DESC M_PORT M_ARGS M_CANDS M_OVERHEAD M_DEFAULT
 
 M_REPO[qwen3-embed-4b]="Qwen/Qwen3-Embedding-4B-GGUF"
@@ -713,12 +727,20 @@ M_ARGS[qwen38-27b]="-c 32768 --jinja"
 M_OVERHEAD[qwen38-27b]=4096
 M_DEFAULT[qwen38-27b]=N
 
+M_REPO[gemma4-26b-a4b]="unsloth/gemma-4-26B-A4B-it-qat-GGUF"
+M_DESC[gemma4-26b-a4b]="Gemma-4-26B-A4B (QAT) - MoE chat model from Google"
+M_PORT[gemma4-26b-a4b]=10023
+M_ARGS[gemma4-26b-a4b]="-c 32768 --jinja"
+M_OVERHEAD[gemma4-26b-a4b]=3072
+M_DEFAULT[gemma4-26b-a4b]=N
+
 # Candidate files, best first: "file:bytes". The first one that fits in the
 # remaining memory is used. Override with <NAME>_FILE (see header).
 M_CANDS[qwen3-embed-4b]="Qwen3-Embedding-4B-Q8_0.gguf:4279660224 Qwen3-Embedding-4B-Q4_K_M.gguf:2496703776"
 M_CANDS[qwen36-35b-a3b]="Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf:22360456160 Qwen3.6-35B-A3B-UD-IQ4_XS.gguf:17730509792 Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf:16845511648 Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf:13211155424"
 M_CANDS[nemotron-bolt-e4b]="Nemotron-3.5-Bolt-E4B-Q4_K_M.gguf:6180446208"
 M_CANDS[qwen38-27b]="Qwen3.8-27B-UD-Q4_K_XL.gguf:17559178144 Qwen3.8-27B-UD-Q4_K_S.gguf:15358213024 Qwen3.8-27B-UD-IQ4_XS.gguf:14252845984 Qwen3.8-27B-UD-Q3_K_XL.gguf:13146393504"
+M_CANDS[gemma4-26b-a4b]="gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf:14249047104"
 
 # Memory available to models: system RAM + dedicated GPU memory
 # (on an AMD APU the VRAM carve-out is not part of MemTotal), minus 4 GiB for the OS.
