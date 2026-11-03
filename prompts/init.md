@@ -21,7 +21,7 @@
 
 ---
 
-# Project Init (agent-neutral)
+# Project Init (agent-neutral) - Version: 0.1.2 - Updated: 11/2/2026
 
 You are an AI coding agent (any vendor). Set up, or bring up to date, the documentation
 and management files for THIS application directory so that any other agent or human can
@@ -110,6 +110,21 @@ Every file gets a footer line: `Last updated: <YYYY-MM-DD> by <agent name>`.
 - Outside markers, make minimal, additive edits.
 - If the project is a git repository, follow its commit policy. If it is not, copy a file to
   `output/backups/<UTC-timestamp>/<path>` before any risky or large edit.
+
+
+Create a start.sh, stop.sh, reload.sh - docker deployment scripts to make provisioning easier. 
+All containers should be running the latest stable versions of the desired software stack. Do not pin a version number.
+All containers should log to /var/log/<app>. Set log retention to 14 days, and enable daily log rotation.
+Set limits (cpu cores and memory) for the container based on available system resources. 
+Always choose the strongest security solutions. If the users ask for lesser security, then push back on it and ask for clarifying questions as to why. 
+Suggest best security practices over less secure solutions. 
+With each change of any file, make sure to incerment the version number at the top of the file, as well as the version that is showed to the user (ether CLI script, or WebUI).
+If the user is using git for version control, make sure to commit all changes with a detailed change log, with the following:
+    - explaining why
+    - timestamp (UTC) when
+    - the agent that made it
+    - the machines' hostname to know where it was made. 
+
 
 ## Step 2. Remote templates (large documents)
 
