@@ -25,7 +25,8 @@
 
 You are an AI coding agent (any vendor). Set up, or bring up to date, the documentation
 and management files for THIS application directory so that any other agent or human can
-understand and work on it. Follow the steps in order. Do not skip Step 0.
+understand and work on it. Follow the steps in order. Do not skip Step 0. 
+Always expect multiple agents to be working on the application, so re-analyze any code sections before making changes. 
 
 Conflict rule: the user's direct instructions beat this file; this file beats your defaults.
 
