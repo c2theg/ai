@@ -15,13 +15,13 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.0.8
-Last Updated:  11/23/2026
+Version:  0.0.9
+Last Updated:  11/24/2026
 
 Supported:  Ubuntu 24.04 LTS and Ubuntu 26.04 LTS
 
-Install:
-    wget https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_llama_cpp_ubuntu24.04.sh && chmod +x install_llama_cpp_ubuntu24.04.sh
+Install (-4 = IPv4, so a host with broken IPv6 doesn't hang):
+    wget -4 https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_llama_cpp_ubuntu24.04.sh && chmod +x install_llama_cpp_ubuntu24.04.sh
 
 Usage:
     sudo ./install_llama_cpp_ubuntu24.04.sh
@@ -57,6 +57,8 @@ Usage:
                                system ones are too old for all llama.cpp features
     MESA_PPA=1                 Vulkan/AMD on 24.04: upgrade an old Mesa (< 25) from
                                ppa:kisak/kisak-mesa without asking
+    IPV4_ONLY=auto|1|0         Use IPv4 only for apt / git / curl / wget. auto (default)
+                               turns it on when IPv6 is configured but doesn't work
 
     llama.cpp always tracks the newest upstream master commit; each run
     verifies that against GitHub and rebuilds when the commit or the
@@ -197,6 +199,68 @@ if [[ "${ID:-}" != "ubuntu" || " $SUPPORTED_RELEASES " != *" ${VERSION_ID:-} "* 
     echo
     echo "WARNING: This script supports Ubuntu $SUPPORTED_RELEASES (found ${PRETTY_NAME:-unknown})."
     ask_yn "Continue anyway?" N || exit 1
+fi
+
+# ------------------------------------------------------------
+# IPv4-only mode
+#
+# A host with an IPv6 address but no working IPv6 route makes apt, git,
+# curl and wget hang trying the IPv6 addresses of GitHub / Hugging Face /
+# the Ubuntu mirrors. IPV4_ONLY=auto (default) tests IPv6 and, if it
+# doesn't work, makes this run use IPv4:
+#   - apt:        /etc/apt/apt.conf.d/99llama-force-ipv4 (Acquire::ForceIPv4)
+#   - git etc.:   a "prefer IPv4" precedence line in /etc/gai.conf
+#   - curl/wget:  called with -4
+# The apt + gai.conf changes are marked, and removed again on a later run
+# once IPv6 works (or with IPV4_ONLY=0).
+# ------------------------------------------------------------
+
+IPV4_ONLY="${IPV4_ONLY:-auto}"
+APT_IPV4_CONF="/etc/apt/apt.conf.d/99llama-force-ipv4"
+GAI_MARK="# llama.cpp installer: prefer IPv4 (IPV4_ONLY)"
+
+# ipv6_works  -- an IPv6 default route exists and an HTTPS connection over it succeeds
+ipv6_works() {
+    ip -6 route show default 2>/dev/null | grep -q . || return 1
+    if command -v curl >/dev/null 2>&1; then
+        curl -6 -sS -m 6 -o /dev/null https://raw.githubusercontent.com/ 2>/dev/null
+    elif command -v wget >/dev/null 2>&1; then
+        # any HTTP response (even an error status) means the connection worked
+        wget -6 -q -T 6 -t 1 -O /dev/null https://raw.githubusercontent.com/ 2>/dev/null
+        (( $? != 4 ))
+    else
+        return 0
+    fi
+}
+
+USE_IPV4=0
+case "$IPV4_ONLY" in
+    1) USE_IPV4=1 ;;
+    0) USE_IPV4=0 ;;
+    *) if ip -6 route show default 2>/dev/null | grep -q . && ! ipv6_works; then
+           USE_IPV4=1
+       fi ;;
+esac
+
+echo
+if (( USE_IPV4 )); then
+    echo "Network: IPv4 only (IPV4_ONLY=$IPV4_ONLY) - apt, git, curl and wget will use IPv4."
+    echo 'Acquire::ForceIPv4 "true";  // added by the llama.cpp installer (IPV4_ONLY)' >"$APT_IPV4_CONF"
+    if ! grep -qF "$GAI_MARK" /etc/gai.conf 2>/dev/null; then
+        printf '%s\nprecedence ::ffff:0:0/96  100\n' "$GAI_MARK" >>/etc/gai.conf
+    fi
+    curl() { command curl -4 "$@"; }
+    wget() { command wget -4 "$@"; }
+else
+    echo "Network: IPv4 + IPv6."
+    # Undo an IPv4-only setup from an earlier run.
+    rm -f "$APT_IPV4_CONF"
+    if grep -qF "$GAI_MARK" /etc/gai.conf 2>/dev/null; then
+        # drop the marker line and the precedence line after it; cat > keeps perms
+        gai_new="$(awk -v m="$GAI_MARK" '$0 == m { skip = 1; next } skip { skip = 0; next } { print }' /etc/gai.conf)"
+        printf '%s\n' "$gai_new" >/etc/gai.conf
+        echo "Removed the IPv4 preference from /etc/gai.conf (IPv6 works again)."
+    fi
 fi
 
 # Release-specific names, e.g. 26.04 -> ubuntu2604 / linux-generic-hwe-26.04
