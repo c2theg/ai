@@ -14,8 +14,8 @@ echo "
                             |_|                                             |___|
 
 
-Version:  0.0.5
-Last Updated:  9/24/2026
+Version:  0.1.0
+Last Updated:  11/23/2026
 
 
 "
@@ -30,20 +30,27 @@ Last Updated:  9/24/2026
 #   - CUDA Toolkit if nvcc is missing
 #   - llama.cpp
 #   - CUDA-enabled llama-cli / llama-server / llama-bench
+#   - Inkling 2 Mini UD-IQ4_XS GGUF + vision projector (~16 GB)
 #
 # Default install:
 #   Source:  /opt/llama.cpp
 #   Binaries: /usr/local/bin/
+#   Models:   /opt/ai/models/*.gguf
+#             /opt/ai/models/mmproj/*.gguf  (vision projectors)
 #
 # Usage:
 #   chmod +x install-llamacpp.sh
 #   sudo ./install-llamacpp.sh
+#
+#   Skip the model download:  sudo SKIP_INKLING=1 ./install-llamacpp.sh
+#   Use a Hugging Face token: sudo HF_TOKEN=hf_xxx ./install-llamacpp.sh
 # ============================================================
 
 set -Eeuo pipefail
 
 LLAMA_DIR="/opt/llama.cpp"
 LLAMA_REPO="https://github.com/ggml-org/llama.cpp.git"
+MODEL_DIR="${MODEL_DIR:-/opt/ai/models}"
 
 echo "============================================================"
 echo " llama.cpp CUDA Installer"
@@ -73,7 +80,7 @@ if [[ "${ARCH}" != "x86_64" ]]; then
     echo "WARNING: Expected x86_64 but found ${ARCH}"
 fi
 
-echo "[1/10] System information"
+echo "[1/11] System information"
 echo "------------------------------------------------------------"
 echo "OS:"
 grep PRETTY_NAME /etc/os-release || true
@@ -92,7 +99,7 @@ echo
 # Check NVIDIA driver
 # ------------------------------------------------------------
 
-echo "[2/10] Checking NVIDIA GPU / driver"
+echo "[2/11] Checking NVIDIA GPU / driver"
 echo "------------------------------------------------------------"
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
@@ -137,7 +144,7 @@ fi
 # ------------------------------------------------------------
 
 echo
-echo "[3/10] Installing build dependencies"
+echo "[3/11] Installing build dependencies"
 echo "------------------------------------------------------------"
 
 export DEBIAN_FRONTEND=noninteractive
@@ -168,7 +175,7 @@ apt-get install -y \
 # ------------------------------------------------------------
 
 echo
-echo "[4/10] Checking CUDA Toolkit"
+echo "[4/11] Checking CUDA Toolkit"
 echo "------------------------------------------------------------"
 
 if command -v nvcc >/dev/null 2>&1; then
@@ -205,7 +212,7 @@ fi
 # ------------------------------------------------------------
 
 echo
-echo "[5/10] Configuring CUDA environment"
+echo "[5/11] Configuring CUDA environment"
 echo "------------------------------------------------------------"
 
 if [[ -x /usr/local/cuda/bin/nvcc ]]; then
@@ -248,7 +255,7 @@ chmod 644 /etc/profile.d/cuda.sh
 # ------------------------------------------------------------
 
 echo
-echo "[6/10] Downloading llama.cpp"
+echo "[6/11] Downloading llama.cpp"
 echo "------------------------------------------------------------"
 
 if [[ -d "${LLAMA_DIR}/.git" ]]; then
@@ -290,7 +297,7 @@ echo "CPU build threads: ${CPU_THREADS}"
 # ------------------------------------------------------------
 
 echo
-echo "[7/10] Configuring CUDA build"
+echo "[7/11] Configuring CUDA build"
 echo "------------------------------------------------------------"
 
 rm -rf build
@@ -306,13 +313,38 @@ rm -rf build
 #     Enables optimized build.
 #
 
+#
+# Older CPUs (Sandy/Ivy Bridge era) have AVX but no AVX2/FMA.
+# llama.cpp's AVX-only x86 code path does not compile on current
+# master (FMA intrinsics under __AVX__ guard, const errors in
+# repack.cpp), so on those CPUs drop -march=native and AVX entirely.
+# The GPU does the heavy lifting, so the CPU impact is negligible.
+#
+
+CPU_FLAGS=(-DGGML_NATIVE=ON)
+
+if ! grep -qw avx2 /proc/cpuinfo || ! grep -qw fma /proc/cpuinfo; then
+    echo "CPU lacks AVX2/FMA - building generic CPU backend (SSE4.2)."
+    CPU_FLAGS=(
+        -DGGML_NATIVE=OFF
+        -DGGML_SSE42=ON
+        -DGGML_AVX=OFF
+        -DGGML_AVX2=OFF
+        -DGGML_FMA=OFF
+        -DGGML_F16C=OFF
+        -DGGML_AVX512=OFF
+        -DGGML_BMI2=OFF
+    )
+fi
+
 cmake \
     -S . \
     -B build \
     -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DGGML_CUDA=ON \
-    -DGGML_NATIVE=ON \
+    -DCMAKE_CUDA_ARCHITECTURES=native \
+    "${CPU_FLAGS[@]}" \
     -DLLAMA_CURL=ON
 
 # ------------------------------------------------------------
@@ -320,7 +352,7 @@ cmake \
 # ------------------------------------------------------------
 
 echo
-echo "[8/10] Compiling llama.cpp"
+echo "[8/11] Compiling llama.cpp"
 echo "------------------------------------------------------------"
 
 cmake \
@@ -333,7 +365,7 @@ cmake \
 # ------------------------------------------------------------
 
 echo
-echo "[9/10] Installing command symlinks"
+echo "[9/11] Installing command symlinks"
 echo "------------------------------------------------------------"
 
 BIN_DIR="${LLAMA_DIR}/build/bin"
@@ -361,11 +393,65 @@ for CMD in "${COMMANDS[@]}"; do
 done
 
 # ------------------------------------------------------------
+# Download Inkling 2 Mini (UD-IQ4_XS) + vision projector
+#
+# Uses the Mainline_Support files: same tensors as the repo-root GGUFs but
+# in the inkling2_loop layout mainline llama.cpp reads (the root files need
+# Unsloth's fork). They ship as .gguf_file and are renamed to .gguf.
+# Requires llama.cpp b12611+ (PR #32704); this script always builds the
+# latest master, so that is satisfied. Downloads resume if interrupted.
+# ------------------------------------------------------------
+
+echo
+echo "[10/11] Downloading Inkling 2 Mini (UD-IQ4_XS)"
+echo "------------------------------------------------------------"
+
+INKLING_REPO="https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/main"
+INKLING_MODEL="${MODEL_DIR}/Inkling-2-Mini-UD-IQ4_XS.gguf"
+INKLING_MMPROJ="${MODEL_DIR}/mmproj/Inkling-2-Mini-mmproj-F16.gguf"
+
+# hf_download <repo path> <destination>
+hf_download() {
+    local src="$1" dest="$2" part="$2.part"
+    local auth=()
+    [[ -n "${HF_TOKEN:-}" ]] && auth=(-H "Authorization: Bearer ${HF_TOKEN}")
+
+    if [[ -s "${dest}" ]]; then
+        echo "Already present: ${dest}"
+        return 0
+    fi
+    echo "Downloading ${src}"
+    echo "  -> ${dest}"
+    curl -fL --retry 5 --retry-delay 5 -C - "${auth[@]}" -o "${part}" "${INKLING_REPO}/${src}"
+    mv "${part}" "${dest}"
+}
+
+if [[ "${SKIP_INKLING:-0}" == "1" ]]; then
+    echo "Skipping (SKIP_INKLING=1)."
+else
+    mkdir -p "${MODEL_DIR}/mmproj"
+
+    if [[ ! -s "${INKLING_MODEL}" ]]; then
+        # ~15.7 GB model + ~0.6 GB mmproj; ask for 17 GB free.
+        NEED_KB=$((17 * 1024 * 1024))
+        FREE_KB="$(df -Pk "${MODEL_DIR}" | awk 'NR==2 {print $4}')"
+        if (( FREE_KB < NEED_KB )); then
+            echo "ERROR: need ~17 GB free in ${MODEL_DIR}, only $((FREE_KB / 1024 / 1024)) GB available."
+            exit 1
+        fi
+    fi
+
+    hf_download "Mainline_Support/Inkling-2-Mini-UD-IQ4_XS.gguf_file" "${INKLING_MODEL}"
+    hf_download "mmproj-F16.gguf" "${INKLING_MMPROJ}"
+    chmod 644 "${INKLING_MODEL}" "${INKLING_MMPROJ}"
+fi
+
+# ------------------------------------------------------------
 # Verification
 # ------------------------------------------------------------
 
 echo
-echo "[10/10] Verifying installation"
+echo "[11/11] Verifying installation"
 echo "------------------------------------------------------------"
 
 echo
@@ -448,6 +534,22 @@ echo "Run the server in the background and log to a file:"
 echo
 echo "  nohup llama-server -m /models/model.gguf --alias my-model -ngl 99 --port 8001 \\"
 echo "      > /var/log/llama-server-8001.log 2>&1 &"
+echo
+echo "Inkling 2 Mini (text + images), alias \"inkling-mini\":"
+echo "  The 15.7 GB model plus KV cache does not fit in 16 GB of VRAM, so"
+echo "  --n-cpu-moe keeps the experts of the first N layers in system RAM"
+echo "  (MoE, 3.4B active params, so this costs little speed). Lower N until"
+echo "  it runs out of VRAM, then step back up; 0 = everything on the GPU."
+echo
+echo "  llama-server \\"
+echo "      -m ${MODEL_DIR}/Inkling-2-Mini-UD-IQ4_XS.gguf \\"
+echo "      --mmproj ${MODEL_DIR}/mmproj/Inkling-2-Mini-mmproj-F16.gguf \\"
+echo "      --alias inkling-mini \\"
+echo "      -ngl 99 --n-cpu-moe 6 \\"
+echo "      -c 32768 --jinja \\"
+echo "      --temp 1.0 --top-p 1.0 --top-k 0 --min-p 0.0 \\"
+echo "      --host 0.0.0.0 \\"
+echo "      --port 8003"
 echo
 echo "Benchmark:"
 echo
