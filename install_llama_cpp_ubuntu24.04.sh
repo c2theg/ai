@@ -20,7 +20,8 @@ Last Updated:  11/23/2026
 
 Supported:  Ubuntu 24.04 LTS and Ubuntu 26.04 LTS
 
-
+Install:
+    wget https://raw.githubusercontent.com/c2theg/ai/refs/heads/main/install_llama_cpp_ubuntu24.04.sh && chmod +x install_llama_cpp_ubuntu24.04.sh
 
 Usage:
     sudo ./install_llama_cpp_ubuntu24.04.sh
